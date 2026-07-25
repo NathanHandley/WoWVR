@@ -6,6 +6,7 @@
 #include "core/log.h"
 #include "core/paths.h"
 #include "diag/frame_report.h"
+#include "game/camera_probe.h"
 #include "present/presenter.h"
 #include "proxy/d3d9_slots.h"
 #include "proxy/vtable_hook.h"
@@ -103,6 +104,22 @@ namespace wowvr
         bool g_haveEyeProjections = false;
         UINT g_projectionRegister = 0;
 
+        // The same thing again for the fixed-function pipeline. Not every world draw
+        // uses a vertex shader: a couple per frame go through SetTransform instead, and
+        // patching only the shader constant leaves those rendering with the game's own
+        // narrow camera while everything around them uses the headset's - which is what
+        // put a large black shape through the middle of the view.
+        float g_eyeFixedProjection[EyeCount][16] = {};
+        bool g_haveFixedEyeProjections = false;
+
+        // The game sets the fixed-function projection only occasionally, not every
+        // frame, so the per-eye versions cannot be rebuilt from the SetTransform call
+        // alone - they would be missing on most frames, leaving the sky to draw with a
+        // stale matrix at the wrong place and the wrong depth. The original is kept and
+        // the eye matrices are rebuilt from it whenever the head moves.
+        float g_currentFixedProjection[16] = {};
+        bool g_haveFixedProjectionSource = false;
+
         // Set while the frame is being rendered into the side-by-side target. Guards
         // against duplicating draws that belong to the shadow or post passes.
         bool g_stereoRedirected = false;
@@ -139,6 +156,13 @@ namespace wowvr
         // view and projection entirely. Duplicating such a draw per eye does not move
         // it, so it lands in the same place both times and is merely clipped
         // differently - which is what a hard edge at the game's own width looks like.
+        UINT g_lastPrimitiveCount = 0;
+        bool g_stateBlockFailureLogged = false;
+        bool g_sequenceDumpArmed = false;
+        bool g_armSequenceNextFrame = false;
+        int g_worldDrawIndex = 0;
+        int g_sequenceDumpsWritten = 0;
+
         bool g_vertexFormatIsPreTransformed = false;
         unsigned long long g_preTransformedWorldDraws = 0;
 
@@ -146,6 +170,14 @@ namespace wowvr
         // inside the wider side-by-side target it clips everything to the game's
         // 1920x1080 corner no matter what viewport a draw is given.
         D3DVIEWPORT9 g_currentViewport = {};
+
+        // The depth range the game itself asked for, kept apart from the eye viewport
+        // we impose. BeginEye overwrites g_currentViewport, so it cannot double as the
+        // record of what the game wanted.
+        float g_depthRanges[16][2] = {};
+        int g_depthRangeCount = 0;
+        float g_gameViewportMinZ = 0.0f;
+        float g_gameViewportMaxZ = 1.0f;
         RECT g_gameScissor = {};
         bool g_haveGameScissor = false;
         bool g_scissorTestEnabled = false;
@@ -345,6 +377,22 @@ namespace wowvr
             g_originalSetRenderTarget(device, 0, g_stereo.Color());
             g_originalSetDepthStencilSurface(device, nullptr);
 
+            // The panel is drawn with the fixed-function pipeline, which means changing
+            // texture stage states, sampler states, lighting, fog and culling. The game
+            // does not reset all of that before its own fixed-function draws, so
+            // without putting it back the distant terrain renders untextured and flat.
+            IDirect3DStateBlock9* savedState = nullptr;
+            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &savedState)))
+            {
+                savedState = nullptr;
+                if (!g_stateBlockFailureLogged)
+                {
+                    WOWVR_WARN("Could not capture device state before compositing the UI "
+                               "panel; the game's own fixed-function draws may be affected.");
+                    g_stateBlockFailureLogged = true;
+                }
+            }
+
             const float width = Cfg().panelWidth;
             const float height = width * static_cast<float>(g_uiPanel.Height())
                                        / static_cast<float>(g_uiPanel.Width());
@@ -430,10 +478,11 @@ namespace wowvr
                 g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PanelVertex));
             }
 
-            device->SetTexture(0, nullptr);
-            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, FALSE);
-            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_TRUE);
-            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, TRUE);
+            if (savedState != nullptr)
+            {
+                savedState->Apply();
+                savedState->Release();
+            }
 
             // Release the stereo surface before anyone tries to read it back: D3D9
             // refuses StretchRect and GetRenderTargetData on a target that is still
@@ -483,6 +532,46 @@ namespace wowvr
             }
 
             staging->Release();
+        }
+
+        // Snapshots the stereo target mid-frame. The target has to be unbound first:
+        // D3D9 will not read back a surface that is currently the render target. Slow
+        // and only ever used while hunting an artefact.
+        void DumpWorldProgress(IDirect3DDevice9* device, int worldDrawIndex)
+        {
+            if (!g_stereo.IsReady() || g_realBackBuffer == nullptr)
+            {
+                return;
+            }
+
+            g_originalSetRenderTarget(device, 0, g_realBackBuffer);
+            g_originalSetDepthStencilSurface(device, nullptr);
+
+            const uint32_t width = g_stereo.EyeWidth() * 2;
+            const uint32_t height = g_stereo.EyeHeight();
+
+            IDirect3DSurface9* staging = nullptr;
+            if (SUCCEEDED(device->CreateOffscreenPlainSurface(width, height, D3DFMT_A8R8G8B8,
+                                                              D3DPOOL_SYSTEMMEM, &staging, nullptr))
+                && staging != nullptr)
+            {
+                if (SUCCEEDED(device->GetRenderTargetData(g_stereo.Color(), staging)))
+                {
+                    D3DLOCKED_RECT locked = {};
+                    if (SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                    {
+                        wchar_t name[64];
+                        swprintf_s(name, L"WoWVR_seq_%04d.bmp", worldDrawIndex);
+                        SaveBgraBmp(ModuleFile(name).c_str(), locked.pBits,
+                                    width, height, static_cast<uint32_t>(locked.Pitch));
+                        staging->UnlockRect();
+                    }
+                }
+                staging->Release();
+            }
+
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, g_stereo.Depth());
         }
 
         void SubmitFrame(IDirect3DDevice9* device)
@@ -613,7 +702,11 @@ namespace wowvr
             if (HotkeyPressed(Hotkey::FrameDump))
             {
                 g_dumpNextFrame = true;
-                WOWVR_INFO("F10: eye buffer will be written on the next frame.");
+                // Armed separately: SubmitFrame consumes g_dumpNextFrame before the
+                // per-frame reset runs, so keying off it there never fires.
+                g_armSequenceNextFrame = (Cfg().dumpEveryNWorldDraws > 0);
+                WOWVR_INFO("F10: eye buffers will be written on the next frame%s.",
+                           g_armSequenceNextFrame ? ", with a mid-frame draw sequence" : "");
             }
 
             if (HotkeyPressed(Hotkey::Recenter))
@@ -672,6 +765,7 @@ namespace wowvr
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
                     g_uiPanel.Update(Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
+
                 }
             }
 
@@ -696,6 +790,45 @@ namespace wowvr
             g_stereoHasContent = false;
             g_uiRendered = false;
 
+            g_sequenceDumpArmed = g_armSequenceNextFrame;
+            g_armSequenceNextFrame = false;
+            g_worldDrawIndex = 0;
+            if (g_sequenceDumpArmed)
+            {
+                g_sequenceDumpsWritten = 0;
+            }
+
+            // Once the scene projection is known, go and find the camera that
+            // produced it. Done once, off the back of a frame that has already been
+            // presented, so the one-off scan hitch is not inside a visible frame.
+            // Find the camera that produced the projection we are already decoding,
+            // then keep re-checking the candidates until exactly one is still telling
+            // the truth. Done off the back of a presented frame so the one-off scan
+            // hitch is not inside a visible one.
+            if (Cfg().scanForCamera && Projection().HasSceneProjection() && !Camera().Found())
+            {
+                const bool restart = Camera().ShouldRescan(Projection().SceneFar(),
+                                                           Projection().SceneVerticalScale());
+
+                if (g_frameCount == 300 || (restart && (g_frameCount % 300) == 0))
+                {
+                    Camera().Scan(Projection().SceneNear(), Projection().SceneFar(),
+                                  Projection().SceneAspect(), Projection().SceneVerticalScale());
+                }
+                else if (g_frameCount > 300 && (g_frameCount % 300) == 0)
+                {
+                    Camera().Verify(Projection().SceneNear(), Projection().SceneFar(),
+                                    Projection().SceneAspect(), Projection().SceneVerticalScale());
+                }
+                else if (g_frameCount > 900 && (g_frameCount % 10) == 0)
+                {
+                    // Once the stable survivors are known, find out which of them the
+                    // game actually builds its projection from.
+                    Camera().ActiveTest(Projection().SceneVerticalScale());
+                }
+            }
+
+            g_depthRangeCount = 0;
             Report().BeginFrame(g_frameCount);
             return hr;
         }
@@ -733,6 +866,25 @@ namespace wowvr
             {
                 Report().NoteTransform(static_cast<uint32_t>(state), &matrix->_11);
             }
+
+            if (state == D3DTS_PROJECTION && matrix != nullptr && !g_duplicatingDraw
+                && Cfg().enabled && g_renderingToBackBuffer && !g_uiPassStarted)
+            {
+                if (Projection().TryPatch(&matrix->_11, g_eyeFixedProjection[EyeLeft],
+                                          g_eyeFixedProjection[EyeRight]))
+                {
+                    memcpy(g_currentFixedProjection, &matrix->_11, sizeof(g_currentFixedProjection));
+                    g_haveFixedProjectionSource = true;
+                    return g_originalSetTransform(
+                        device, state,
+                        reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
+                }
+
+                // Something that is not the scene camera - the interface's orthographic
+                // projection, most likely. Leave it alone and stop substituting.
+                g_haveFixedProjectionSource = false;
+            }
+
             return g_originalSetTransform(device, state, matrix);
         }
 
@@ -866,6 +1018,47 @@ namespace wowvr
                 && g_vertexFormatIsPreTransformed;
         }
 
+        // Counts world draws during the frame being dumped and snapshots at intervals.
+        void NoteWorldDrawForSequence(IDirect3DDevice9* device)
+        {
+            if (!g_sequenceDumpArmed)
+            {
+                return;
+            }
+
+            ++g_worldDrawIndex;
+
+            if (Cfg().logWorldDrawTo > 0
+                && g_worldDrawIndex >= Cfg().logWorldDrawFrom
+                && g_worldDrawIndex <= Cfg().logWorldDrawTo)
+            {
+                IDirect3DBaseTexture9* texture = nullptr;
+                device->GetTexture(0, &texture);
+
+                IDirect3DVertexShader9* shader = nullptr;
+                device->GetVertexShader(&shader);
+
+                WOWVR_INFO("world draw %-4d: prims=%-6u tex=%p vs=%p blend=%s ztest=%s "
+                           "zwrite=%s zfunc=%lu preT=%s",
+                           g_worldDrawIndex, g_lastPrimitiveCount,
+                           static_cast<void*>(texture), static_cast<void*>(shader),
+                           g_alphaBlendEnabled ? "on" : "off",
+                           g_depthTestEnabled ? "on" : "off",
+                           g_depthWriteEnabled ? "on" : "off",
+                           g_depthFunction,
+                           g_vertexFormatIsPreTransformed ? "yes" : "no");
+
+                if (texture != nullptr) { texture->Release(); }
+                if (shader != nullptr) { shader->Release(); }
+            }
+            const int step = Cfg().dumpEveryNWorldDraws;
+            if (step > 0 && (g_worldDrawIndex % step) == 0 && g_sequenceDumpsWritten < 24)
+            {
+                ++g_sequenceDumpsWritten;
+                DumpWorldProgress(device, g_worldDrawIndex);
+            }
+        }
+
         bool ShouldDuplicateDraw()
         {
             // The UI is deliberately excluded: it is laid out for a 1920x1080 screen
@@ -882,8 +1075,20 @@ namespace wowvr
             viewport.Y = 0;
             viewport.Width = g_stereo.EyeWidth();
             viewport.Height = g_stereo.EyeHeight();
-            viewport.MinZ = 0.0f;
-            viewport.MaxZ = 1.0f;
+
+            // The game's depth range is carried over rather than reset to 0..1.
+            // Squashing geometry into a narrow slice at the far end of the range is how
+            // an engine keeps a distant backdrop behind everything else, and forcing the
+            // full range back on every draw throws that away - which is what put the far
+            // terrain in front of the world.
+            viewport.MinZ = g_gameViewportMinZ;
+            viewport.MaxZ = g_gameViewportMaxZ;
+            if (viewport.MaxZ <= viewport.MinZ)
+            {
+                viewport.MinZ = 0.0f;
+                viewport.MaxZ = 1.0f;
+            }
+
             g_currentViewport = viewport;
             g_originalSetViewport(device, &viewport);
 
@@ -893,6 +1098,23 @@ namespace wowvr
             {
                 g_originalSetVertexShaderConstantF(device, g_projectionRegister,
                                                    g_eyeProjection[eye], 4);
+            }
+
+            // Rebuilt from whatever projection the game currently has set, not from a
+            // cached one. The sky dome supplies its own projection with a far plane of
+            // its own, and forcing every fixed-function draw through a single cached
+            // matrix gave the sky the wrong depth range - which is what put it in front
+            // of the world.
+            if (g_haveFixedProjectionSource)
+            {
+                float left[16];
+                float right[16];
+                if (Projection().TryPatch(g_currentFixedProjection, left, right))
+                {
+                    g_originalSetTransform(
+                        device, D3DTS_PROJECTION,
+                        reinterpret_cast<const D3DMATRIX*>(eye == EyeLeft ? left : right));
+                }
             }
 
             // The scissor rectangle is in the game's screen space, which inside the
@@ -969,6 +1191,34 @@ namespace wowvr
             if (viewport != nullptr)
             {
                 g_currentViewport = *viewport;
+                g_gameViewportMinZ = viewport->MinZ;
+                g_gameViewportMaxZ = viewport->MaxZ;
+
+                // Record the distinct depth ranges the game asks for. Carrying these
+                // over fixed the backdrop, so it matters exactly how many there are and
+                // which geometry each belongs to.
+                if (Report().IsActive())
+                {
+                    bool known = false;
+                    for (int i = 0; i < g_depthRangeCount; ++i)
+                    {
+                        if (g_depthRanges[i][0] == viewport->MinZ
+                            && g_depthRanges[i][1] == viewport->MaxZ)
+                        {
+                            known = true;
+                            break;
+                        }
+                    }
+                    if (!known && g_depthRangeCount < 16)
+                    {
+                        g_depthRanges[g_depthRangeCount][0] = viewport->MinZ;
+                        g_depthRanges[g_depthRangeCount][1] = viewport->MaxZ;
+                        ++g_depthRangeCount;
+                        WOWVR_INFO("depth range in use: MinZ=%.4f MaxZ=%.4f (viewport %ux%u at %u,%u)",
+                                   viewport->MinZ, viewport->MaxZ,
+                                   viewport->Width, viewport->Height, viewport->X, viewport->Y);
+                    }
+                }
             }
             return g_originalSetViewport(device, viewport);
         }
@@ -1211,6 +1461,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            NoteWorldDrawForSequence(device);
             return hr;
         }
 
@@ -1231,6 +1482,8 @@ namespace wowvr
                 return D3D_OK;
             }
 
+            g_lastPrimitiveCount = primitiveCount;
+
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawIndexedPrimitive(device, type, baseVertexIndex, minVertexIndex,
@@ -1248,6 +1501,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            NoteWorldDrawForSequence(device);
             return hr;
         }
 
@@ -1282,6 +1536,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            NoteWorldDrawForSequence(device);
             return hr;
         }
 
@@ -1322,6 +1577,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            NoteWorldDrawForSequence(device);
             return hr;
         }
 

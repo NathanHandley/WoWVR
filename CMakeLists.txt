@@ -55,6 +55,8 @@ set(WOWVR_SOURCES
     src/core/paths.h
     src/diag/frame_report.cpp
     src/diag/frame_report.h
+    src/game/camera_probe.cpp
+    src/game/camera_probe.h
     src/present/presenter.cpp
     src/present/presenter.h
     src/proxy/d3d9_slots.h

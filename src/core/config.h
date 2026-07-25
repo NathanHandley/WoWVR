@@ -47,7 +47,17 @@ namespace wowvr
 
         // [Camera]
         bool headTracking = true;       // HMD orientation drives the in-game view
-        float cullFovScale = 1.6f;      // widen WoW's culling frustum so edges do not pop
+        float cullFovScale = 1.6f;
+
+        // Searches process memory for WoW's camera. Off by default: each pass walks
+        // hundreds of megabytes with the render thread blocked, which the player feels
+        // as the headset briefly dropping out, and it has not succeeded yet.
+        bool scanForCamera = false;
+
+        // Last-resort camera identification: alters candidate addresses to see which
+        // one the game rebuilds its projection from. Conclusive, but it writes to
+        // memory that may belong to something else, and it has crashed the client.
+        bool probeCameraByWriting = false;      // widen WoW's culling frustum so edges do not pop
 
         // [Panel]
         float panelDistance = 1.6f;     // metres in front of the body
@@ -68,6 +78,24 @@ namespace wowvr
         // this frame: transforms, constant uploads, shaders, draws, render targets.
         // 0 disables it.
         int frameReportNumber = 0;
+
+        // Writes the stereo target out every N world draws of the dumped frame, so the
+        // exact draw that introduces an artefact can be found by looking rather than by
+        // guessing at what it might be. 0 disables it. Expensive: that frame takes
+        // seconds and each image is ~20 MB.
+        int dumpEveryNWorldDraws = 0;
+
+        // Bisect switch: hands the game's own projection back untouched instead of
+        // substituting the eye frustum. Everything else - stereo duplication, the UI
+        // panel, the render targets - stays exactly as it is. If an artefact survives
+        // this, the projection substitution is not what causes it.
+        bool useGameProjection = false;
+
+        // Logs full state for world draws in this range of the dumped frame, so an
+        // artefact narrowed down by the sequence dump can be identified rather than
+        // guessed at. Inclusive; 0/0 disables.
+        int logWorldDrawFrom = 0;
+        int logWorldDrawTo = 0;
 
         // Probe for the camera hunt. When not 1.0, the horizontal scale of the
         // matrix at vertex shader constant c2 is multiplied by this on its way to the

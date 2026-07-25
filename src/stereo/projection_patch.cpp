@@ -184,8 +184,47 @@ namespace wowvr
 
         if (std::fabs(aspect - m_sceneAspect) > kAspectTolerance * m_sceneAspect)
         {
+            // A perspective projection that is not the scene camera. Worth recording:
+            // if a pass has its own camera we need to know before deciding whether to
+            // leave it alone.
+            bool known = false;
+            for (int i = 0; i < m_rejectedProjectionCount; ++i)
+            {
+                RejectedProjection& entry = m_rejectedProjections[i];
+                if (std::fabs(entry.aspect - aspect) < 0.01f
+                    && std::fabs(entry.nearPlane - decoded.nearPlane) < 0.01f)
+                {
+                    ++entry.count;
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && m_rejectedProjectionCount < kMaxRejected)
+            {
+                RejectedProjection& entry = m_rejectedProjections[m_rejectedProjectionCount++];
+                entry.aspect = aspect;
+                entry.nearPlane = decoded.nearPlane;
+                entry.farPlane = decoded.farPlane;
+                entry.count = 1;
+            }
+
             ++m_rejected;
             return false;
+        }
+
+        // Accepted: this is the player's camera, so remember what it is made of.
+        m_sceneNear = decoded.nearPlane;
+        m_sceneFar = decoded.farPlane;
+        m_sceneVerticalScale = decoded.verticalScale;
+
+        if (Cfg().useGameProjection)
+        {
+            // Both eyes get the game's matrix verbatim. Stereo separation is lost, but
+            // everything else about the pipeline is unchanged.
+            MatrixTo(MatrixFrom(uploaded), outLeft);
+            MatrixTo(MatrixFrom(uploaded), outRight);
+            ++m_patched;
+            return true;
         }
 
         const float unitsPerMetre = Cfg().unitsPerMetre * Cfg().worldScale;
@@ -208,6 +247,20 @@ namespace wowvr
 
                 replacement = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
                                                       decoded.nearPlane, decoded.farPlane);
+
+                // Take the depth terms straight from the matrix being replaced rather
+                // than rebuilding them from a decoded near and far.
+                //
+                // Depth in D3D is Q - n*Q/z: it depends only on view-space z and these
+                // two terms, never on the field of view. So the eye frustum can change
+                // x and y freely, but the moment these are recomputed, any error in the
+                // decode silently rewrites the depth range. That is what put the sky in
+                // front of the world: a sky dome's far plane is enormous, which makes Q
+                // round to almost exactly 1 and trip the decode's fallback.
+                replacement.m[2][2] = decoded.projection.m[2][2];
+                replacement.m[3][2] = decoded.projection.m[3][2];
+                replacement.m[2][3] = decoded.projection.m[2][3];
+                replacement.m[3][3] = decoded.projection.m[3][3];
             }
 
             // The eye's own offset from the head, which is what actually produces
@@ -245,6 +298,13 @@ namespace wowvr
         WOWVR_INFO("Projection patch: %llu patched, %llu left alone. Last seen aspect %.4f "
                    "(scene aspect %.4f), near %.3f, far %.1f",
                    m_patched, m_rejected, m_lastAspect, m_sceneAspect, m_lastNear, m_lastFar);
+
+        for (int i = 0; i < m_rejectedProjectionCount; ++i)
+        {
+            const RejectedProjection& entry = m_rejectedProjections[i];
+            WOWVR_INFO("  other perspective camera seen %llu times: aspect %.4f, near %.3f, far %.1f",
+                       entry.count, entry.aspect, entry.nearPlane, entry.farPlane);
+        }
     }
 
     ProjectionPatch& Projection()

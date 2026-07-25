@@ -171,6 +171,9 @@ namespace wowvr
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);
+        config.scanForCamera = ReadBool(path, L"Camera", L"ScanForCamera", config.scanForCamera);
+        config.probeCameraByWriting =
+            ReadBool(path, L"Camera", L"ProbeCameraByWriting", config.probeCameraByWriting);
 
         config.panelDistance = ReadFloat(path, L"Panel", L"Distance", config.panelDistance);
         config.panelWidth = ReadFloat(path, L"Panel", L"Width", config.panelWidth);
@@ -182,6 +185,11 @@ namespace wowvr
 
         config.dumpFrameNumber = ReadInt(path, L"Debug", L"DumpFrameNumber", config.dumpFrameNumber);
         config.frameReportNumber = ReadInt(path, L"Debug", L"FrameReportNumber", config.frameReportNumber);
+        config.logWorldDrawFrom = ReadInt(path, L"Debug", L"LogWorldDrawFrom", config.logWorldDrawFrom);
+        config.logWorldDrawTo = ReadInt(path, L"Debug", L"LogWorldDrawTo", config.logWorldDrawTo);
+        config.useGameProjection = ReadBool(path, L"Debug", L"UseGameProjection", config.useGameProjection);
+        config.dumpEveryNWorldDraws =
+            ReadInt(path, L"Debug", L"DumpEveryNWorldDraws", config.dumpEveryNWorldDraws);
         config.projectionProbeXScale =
             ReadFloat(path, L"Debug", L"ProjectionProbeXScale", config.projectionProbeXScale);
 

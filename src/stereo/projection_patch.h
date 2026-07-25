@@ -40,6 +40,15 @@ namespace wowvr
         // left-handed convention. Drives the body-locked panel.
         float HeadYaw() const { return m_headYaw; }
 
+        // The scene camera's own parameters, as decoded from the matrix the game
+        // uploads. These are what the camera in memory must also be holding, which is
+        // how it gets found without trusting a published offset.
+        bool HasSceneProjection() const { return m_patched > 0; }
+        float SceneNear() const { return m_sceneNear; }
+        float SceneFar() const { return m_sceneFar; }
+        float SceneAspect() const { return m_sceneAspect; }
+        float SceneVerticalScale() const { return m_sceneVerticalScale; }
+
         // The same correction applied to the world: rotation into the current view
         // frame, and displacement since recentring, in metres. Anything that wants to
         // sit still in space has to use these, not just the yaw.
@@ -72,8 +81,26 @@ namespace wowvr
         float m_headYaw = 0.0f;
         bool m_recenterRequested = true;
 
+        // Perspective matrices that were recognised but not treated as the scene
+        // camera. If the sky or any other pass has a projection of its own, it
+        // shows up here - and being left unpatched while the world is patched is
+        // exactly how geometry ends up in the wrong place at the wrong depth.
+        struct RejectedProjection
+        {
+            float aspect = 0.0f;
+            float nearPlane = 0.0f;
+            float farPlane = 0.0f;
+            unsigned long long count = 0;
+        };
+        static constexpr int kMaxRejected = 8;
+        RejectedProjection m_rejectedProjections[kMaxRejected];
+        int m_rejectedProjectionCount = 0;
+
         unsigned long long m_patched = 0;
         unsigned long long m_rejected = 0;
+        float m_sceneNear = 0.0f;
+        float m_sceneFar = 0.0f;
+        float m_sceneVerticalScale = 0.0f;
         float m_lastAspect = 0.0f;
         float m_lastNear = 0.0f;
         float m_lastFar = 0.0f;
