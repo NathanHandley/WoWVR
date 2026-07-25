@@ -1857,7 +1857,7 @@ namespace wowvr
             // its own, and forcing every fixed-function draw through a single cached
             // matrix gave the sky the wrong depth range - which is what put it in front
             // of the world.
-            if (g_haveFixedProjectionSource)
+            if (g_haveFixedProjectionSource && !Cfg().useGameProjection)
             {
                 float left[16];
                 float right[16];
