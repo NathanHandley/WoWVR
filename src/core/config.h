@@ -45,10 +45,13 @@ namespace wowvr
         // if leaning moves the view too little, lower it if it moves too much.
         float unitsPerMetre = 1.0936f;
 
-        // Per-shader search for a combined world-view-projection. Off: it costs a
-        // constant-file scan per draw for every unresolved shader and has not yet been
-        // shown to find anything the c4 rule misses.
-        bool perShaderCombined = false;
+        // Per-shader search for a combined world-view-projection. Registers are aliased
+        // across shaders - c0 is the water's transform and something else entirely
+        // elsewhere - so the register has to be resolved per shader rather than assumed.
+        // The scan costs a constant-file walk per draw, but only until each shader is
+        // either resolved or given up on, so it is a startup cost rather than a
+        // per-frame one.
+        bool perShaderCombined = true;
 
         // [Camera]
         bool headTracking = true;       // HMD orientation drives the in-game view

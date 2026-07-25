@@ -436,6 +436,18 @@ namespace wowvr
         float g_currentFixedProjection[16] = {};
         bool g_haveFixedProjectionSource = false;
 
+        // Colour writes off means the game is drawing something it intends to be
+        // invisible - an occlusion-query box, most often. Such a draw becoming visible
+        // is a state-preservation bug, not a transform bug.
+        DWORD g_colorWriteMask = 0x0F;
+        bool g_alphaTestEnabled = false;
+
+        // Whether the projection currently set is orthographic. Screen-space geometry
+        // cannot follow the head no matter what is done to the eye transform.
+        bool g_fixedProjectionIsOrtho = false;
+
+        IDirect3DVertexShader9* g_currentVertexShader = nullptr;
+
         // Set while the frame is being rendered into the side-by-side target. Guards
         // against duplicating draws that belong to the shadow or post passes.
         bool g_stereoRedirected = false;
@@ -1227,6 +1239,7 @@ namespace wowvr
                 {
                     memcpy(g_currentFixedProjection, &matrix->_11, sizeof(g_currentFixedProjection));
                     g_haveFixedProjectionSource = true;
+                    g_fixedProjectionIsOrtho = false;
                     g_projectionPatchedThisFrame = true;
                     return g_originalSetTransform(
                         device, state,
@@ -1245,6 +1258,7 @@ namespace wowvr
                     memcpy(g_currentFixedProjection, &matrix->_11,
                            sizeof(g_currentFixedProjection));
                     g_haveFixedProjectionSource = true;
+                    g_fixedProjectionIsOrtho = false;
                     g_projectionPatchedThisFrame = true;
                     return g_originalSetTransform(
                         device, state,
@@ -1252,6 +1266,11 @@ namespace wowvr
                 }
 
                 g_haveFixedProjectionSource = false;
+                g_fixedProjectionIsOrtho = true;
+            }
+            else if (state == D3DTS_PROJECTION && matrix != nullptr && !g_duplicatingDraw)
+            {
+                g_fixedProjectionIsOrtho = false;
             }
 
             return g_originalSetTransform(device, state, matrix);
@@ -1423,8 +1442,20 @@ namespace wowvr
 
             // Screen-space overlays inside the world pass, which cannot be duplicated
             // usefully because their coordinates are absolute.
-            return Cfg().skipScreenSpaceWorldDraws && !g_uiPassStarted
-                && g_vertexFormatIsPreTransformed;
+            //
+            // Pre-transformed vertices are the obvious form of this and never actually
+            // occurred. The form that does occur is a fixed-function draw made under an
+            // ORTHOGRAPHIC projection: small untextured quads issued between the distant
+            // terrain and the sky. Being screen-space they have no world position to
+            // follow, so no eye transform can anchor them - they simply hang in front of
+            // the viewer. Flat-screen effects like these have no meaning in VR.
+            if (!Cfg().skipScreenSpaceWorldDraws || g_uiPassStarted)
+            {
+                return false;
+            }
+
+            return g_vertexFormatIsPreTransformed
+                || (g_fixedProjectionIsOrtho && g_currentVertexShader == nullptr);
         }
 
         // Counts world draws during the frame being dumped and snapshots at intervals.
@@ -1452,13 +1483,38 @@ namespace wowvr
                 // gets neither is drawn with the game's own camera and ends up welded
                 // to the viewer's head.
                 WOWVR_INFO("world draw %-4d: prims=%-6u tex=%p vs=%p blend=%s ztest=%s "
-                           "depth=%.3f..%.3f  camShader=%d camFixed=%d",
+                           "depth=%.3f..%.3f  camShader=%d camFixed=%d cwrite=%X atest=%d "
+                           "ortho=%d",
                            g_worldDrawIndex, g_lastPrimitiveCount,
                            static_cast<void*>(texture), static_cast<void*>(shader),
                            g_alphaBlendEnabled ? "on" : "off",
                            g_depthTestEnabled ? "on" : "off",
                            g_currentViewport.MinZ, g_currentViewport.MaxZ,
-                           g_patchedBlockCount, g_haveFixedProjectionSource ? 1 : 0);
+                           g_patchedBlockCount, g_haveFixedProjectionSource ? 1 : 0,
+                           g_colorWriteMask, g_alphaTestEnabled ? 1 : 0,
+                           g_fixedProjectionIsOrtho ? 1 : 0);
+
+                // Which registers currently hold something that can be read back as a
+                // world-view-projection. This is the question that matters for a draw
+                // that will not follow the head: either its transform is in there and we
+                // are missing it, or it is not, and the cause lies elsewhere.
+                char affine[256];
+                int used = 0;
+                for (UINT reg = 0; reg + 4 <= 64 && reg + 4 <= kShadowRegisters; ++reg)
+                {
+                    float l[16];
+                    float r[16];
+                    const bool plain = Projection().TryPatchCombined(&g_shadowConstants[reg][0], l, r);
+                    const bool rigid = plain
+                        && Projection().TryPatchCombinedStrict(&g_shadowConstants[reg][0], l, r);
+                    if (plain && used < static_cast<int>(sizeof(affine)) - 8)
+                    {
+                        used += sprintf_s(affine + used, sizeof(affine) - used, "c%u%s ",
+                                          reg, rigid ? "*" : "");
+                    }
+                }
+                affine[used] = 0;
+                WOWVR_INFO("      recoverable transforms: %s", used ? affine : "(none)");
 
                 if (texture != nullptr) { texture->Release(); }
                 if (shader != nullptr) { shader->Release(); }
@@ -1485,12 +1541,20 @@ namespace wowvr
             int attempts;
             bool resolved;
             bool hopeless;
+
+            // The left and right matrices last derived, and the constants they came
+            // from. BeginEye runs once per eye with nothing uploaded in between, so the
+            // second call always hits this and the recovery is done once per draw
+            // rather than twice.
+            bool hasCache;
+            float cachedSource[16];
+            float cachedLeft[16];
+            float cachedRight[16];
         };
 
         const int kMaxShaderCombined = 96;
         ShaderCombined g_shaderCombined[kMaxShaderCombined];
         int g_shaderCombinedCount = 0;
-        IDirect3DVertexShader9* g_currentVertexShader = nullptr;
 
         ShaderCombined* FindShaderCombined(IDirect3DVertexShader9* shader)
         {
@@ -1514,6 +1578,7 @@ namespace wowvr
             entry.attempts = 0;
             entry.resolved = false;
             entry.hopeless = false;
+            entry.hasCache = false;
             return &entry;
         }
 
@@ -1630,9 +1695,12 @@ namespace wowvr
             // cached across draws: the register holds a different object every time.
             if (Cfg().perShaderCombined && g_currentVertexShader != nullptr)
             {
-                const ShaderCombined* entry = FindShaderCombined(g_currentVertexShader);
+                ShaderCombined* entry = FindShaderCombined(g_currentVertexShader);
                 if (entry != nullptr && entry->resolved)
                 {
+                    // Recomputed for each eye rather than cached. Caching this on the
+                    // shader entry cut the work by two orders of magnitude and flattened
+                    // the scene into a single plane, so the reuse was plainly not valid.
                     float left[16];
                     float right[16];
                     if (Projection().TryPatchCombined(&g_shadowConstants[entry->startRegister][0],
@@ -1690,6 +1758,8 @@ namespace wowvr
             case D3DRS_ALPHABLENDENABLE: g_alphaBlendEnabled = (value != 0); break;
             case D3DRS_ZFUNC:            g_depthFunction = value; break;
             case D3DRS_SCISSORTESTENABLE: g_scissorTestEnabled = (value != 0); break;
+            case D3DRS_COLORWRITEENABLE: g_colorWriteMask = value; break;
+            case D3DRS_ALPHATESTENABLE:  g_alphaTestEnabled = (value != 0); break;
             default: break;
             }
             return g_originalSetRenderState(device, state, value);
