@@ -1,0 +1,35 @@
+; Export table for the WoWVR proxy.
+;
+; Ordinals match the system d3d9.dll exactly (verified against
+; C:\Windows\SysWOW64\d3d9.dll) so that anything importing by ordinal still works.
+; The "alias = internal" form keeps our thunk symbols from colliding with the
+; prototypes in d3d9.h.
+
+LIBRARY d3d9
+
+EXPORTS
+    Direct3DCreate9                             @37
+    Direct3DCreate9Ex                           @38
+
+    Direct3DCreate9On12                         = WoWVR_Direct3DCreate9On12                         @20
+    Direct3DCreate9On12Ex                       = WoWVR_Direct3DCreate9On12Ex                       @21
+    Direct3DShaderValidatorCreate9              = WoWVR_Direct3DShaderValidatorCreate9              @24
+    PSGPError                                   = WoWVR_PSGPError                                   @25
+    PSGPSampleTexture                           = WoWVR_PSGPSampleTexture                           @26
+    D3DPERF_BeginEvent                          = WoWVR_D3DPERF_BeginEvent                          @27
+    D3DPERF_EndEvent                            = WoWVR_D3DPERF_EndEvent                            @28
+    D3DPERF_GetStatus                           = WoWVR_D3DPERF_GetStatus                           @29
+    D3DPERF_QueryRepeatFrame                    = WoWVR_D3DPERF_QueryRepeatFrame                    @30
+    D3DPERF_SetMarker                           = WoWVR_D3DPERF_SetMarker                           @31
+    D3DPERF_SetOptions                          = WoWVR_D3DPERF_SetOptions                          @32
+    D3DPERF_SetRegion                           = WoWVR_D3DPERF_SetRegion                           @33
+    DebugSetLevel                               = WoWVR_DebugSetLevel                               @34
+    DebugSetMute                                = WoWVR_DebugSetMute                                @35
+    Direct3D9EnableMaximizedWindowedModeShim    = WoWVR_Direct3D9EnableMaximizedWindowedModeShim    @36
+
+    WoWVR_Ordinal16 @16 NONAME
+    WoWVR_Ordinal17 @17 NONAME
+    WoWVR_Ordinal18 @18 NONAME
+    WoWVR_Ordinal19 @19 NONAME
+    WoWVR_Ordinal22 @22 NONAME
+    WoWVR_Ordinal23 @23 NONAME
