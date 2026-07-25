@@ -254,7 +254,8 @@ namespace wowvr
     }
 
     void FrameReport::NoteDrawContext(bool toBackBuffer, bool usingSceneCamera, bool depthTestOn,
-                                      uint32_t viewportX, uint32_t viewportWidth, bool duplicated)
+                                      uint32_t viewportX, uint32_t viewportWidth, bool duplicated,
+                                      float minZ, float maxZ)
     {
         if (!m_active)
         {
@@ -271,7 +272,8 @@ namespace wowvr
                 && current.depthTestOn == depthTestOn
                 && current.viewportX == viewportX
                 && current.viewportWidth == viewportWidth
-                && current.duplicated == duplicated)
+                && current.duplicated == duplicated
+                && current.minZ == minZ && current.maxZ == maxZ)
             {
                 ++current.draws;
                 return;
@@ -292,6 +294,8 @@ namespace wowvr
         phase.viewportX = viewportX;
         phase.viewportWidth = viewportWidth;
         phase.duplicated = duplicated;
+        phase.minZ = minZ;
+        phase.maxZ = maxZ;
     }
 
     void FrameReport::LogDrawPhases() const
@@ -301,12 +305,13 @@ namespace wowvr
         {
             const DrawPhase& phase = m_phases[i];
             WOWVR_INFO("    from draw %-5u  %-5u draws  target=%-10s depth=%-7s blend=%-3s "
-                       "viewport x=%-5u w=%-5u  %s",
+                       "viewport x=%-5u w=%-5u depth=%.4f..%.4f  %s",
                        phase.firstDrawIndex, phase.draws,
                        phase.toBackBuffer ? "backbuffer" : "offscreen",
                        phase.usingSceneCamera ? "tested" : "ignored",
                        phase.depthTestOn ? "on" : "off",
                        phase.viewportX, phase.viewportWidth,
+                       phase.minZ, phase.maxZ,
                        phase.duplicated ? "PER-EYE" : "once");
         }
         if (m_phaseCount >= kMaxPhases)

@@ -77,6 +77,7 @@ namespace wowvr
         // Defined below, once the stereo state it needs is in scope.
         bool StereoActive();
 
+
         IDirect3DDevice9* g_device = nullptr;
         EyeTargets g_eyeTargets[EyeCount];
         Presenter g_presenter;
@@ -100,9 +101,42 @@ namespace wowvr
 
         // The two eye projections for the current frame, in the layout the game
         // uploaded, plus where to put them back.
-        float g_eyeProjection[EyeCount][16] = {};
+        // Every constant register found to hold the scene camera this frame, with the
+        // matrix each eye needs put back into it before that eye's draw.
+        struct PatchedBlock
+        {
+            UINT startRegister = 0;
+            float left[16] = {};
+            float right[16] = {};
+        };
+        static constexpr int kMaxPatchedBlocks = 8;
+        PatchedBlock g_patchedBlocks[kMaxPatchedBlocks];
+        int g_patchedBlockCount = 0;
         bool g_haveEyeProjections = false;
-        UINT g_projectionRegister = 0;
+
+        void RememberPatchedBlock(UINT startRegister, const float* left, const float* right)
+        {
+            for (int i = 0; i < g_patchedBlockCount; ++i)
+            {
+                if (g_patchedBlocks[i].startRegister == startRegister)
+                {
+                    memcpy(g_patchedBlocks[i].left, left, sizeof(g_patchedBlocks[i].left));
+                    memcpy(g_patchedBlocks[i].right, right, sizeof(g_patchedBlocks[i].right));
+                    return;
+                }
+            }
+
+            if (g_patchedBlockCount >= kMaxPatchedBlocks)
+            {
+                return;
+            }
+
+            PatchedBlock& block = g_patchedBlocks[g_patchedBlockCount++];
+            block.startRegister = startRegister;
+            memcpy(block.left, left, sizeof(block.left));
+            memcpy(block.right, right, sizeof(block.right));
+            g_haveEyeProjections = true;
+        }
 
         // The same thing again for the fixed-function pipeline. Not every world draw
         // uses a vertex shader: a couple per frame go through SetTransform instead, and
@@ -157,6 +191,8 @@ namespace wowvr
         // it, so it lands in the same place both times and is merely clipped
         // differently - which is what a hard edge at the game's own width looks like.
         UINT g_lastPrimitiveCount = 0;
+        bool g_projectionPatchedThisFrame = false;
+        bool g_previousFrameHadCamera = true;
         bool g_stateBlockFailureLogged = false;
         bool g_sequenceDumpArmed = false;
         bool g_armSequenceNextFrame = false;
@@ -790,6 +826,14 @@ namespace wowvr
             g_stereoHasContent = false;
             g_uiRendered = false;
 
+            // Whether the frame just finished ever had a 3D camera. Used next frame to
+            // recognise a loading screen; asking within the frame races the camera
+            // upload, which arrives after the first back buffer draw.
+            g_previousFrameHadCamera = g_projectionPatchedThisFrame;
+            g_projectionPatchedThisFrame = false;
+            g_patchedBlockCount = 0;
+            g_haveEyeProjections = false;
+
             g_sequenceDumpArmed = g_armSequenceNextFrame;
             g_armSequenceNextFrame = false;
             g_worldDrawIndex = 0;
@@ -875,6 +919,7 @@ namespace wowvr
                 {
                     memcpy(g_currentFixedProjection, &matrix->_11, sizeof(g_currentFixedProjection));
                     g_haveFixedProjectionSource = true;
+                    g_projectionPatchedThisFrame = true;
                     return g_originalSetTransform(
                         device, state,
                         reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
@@ -927,6 +972,15 @@ namespace wowvr
 
             ++g_backBufferDrawPeriod;
 
+            // A frame with no 3D camera at all is a loading screen: a full-screen
+            // image and nothing else. Treating it as world geometry hands it the eye
+            // frustum, which tilts it through the viewer at an angle. It belongs on the
+            // panel with the rest of the flat content.
+            if (g_backBufferDrawPeriod == 1 && !g_previousFrameHadCamera)
+            {
+                g_backBufferDrawPeriod = 2;
+            }
+
             // First batch is the world. Make sure it lands in the stereo target even
             // if the game never explicitly asked for the back buffer.
             if (g_backBufferDrawPeriod == 1)
@@ -958,8 +1012,17 @@ namespace wowvr
         // opaque black slab in the world.
         void MaybeStartUiPass(IDirect3DDevice9* device)
         {
-            if (g_uiPassStarted || g_backBufferDrawPeriod < 2
-                || !g_renderingToBackBuffer || !g_alphaBlendEnabled)
+            if (g_uiPassStarted || g_backBufferDrawPeriod < 2 || !g_renderingToBackBuffer)
+            {
+                return;
+            }
+
+            // The blended-draw test exists to let the post-process composite through
+            // before the interface starts. On a loading screen there is no world pass
+            // and no composite, and the image itself is opaque, so waiting for a
+            // blended draw would never let it onto the panel.
+            const bool loadingScreen = !g_previousFrameHadCamera;
+            if (!loadingScreen && !g_alphaBlendEnabled)
             {
                 return;
             }
@@ -1094,10 +1157,11 @@ namespace wowvr
 
             // Only the scene camera gets swapped. UI and other ortho passes never had
             // a patched projection, so they are simply drawn into each half as-is.
-            if (g_haveEyeProjections)
+            for (int i = 0; i < g_patchedBlockCount; ++i)
             {
-                g_originalSetVertexShaderConstantF(device, g_projectionRegister,
-                                                   g_eyeProjection[eye], 4);
+                g_originalSetVertexShaderConstantF(
+                    device, g_patchedBlocks[i].startRegister,
+                    eye == EyeLeft ? g_patchedBlocks[i].left : g_patchedBlocks[i].right, 4);
             }
 
             // Rebuilt from whatever projection the game currently has set, not from a
@@ -1161,7 +1225,8 @@ namespace wowvr
                                 && g_depthFunction != D3DCMP_ALWAYS;
             Report().NoteDrawContext(g_renderingToBackBuffer, depthLike, g_alphaBlendEnabled,
                                      g_currentViewport.X, g_currentViewport.Width,
-                                     ShouldDuplicateDraw());
+                                     ShouldDuplicateDraw(),
+                                     g_currentViewport.MinZ, g_currentViewport.MaxZ);
         }
 
         HRESULT WINAPI HookedSetScissorRect(IDirect3DDevice9* device, const RECT* rect)
@@ -1307,25 +1372,42 @@ namespace wowvr
 
             if (couldHoldAMatrix && !g_duplicatingDraw)
             {
+                // Every four-register window is offered to the patch, not just the
+                // first. Different shaders keep the camera at different offsets within
+                // an upload, and anything missed here is drawn without the head
+                // rotation - which reads as geometry welded to the viewer's face.
                 static float patched[256 * 4];
-                if (Projection().TryPatch(data, g_eyeProjection[EyeLeft], g_eyeProjection[EyeRight]))
-                {
-                    // Remember where it went so each duplicated draw can put the right
-                    // eye's version back into the same registers.
-                    g_projectionRegister = startRegister;
-                    g_haveEyeProjections = true;
+                bool anyPatched = false;
 
-                    memcpy(patched, g_eyeProjection[EyeLeft], sizeof(float) * 16);
-                    memcpy(patched + 16, data + 16,
-                           (static_cast<size_t>(vector4Count) - 4) * 4 * sizeof(float));
-                    return g_originalSetVertexShaderConstantF(device, startRegister, patched, vector4Count);
+                // Only the head of the upload is tested. Sliding a window over the whole
+                // block was tried and matched thousands of times per frame - arrays of
+                // bone and lighting constants throw up four-register runs that look
+                // perspective-shaped by chance. Finding a camera at another offset needs
+                // an exact match against the known scene matrix, not a shape test.
+                for (UINT offset = 0; offset < 1; ++offset)
+                {
+                    float left[16];
+                    float right[16];
+                    if (!Projection().TryPatch(data + offset * 4, left, right))
+                    {
+                        continue;
+                    }
+
+                    if (!anyPatched)
+                    {
+                        memcpy(patched, data,
+                               static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                        anyPatched = true;
+                    }
+
+                    memcpy(patched + offset * 4, left, sizeof(left));
+                    RememberPatchedBlock(startRegister + offset, left, right);
                 }
 
-                // Something else has taken over these registers, so the cached eye
-                // matrices no longer describe what is about to be drawn.
-                if (g_haveEyeProjections && startRegister == g_projectionRegister)
+                if (anyPatched)
                 {
-                    g_haveEyeProjections = false;
+                    g_projectionPatchedThisFrame = true;
+                    return g_originalSetVertexShaderConstantF(device, startRegister, patched, vector4Count);
                 }
             }
 

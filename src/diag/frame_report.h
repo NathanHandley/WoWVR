@@ -39,7 +39,8 @@ namespace wowvr
         // Records what the device looked like for this draw, so the boundary between
         // the world pass and the UI pass can be found instead of guessed at.
         void NoteDrawContext(bool toBackBuffer, bool usingSceneCamera, bool depthTestOn,
-                             uint32_t viewportX, uint32_t viewportWidth, bool duplicated);
+                             uint32_t viewportX, uint32_t viewportWidth, bool duplicated,
+                             float minZ, float maxZ);
         void NoteRenderTarget(void* surface, uint32_t width, uint32_t height, uint32_t format);
 
     private:
@@ -88,6 +89,8 @@ namespace wowvr
             uint32_t viewportX = 0;
             uint32_t viewportWidth = 0;
             bool duplicated = false;
+            float minZ = 0.0f;
+            float maxZ = 1.0f;
         };
         DrawPhase m_phases[kMaxPhases];
         int m_phaseCount = 0;
