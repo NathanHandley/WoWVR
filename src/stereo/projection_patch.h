@@ -48,6 +48,12 @@ namespace wowvr
         // secondary perspective camera, which still has to follow the head.
         bool PatchAnyPerspective(const float* uploaded, float* outLeft, float* outRight);
 
+        // Geometry that is effectively infinitely far away - the sky dome. It must turn
+        // with the head but never translate: no per-eye offset, so both eyes see it
+        // identically and it reads as infinitely distant, and no head displacement, so
+        // leaning cannot produce parallax against it.
+        void SetInfiniteDistance(bool on) { m_infiniteDistance = on; }
+
         // Same recovery, but the residual must also look like a rigid placement
         // (perpendicular axes of equal length). Used when searching a shader's whole
         // constant file, where the plain affine test alone accepts far too much.
@@ -132,6 +138,7 @@ namespace wowvr
         unsigned long long m_combinedNoScene = 0;
         unsigned long long m_combinedNotAffine = 0;
         bool m_requireRigidResidual = false;
+        bool m_infiniteDistance = false;
         Mat4 m_sceneMatrix;              // row-vector form of the scene projection
         bool m_haveSceneMatrix = false;
         float m_sceneNear = 0.0f;

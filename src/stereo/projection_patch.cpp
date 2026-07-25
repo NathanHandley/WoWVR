@@ -273,7 +273,16 @@ namespace wowvr
             const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
             const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
 
-            if (Cfg().headTracking)
+            if (m_infiniteDistance)
+            {
+                // Rotation only. Translating the sky is what makes it feel like a
+                // painted wall a few metres away instead of a horizon.
+                if (Cfg().headTracking)
+                {
+                    replacement = Mat4Multiply(m_headRotation, replacement);
+                }
+            }
+            else if (Cfg().headTracking)
             {
                 // A point at P in the old view frame sits at (P - d) * R in the new
                 // one, so the correction ahead of the projection is T(-d) then R.
@@ -324,6 +333,11 @@ namespace wowvr
         const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
         const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
         const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+
+        if (m_infiniteDistance)
+        {
+            return Cfg().headTracking ? Mat4Multiply(m_headRotation, replacement) : replacement;
+        }
 
         const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
         const Mat4 correction = Cfg().headTracking

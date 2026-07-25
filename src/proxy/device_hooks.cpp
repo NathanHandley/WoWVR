@@ -479,6 +479,16 @@ namespace wowvr
         unsigned long long g_drawsOffscreen = 0;
         unsigned long long g_drawsStrayBackBuffer = 0;
         int g_lastPeriodCount = 0;
+        unsigned long long g_skySliceDraws = 0;
+
+        // The game uses the hardware cursor, which never reaches the render target, so
+        // in the headset there is nothing to aim with. This draws one onto the panel.
+        HWND g_gameWindow = nullptr;
+        IDirect3DTexture9* g_cursorTexture = nullptr;
+        bool g_cursorTextureFailed = false;
+        unsigned long long g_cursorDrawn = 0;
+        float g_lastCursorU = -1.0f;
+        float g_lastCursorV = -1.0f;
 
         // Pre-transformed vertices carry absolute screen coordinates and ignore the
         // view and projection entirely. Duplicating such a draw per eye does not move
@@ -569,9 +579,14 @@ namespace wowvr
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
             WOWVR_INFO("Draw routing: stereo %llu, ui %llu, offscreen %llu, "
-                       "STRAY-to-backbuffer %llu; periods last frame %d",
+                       "STRAY-to-backbuffer %llu; periods last frame %d; "
+                       "sky-slice eye draws %llu",
                        g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
-                       g_drawsStrayBackBuffer, g_lastPeriodCount);
+                       g_drawsStrayBackBuffer, g_lastPeriodCount, g_skySliceDraws);
+            WOWVR_INFO("Cursor: window %p, texture %s, drawn %llu, last position %.3f, %.3f",
+                       static_cast<void*>(g_gameWindow),
+                       g_cursorTexture != nullptr ? "ok" : "MISSING",
+                       g_cursorDrawn, g_lastCursorU, g_lastCursorV);
             WOWVR_INFO("World draws using pre-transformed screen coordinates: %llu",
                        g_preTransformedWorldDraws);
             WOWVR_INFO("World draws with the scissor test on: %llu (game scissor %ld,%ld - %ld,%ld)",
@@ -692,6 +707,91 @@ namespace wowvr
         // straight into the stereo target. Because it is real geometry at a real
         // distance the compositor stops treating it as a flat sheet at infinity, which
         // is what made it swim about when the head moved.
+        // A plain arrow, built here rather than shipped as a file. 'X' is the outline,
+        // '.' the fill, everything else transparent.
+        void EnsureCursorTexture(IDirect3DDevice9* device)
+        {
+            if (g_cursorTexture != nullptr || g_cursorTextureFailed)
+            {
+                return;
+            }
+
+            static const char* kArrow[16] = {
+                "X               ",
+                "XX              ",
+                "X.X             ",
+                "X..X            ",
+                "X...X           ",
+                "X....X          ",
+                "X.....X         ",
+                "X......X        ",
+                "X.......X       ",
+                "X........X      ",
+                "X.....XXXXX     ",
+                "X..X..X         ",
+                "X.X X..X        ",
+                "XX  X..X        ",
+                "X    X..X       ",
+                "      XX        ",
+            };
+
+            // Managed pool so it survives a device reset without needing to be rebuilt.
+            if (FAILED(device->CreateTexture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                             &g_cursorTexture, nullptr))
+                || g_cursorTexture == nullptr)
+            {
+                g_cursorTextureFailed = true;
+                WOWVR_WARN("Could not create the cursor texture; the pointer will not be drawn.");
+                return;
+            }
+
+            D3DLOCKED_RECT locked = {};
+            if (FAILED(g_cursorTexture->LockRect(0, &locked, nullptr, 0)))
+            {
+                g_cursorTexture->Release();
+                g_cursorTexture = nullptr;
+                g_cursorTextureFailed = true;
+                return;
+            }
+
+            for (int y = 0; y < 16; ++y)
+            {
+                uint32_t* row = reinterpret_cast<uint32_t*>(
+                    static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch);
+                for (int x = 0; x < 16; ++x)
+                {
+                    const char pixel = kArrow[y][x];
+                    row[x] = (pixel == 'X') ? 0xFF000000u
+                           : (pixel == '.') ? 0xFFFFFFFFu
+                           : 0x00000000u;
+                }
+            }
+            g_cursorTexture->UnlockRect(0);
+        }
+
+        // Where the pointer sits inside the game window, 0..1. False when it is outside
+        // or the window is not known yet.
+        bool CursorPanelPosition(float& u, float& v)
+        {
+            if (g_gameWindow == nullptr)
+            {
+                return false;
+            }
+
+            POINT point = {};
+            RECT client = {};
+            if (!GetCursorPos(&point) || !ScreenToClient(g_gameWindow, &point)
+                || !GetClientRect(g_gameWindow, &client)
+                || client.right <= client.left || client.bottom <= client.top)
+            {
+                return false;
+            }
+
+            u = static_cast<float>(point.x) / static_cast<float>(client.right - client.left);
+            v = static_cast<float>(point.y) / static_cast<float>(client.bottom - client.top);
+            return u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+        }
+
         void CompositeUiPanel(IDirect3DDevice9* device)
         {
             if (!g_uiRendered || !g_uiPanel.IsReady() || !g_stereoHasContent)
@@ -723,6 +823,8 @@ namespace wowvr
                     g_stateBlockFailureLogged = true;
                 }
             }
+
+            EnsureCursorTexture(device);
 
             const float width = Cfg().panelWidth;
             const float height = width * static_cast<float>(g_uiPanel.Height())
@@ -807,6 +909,35 @@ namespace wowvr
                                        reinterpret_cast<const D3DMATRIX*>(&world));
 
                 g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PanelVertex));
+
+                // The pointer, on the same panel and in the same world transform, so it
+                // sits on the interface rather than floating in front of it.
+                float u = 0.0f;
+                float v = 0.0f;
+                const bool havePointer = CursorPanelPosition(u, v);
+                g_lastCursorU = havePointer ? u : -1.0f;
+                g_lastCursorV = havePointer ? v : -1.0f;
+                if (g_cursorTexture != nullptr && havePointer)
+                {
+                    ++g_cursorDrawn;
+                    const float size = width * 0.030f;
+                    const float left = -halfWidth + u * width;
+                    const float top = halfHeight - v * height;
+
+                    const PanelVertex pointer[4] = {
+                        { left,        top,        0.0f, 0.0f, 0.0f },
+                        { left + size, top,        0.0f, 1.0f, 0.0f },
+                        { left,        top - size, 0.0f, 0.0f, 1.0f },
+                        { left + size, top - size, 0.0f, 1.0f, 1.0f },
+                    };
+
+                    device->SetTexture(0, g_cursorTexture);
+                    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, pointer,
+                                              sizeof(PanelVertex));
+                    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                    device->SetTexture(0, g_uiPanel.Texture());
+                }
             }
 
             if (savedState != nullptr)
@@ -1713,6 +1844,14 @@ namespace wowvr
                 }
             }
 
+            // The sky dome is squashed into the very top of the depth range, above the
+            // distant backdrop terrain at 0.998..0.999. That slice is the reliable way
+            // to recognise it: it needs the head's rotation but neither the head's
+            // displacement nor the per-eye offset, or it stops reading as a horizon.
+            const bool skyDepthSlice = viewport.MinZ >= 0.9985f;
+            if (skyDepthSlice) { ++g_skySliceDraws; }
+            Projection().SetInfiniteDistance(skyDepthSlice);
+
             // Rebuilt from whatever projection the game currently has set, not from a
             // cached one. The sky dome supplies its own projection with a far plane of
             // its own, and forcing every fixed-function draw through a single cached
@@ -1738,6 +1877,8 @@ namespace wowvr
             // its own 1920x1080 corner of the wider stereo target and cuts everything
             // off at that edge. Clipping to the whole eye is the faithful translation,
             // and unlike scaling the game's rectangle it cannot land somewhere odd.
+            Projection().SetInfiniteDistance(false);
+
             if (g_scissorTestEnabled)
             {
                 RECT scissor;
@@ -1941,7 +2082,11 @@ namespace wowvr
                            startRegister + vector4Count - 1, vector4Count);
             }
 
-            if (couldHoldAMatrix && !g_duplicatingDraw)
+            // Only while drawing the scene itself. Offscreen passes - the shadow map
+            // above all - render from the light's point of view, not the viewer's, and
+            // rewriting their transform with an eye camera renders the shadow map from
+            // the wrong place entirely. That is why shadows vanished.
+            if (couldHoldAMatrix && !g_duplicatingDraw && g_renderingToBackBuffer)
             {
                 // Every four-register window is offered to the patch, not just the
                 // first. Different shaders keep the camera at different offsets within
@@ -2426,6 +2571,16 @@ namespace wowvr
         {
             const HRESULT hr = g_originalCreateDevice(d3d9, adapter, deviceType, focusWindow,
                                                       behaviourFlags, parameters, returnedDevice);
+
+            // Needed to turn the desktop cursor position into panel coordinates.
+            if (parameters != nullptr && parameters->hDeviceWindow != nullptr)
+            {
+                g_gameWindow = parameters->hDeviceWindow;
+            }
+            else if (focusWindow != nullptr)
+            {
+                g_gameWindow = focusWindow;
+            }
 
             if (FAILED(hr) || returnedDevice == nullptr || *returnedDevice == nullptr)
             {
