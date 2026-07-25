@@ -333,6 +333,100 @@ namespace wowvr
         return Mat4Multiply(correction, replacement);
     }
 
+    namespace
+    {
+        // A world placement scales and rotates, it does not shear. Requiring the three
+        // axes to be mutually perpendicular and the same length rejects the arrays of
+        // bone and lighting constants that pass a bare affine test by chance.
+        bool LooksLikeRigidPlacement(const Mat4& m)
+        {
+            float length[3];
+            for (int row = 0; row < 3; ++row)
+            {
+                length[row] = sqrtf(m.m[row][0] * m.m[row][0]
+                                    + m.m[row][1] * m.m[row][1]
+                                    + m.m[row][2] * m.m[row][2]);
+                if (length[row] < 1.0e-3f || length[row] > 1.0e4f)
+                {
+                    return false;
+                }
+            }
+
+            if (fabsf(length[0] - length[1]) > 0.02f * length[0]
+                || fabsf(length[0] - length[2]) > 0.02f * length[0])
+            {
+                return false;
+            }
+
+            for (int a = 0; a < 3; ++a)
+            {
+                const int b = (a + 1) % 3;
+                const float dot = m.m[a][0] * m.m[b][0] + m.m[a][1] * m.m[b][1]
+                                + m.m[a][2] * m.m[b][2];
+                if (fabsf(dot) > 0.02f * length[a] * length[b])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    namespace
+    {
+        // Row-vector D3D: a perspective projection puts z into w, so m[2][3] is 1 and
+        // m[3][3] is 0. An orthographic one is the other way round. That distinction is
+        // what separates world geometry from the interface, and it does not care about
+        // aspect ratio or field of view.
+        bool LooksPerspective(const Mat4& m)
+        {
+            return fabsf(m.m[3][3]) < 1.0e-3f && fabsf(m.m[2][3]) > 0.5f;
+        }
+    }
+
+    bool ProjectionPatch::PatchAnyPerspective(const float* uploaded,
+                                              float* outLeft, float* outRight)
+    {
+        if (!Vr().IsActive())
+        {
+            return false;
+        }
+
+        Mat4 projection = MatrixFrom(uploaded);
+        bool wasTransposed = false;
+
+        if (!LooksPerspective(projection))
+        {
+            const Mat4 transposed = Mat4Transpose(projection);
+            if (!LooksPerspective(transposed))
+            {
+                return false;
+            }
+            projection = transposed;
+            wasTransposed = true;
+        }
+
+        // The near and far arguments are immaterial: BuildEyeProjection copies the depth
+        // terms straight out of the matrix it is given, so only x and y are rebuilt.
+        for (int eye = 0; eye < EyeCount; ++eye)
+        {
+            const Mat4 result = BuildEyeProjection(eye, 1.0f, 1000.0f, projection);
+            MatrixTo(wasTransposed ? Mat4Transpose(result) : result,
+                     eye == EyeLeft ? outLeft : outRight);
+        }
+
+        return true;
+    }
+
+    bool ProjectionPatch::TryPatchCombinedStrict(const float* uploaded,
+                                                 float* outLeft, float* outRight)
+    {
+        m_requireRigidResidual = true;
+        const bool ok = TryPatchCombined(uploaded, outLeft, outRight);
+        m_requireRigidResidual = false;
+        return ok;
+    }
+
     bool ProjectionPatch::TryPatchCombined(const float* uploaded, float* outLeft, float* outRight)
     {
         ++m_combinedTried;
@@ -375,6 +469,12 @@ namespace wowvr
         // Everything the game baked in ahead of the projection: world, view, and any
         // per-object placement. It is kept exactly as-is.
         const Mat4 worldView = Mat4Multiply(combined, inverseScene);
+
+        if (m_requireRigidResidual && !LooksLikeRigidPlacement(worldView))
+        {
+            ++m_combinedNotAffine;
+            return false;
+        }
 
         for (int eye = 0; eye < EyeCount; ++eye)
         {

@@ -45,6 +45,11 @@ namespace wowvr
         // if leaning moves the view too little, lower it if it moves too much.
         float unitsPerMetre = 1.0936f;
 
+        // Per-shader search for a combined world-view-projection. Off: it costs a
+        // constant-file scan per draw for every unresolved shader and has not yet been
+        // shown to find anything the c4 rule misses.
+        bool perShaderCombined = false;
+
         // [Camera]
         bool headTracking = true;       // HMD orientation drives the in-game view
         float cullFovScale = 1.6f;

@@ -1233,8 +1233,24 @@ namespace wowvr
                         reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
                 }
 
-                // Something that is not the scene camera - the interface's orthographic
-                // projection, most likely. Leave it alone and stop substituting.
+                // Not the scene camera. If it is still a perspective camera then world
+                // geometry is about to be drawn through it and it has to follow the head
+                // like everything else - a secondary camera with its own field of view is
+                // exactly what left small pieces of town geometry pinned to the screen.
+                // Only a genuinely orthographic projection is left alone.
+                if (Projection().PatchAnyPerspective(&matrix->_11,
+                                                     g_eyeFixedProjection[EyeLeft],
+                                                     g_eyeFixedProjection[EyeRight]))
+                {
+                    memcpy(g_currentFixedProjection, &matrix->_11,
+                           sizeof(g_currentFixedProjection));
+                    g_haveFixedProjectionSource = true;
+                    g_projectionPatchedThisFrame = true;
+                    return g_originalSetTransform(
+                        device, state,
+                        reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
+                }
+
                 g_haveFixedProjectionSource = false;
             }
 
@@ -1455,6 +1471,106 @@ namespace wowvr
             }
         }
 
+        // Which constant register holds a shader's combined world-view-projection.
+        //
+        // This has to be keyed on the shader, not on the register: c32 is the water's
+        // transform AND the character shaders' bone palette, so any global rule about a
+        // register is wrong for somebody. Resolving it per shader, at draw time when the
+        // shader is actually bound, is what makes patching the high registers safe.
+        struct ShaderCombined
+        {
+            IDirect3DVertexShader9* shader;
+            UINT startRegister;
+            int confirmations;
+            int attempts;
+            bool resolved;
+            bool hopeless;
+        };
+
+        const int kMaxShaderCombined = 96;
+        ShaderCombined g_shaderCombined[kMaxShaderCombined];
+        int g_shaderCombinedCount = 0;
+        IDirect3DVertexShader9* g_currentVertexShader = nullptr;
+
+        ShaderCombined* FindShaderCombined(IDirect3DVertexShader9* shader)
+        {
+            for (int i = 0; i < g_shaderCombinedCount; ++i)
+            {
+                if (g_shaderCombined[i].shader == shader)
+                {
+                    return &g_shaderCombined[i];
+                }
+            }
+
+            if (g_shaderCombinedCount >= kMaxShaderCombined)
+            {
+                return nullptr;
+            }
+
+            ShaderCombined& entry = g_shaderCombined[g_shaderCombinedCount++];
+            entry.shader = shader;
+            entry.startRegister = 0;
+            entry.confirmations = 0;
+            entry.attempts = 0;
+            entry.resolved = false;
+            entry.hopeless = false;
+            return &entry;
+        }
+
+        // Registers above the first 96 are texture and lighting data on every shader
+        // seen so far, and scanning them only costs time.
+        const UINT kCombinedSearchLimit = 96;
+
+        // Looks for the current shader's transform in its own constants. A register has
+        // to pass on several separate draws before it is trusted, so a matrix that
+        // happens to validate once cannot capture the shader.
+        void ResolveCombinedRegisterForShader()
+        {
+            if (!Cfg().perShaderCombined
+                || g_currentVertexShader == nullptr || !Projection().HasSceneProjection())
+            {
+                return;
+            }
+
+            ShaderCombined* entry = FindShaderCombined(g_currentVertexShader);
+            if (entry == nullptr || entry->resolved || entry->hopeless)
+            {
+                return;
+            }
+
+            if (++entry->attempts > 240)
+            {
+                entry->hopeless = true;
+                return;
+            }
+
+            float left[16];
+            float right[16];
+            for (UINT reg = 0; reg + 4 <= kCombinedSearchLimit && reg + 4 <= kShadowRegisters; ++reg)
+            {
+                if (!Projection().TryPatchCombinedStrict(&g_shadowConstants[reg][0], left, right))
+                {
+                    continue;
+                }
+
+                if (entry->confirmations > 0 && entry->startRegister == reg)
+                {
+                    if (++entry->confirmations >= 4)
+                    {
+                        entry->resolved = true;
+                        WOWVR_INFO("Shader %p draws through a combined transform at c%u.",
+                                   static_cast<void*>(g_currentVertexShader), reg);
+                    }
+                }
+                else
+                {
+                    entry->startRegister = reg;
+                    entry->confirmations = 1;
+                }
+                return;
+            }
+        }
+
         bool ShouldDuplicateDraw()
         {
             // The UI is deliberately excluded: it is laid out for a 1920x1080 screen
@@ -1507,6 +1623,26 @@ namespace wowvr
                 g_originalSetVertexShaderConstantF(
                     device, block.startRegister,
                     eye == EyeLeft ? block.left : block.right, 4);
+            }
+
+            // The current shader's own combined transform, rebuilt from the constants
+            // as they stand right now. Unlike the remembered blocks this is never
+            // cached across draws: the register holds a different object every time.
+            if (Cfg().perShaderCombined && g_currentVertexShader != nullptr)
+            {
+                const ShaderCombined* entry = FindShaderCombined(g_currentVertexShader);
+                if (entry != nullptr && entry->resolved)
+                {
+                    float left[16];
+                    float right[16];
+                    if (Projection().TryPatchCombined(&g_shadowConstants[entry->startRegister][0],
+                                                     left, right))
+                    {
+                        g_originalSetVertexShaderConstantF(
+                            device, entry->startRegister,
+                            eye == EyeLeft ? left : right, 4);
+                    }
+                }
             }
 
             // Rebuilt from whatever projection the game currently has set, not from a
@@ -1725,6 +1861,16 @@ namespace wowvr
                        static_cast<size_t>(count) * 4 * sizeof(float));
             }
 
+            if (Cfg().logWorldDrawTo > 0 && g_sequenceDumpArmed
+                && g_worldDrawIndex >= Cfg().logWorldDrawFrom
+                && g_worldDrawIndex <= Cfg().logWorldDrawTo
+                && !g_duplicatingDraw)
+            {
+                WOWVR_INFO("    upload at draw %d: c%u..c%u (%u regs)",
+                           g_worldDrawIndex, startRegister,
+                           startRegister + vector4Count - 1, vector4Count);
+            }
+
             if (couldHoldAMatrix && !g_duplicatingDraw)
             {
                 // Every four-register window is offered to the patch, not just the
@@ -1799,11 +1945,11 @@ namespace wowvr
 
                         if (!MatricesMatch(&g_shadowConstants[reg][0], g_sceneProjectionRaw))
                         {
-                            if (Report().IsActive())
+                            if (Report().IsActive() || Cfg().logWorldDrawTo > 0)
                             {
-                                WOWVR_INFO("  camera register c%u dropped: overwritten by an "
-                                           "upload of %u regs from c%u",
-                                           reg, vector4Count, startRegister);
+                                WOWVR_INFO("  camera register c%u dropped at world draw %d: "
+                                           "overwritten by an upload of %u regs from c%u",
+                                           reg, g_worldDrawIndex, vector4Count, startRegister);
                             }
                             g_patchedBlocks[i] = g_patchedBlocks[g_patchedBlockCount - 1];
                             --g_patchedBlockCount;
@@ -1870,6 +2016,11 @@ namespace wowvr
 
         HRESULT WINAPI HookedSetVertexShader(IDirect3DDevice9* device, IDirect3DVertexShader9* shader)
         {
+            if (!g_duplicatingDraw)
+            {
+                g_currentVertexShader = shader;
+            }
+
             if (Report().IsActive())
             {
                 Report().NoteVertexShaderSet(shader);
@@ -1991,6 +2142,7 @@ namespace wowvr
             }
             g_duplicatingDraw = false;
             NoteWorldDrawForSequence(device);
+            ResolveCombinedRegisterForShader();
             return hr;
         }
 
@@ -2031,6 +2183,7 @@ namespace wowvr
             }
             g_duplicatingDraw = false;
             NoteWorldDrawForSequence(device);
+            ResolveCombinedRegisterForShader();
             return hr;
         }
 
@@ -2066,6 +2219,7 @@ namespace wowvr
             }
             g_duplicatingDraw = false;
             NoteWorldDrawForSequence(device);
+            ResolveCombinedRegisterForShader();
             return hr;
         }
 
@@ -2107,6 +2261,7 @@ namespace wowvr
             }
             g_duplicatingDraw = false;
             NoteWorldDrawForSequence(device);
+            ResolveCombinedRegisterForShader();
             return hr;
         }
 

@@ -168,6 +168,8 @@ namespace wowvr
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);
         config.unitsPerMetre = ReadFloat(path, L"VR", L"UnitsPerMetre", config.unitsPerMetre);
+        config.perShaderCombined =
+            ReadInt(path, L"VR", L"PerShaderCombined", config.perShaderCombined ? 1 : 0) != 0;
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);

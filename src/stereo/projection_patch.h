@@ -43,6 +43,16 @@ namespace wowvr
         // affine-ness of that residual is what confirms the identification.
         bool TryPatchCombined(const float* uploaded, float* outLeft, float* outRight);
 
+        // Any perspective camera at all, whatever its aspect. TryPatch deliberately
+        // insists on the scene camera; this is for world geometry drawn under a
+        // secondary perspective camera, which still has to follow the head.
+        bool PatchAnyPerspective(const float* uploaded, float* outLeft, float* outRight);
+
+        // Same recovery, but the residual must also look like a rigid placement
+        // (perpendicular axes of equal length). Used when searching a shader's whole
+        // constant file, where the plain affine test alone accepts far too much.
+        bool TryPatchCombinedStrict(const float* uploaded, float* outLeft, float* outRight);
+
         bool HasSceneMatrix() const { return m_haveSceneMatrix; }
 
         // Head yaw relative to the recentred origin, in radians, in the game's
@@ -121,6 +131,7 @@ namespace wowvr
         unsigned long long m_combinedPatched = 0;
         unsigned long long m_combinedNoScene = 0;
         unsigned long long m_combinedNotAffine = 0;
+        bool m_requireRigidResidual = false;
         Mat4 m_sceneMatrix;              // row-vector form of the scene projection
         bool m_haveSceneMatrix = false;
         float m_sceneNear = 0.0f;
