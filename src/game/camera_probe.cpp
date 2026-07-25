@@ -520,4 +520,291 @@ namespace wowvr
     {
         return g_camera;
     }
+
+    namespace
+    {
+        bool Readable(const void* address, size_t bytes)
+        {
+            if (address == nullptr)
+            {
+                return false;
+            }
+
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(address, &info, sizeof(info)) == 0)
+            {
+                return false;
+            }
+
+            if (info.State != MEM_COMMIT)
+            {
+                return false;
+            }
+
+            const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                                 | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                                 | PAGE_EXECUTE_WRITECOPY;
+            if ((info.Protect & readable) == 0 || (info.Protect & PAGE_GUARD) != 0)
+            {
+                return false;
+            }
+
+            const uint8_t* start = static_cast<const uint8_t*>(info.BaseAddress);
+            const uint8_t* wanted = static_cast<const uint8_t*>(address);
+            return (wanted + bytes) <= (start + info.RegionSize);
+        }
+
+        const uintptr_t kCameraOffsetGuess = 0x7204u;
+
+        // Every comparison against a NaN is false, so a filter written as
+        // "reject if outside tolerance" rejects nothing at all when the memory is
+        // garbage. Finiteness has to be checked explicitly.
+        bool AllFinite(const float* values, int count)
+        {
+            for (int i = 0; i < count; ++i)
+            {
+                if (!(values[i] > -1.0e30f && values[i] < 1.0e30f))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool LooksOrthonormal(const float* m)
+        {
+            if (!AllFinite(m, 9))
+            {
+                return false;
+            }
+
+            for (int row = 0; row < 3; ++row)
+            {
+                const float* r = m + row * 3;
+                const float length = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+                if (fabsf(length - 1.0f) > 0.02f)
+                {
+                    return false;
+                }
+            }
+
+            for (int a = 0; a < 3; ++a)
+            {
+                const int b = (a + 1) % 3;
+                const float* ra = m + a * 3;
+                const float* rb = m + b * 3;
+                const float dot = ra[0] * rb[0] + ra[1] * rb[1] + ra[2] * rb[2];
+                if (fabsf(dot) > 0.02f)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    void CameraProbe::WatchFovField(float verticalScale)
+    {
+        if (m_fovField == nullptr || !Readable(m_fovField, sizeof(float)))
+        {
+            return;
+        }
+
+        const float expectedHalf = atanf(1.0f / verticalScale);
+        const float actual = *m_fovField;
+        WOWVR_INFO("FOV field 0x%08X = %.5f rad (%.3f deg full); projection says %.5f "
+                   "(%.3f deg full) -> %s",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_fovField)),
+                   actual, actual * 2.0f * 57.2957795f,
+                   expectedHalf, expectedHalf * 2.0f * 57.2957795f,
+                   fabsf(actual - expectedHalf) < 0.002f ? "TRACKS" : "diverged");
+    }
+
+    void CameraProbe::ProbeKnownOffsets(float verticalScale, float aspect)
+    {
+        // Published layout for 3.3.5a build 12340: a static pointer to the world frame,
+        // then the active camera hanging off it, then position / basis / clip / fov.
+        // The published addresses assume the usual 0x400000 image base, so they are
+        // rebased against wherever this exe actually loaded - it has been patched, and a
+        // rebased image is the simplest reason a published offset would read as zero.
+        const uintptr_t kPublishedImageBase = 0x00400000u;
+        const uintptr_t kWorldFrameRva = 0x00B7436Cu - kPublishedImageBase;
+        const uintptr_t kCameraOffset = 0x7204u;
+
+        const uintptr_t imageBase =
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const uintptr_t kWorldFramePtr = imageBase + kWorldFrameRva;
+
+        WOWVR_INFO("Camera offset probe: image base 0x%08X (published base 0x%08X), "
+                   "world-frame pointer at 0x%08X.",
+                   static_cast<unsigned>(imageBase),
+                   static_cast<unsigned>(kPublishedImageBase),
+                   static_cast<unsigned>(kWorldFramePtr));
+
+        const float expectedFovY = 2.0f * atanf(1.0f / verticalScale);
+
+        WOWVR_INFO("Camera offset probe: expecting a vertical fov near %.2f degrees "
+                   "(aspect %.4f).", expectedFovY * 57.2957795f, aspect);
+
+        if (!Readable(reinterpret_cast<const void*>(kWorldFramePtr), sizeof(uintptr_t)))
+        {
+            WOWVR_INFO("  the published world-frame pointer at 0x%08X is not readable; "
+                       "this client's layout does not match.",
+                       static_cast<unsigned>(kWorldFramePtr));
+            return;
+        }
+
+        const uintptr_t worldFrame = *reinterpret_cast<const uintptr_t*>(kWorldFramePtr);
+        if (!Readable(reinterpret_cast<const void*>(worldFrame), kCameraOffset + sizeof(uintptr_t)))
+        {
+            WOWVR_INFO("  world frame 0x%08X is not readable.", static_cast<unsigned>(worldFrame));
+            return;
+        }
+
+        const uintptr_t camera =
+            *reinterpret_cast<const uintptr_t*>(worldFrame + kCameraOffset);
+        if (!Readable(reinterpret_cast<const void*>(camera), 0x60))
+        {
+            WOWVR_INFO("  camera 0x%08X is not readable.", static_cast<unsigned>(camera));
+            return;
+        }
+
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(camera);
+        const float* position = reinterpret_cast<const float*>(base + 0x08);
+        const float* basis = reinterpret_cast<const float*>(base + 0x14);
+        const float nearClip = *reinterpret_cast<const float*>(base + 0x38);
+        const float farClip = *reinterpret_cast<const float*>(base + 0x3C);
+        const float fov = *reinterpret_cast<const float*>(base + 0x40);
+
+        WOWVR_INFO("  camera at 0x%08X: pos (%.2f, %.2f, %.2f) near %.3f far %.1f "
+                   "fov %.4f rad (%.2f deg), basis orthonormal=%d",
+                   static_cast<unsigned>(camera),
+                   position[0], position[1], position[2],
+                   nearClip, farClip, fov, fov * 57.2957795f,
+                   LooksOrthonormal(basis) ? 1 : 0);
+
+        // The decisive check: the field of view stored here has to agree with the one
+        // already decoded from the projection matrix on the wire.
+        const bool fovAgrees = fabsf(fov - expectedFovY) < 0.09f;
+        WOWVR_INFO("  fov agreement with the decoded projection: %s",
+                   fovAgrees ? "MATCH - this is the camera" : "no match");
+    }
+
+    // The published offset came back empty on this client, so instead walk the exe's own
+    // static data looking for a pointer that lands on something camera-shaped. This is
+    // far narrower than the whole-memory scans that failed before: only aligned pointers
+    // inside the image are followed, each candidate must carry an orthonormal basis, and
+    // the field of view has to agree with the projection already decoded off the wire.
+    void CameraProbe::ScanStaticsForCamera(float verticalScale)
+    {
+        const uintptr_t imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (imageBase == 0)
+        {
+            return;
+        }
+
+        const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
+        const IMAGE_NT_HEADERS* nt =
+            reinterpret_cast<const IMAGE_NT_HEADERS*>(imageBase + dos->e_lfanew);
+        const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+
+        const float expectedFovY = 2.0f * atanf(1.0f / verticalScale);
+        int examined = 0;
+        int hits = 0;
+
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
+        {
+            if ((section->Characteristics & IMAGE_SCN_MEM_WRITE) == 0)
+            {
+                continue;      // statics live in writable sections
+            }
+
+            const uintptr_t start = imageBase + section->VirtualAddress;
+            const size_t size = section->Misc.VirtualSize;
+
+            for (size_t offset = 0; offset + sizeof(uintptr_t) <= size;
+                 offset += sizeof(uintptr_t))
+            {
+                // Checked a page at a time: a section this size spans several memory
+                // regions, so asking whether the whole thing is readable in one go
+                // always failed and the sweep examined nothing at all.
+                if ((offset & 0xFFFu) == 0
+                    && !Readable(reinterpret_cast<const void*>(start + offset), 0x1000))
+                {
+                    offset += 0x1000 - sizeof(uintptr_t);
+                    continue;
+                }
+
+                const uintptr_t slot = *reinterpret_cast<const uintptr_t*>(start + offset);
+                if (slot < 0x10000u || (slot & 3u) != 0)
+                {
+                    continue;
+                }
+
+                // One indirection, then two, since the camera usually hangs off a frame.
+                for (int depth = 0; depth < 2; ++depth)
+                {
+                    const uintptr_t object = (depth == 0)
+                        ? slot
+                        : (Readable(reinterpret_cast<const void*>(slot + kCameraOffsetGuess),
+                                    sizeof(uintptr_t))
+                           ? *reinterpret_cast<const uintptr_t*>(slot + kCameraOffsetGuess)
+                           : 0);
+
+                    if (object < 0x10000u || !Readable(reinterpret_cast<const void*>(object), 0x60))
+                    {
+                        continue;
+                    }
+
+                    ++examined;
+                    if (!Readable(reinterpret_cast<const void*>(object), 0x140))
+                    {
+                        continue;
+                    }
+
+                    // No assumption about where the field sits. The camera's vertical
+                    // field of view could plausibly be stored as the full angle, the
+                    // half angle, or the tangent that goes straight into the projection,
+                    // so all three are looked for anywhere in the object's first 0x140
+                    // bytes and the offset that hits is reported.
+                    const uint8_t* base = reinterpret_cast<const uint8_t*>(object);
+                    const float wanted[3] = { expectedFovY, expectedFovY * 0.5f,
+                                              1.0f / verticalScale };
+                    const char* label[3] = { "full angle", "half angle", "tangent" };
+
+                    for (unsigned fieldOffset = 0; fieldOffset + 4 <= 0x140; fieldOffset += 4)
+                    {
+                        const float value = *reinterpret_cast<const float*>(base + fieldOffset);
+                        if (!AllFinite(&value, 1))
+                        {
+                            continue;
+                        }
+
+                        for (int k = 0; k < 3; ++k)
+                        {
+                            if (fabsf(value - wanted[k]) > 0.004f)
+                            {
+                                continue;
+                            }
+
+                            WOWVR_INFO("  candidate 0x%08X via static 0x%08X depth %d: "
+                                       "%s %.5f at +0x%X",
+                                       static_cast<unsigned>(object),
+                                       static_cast<unsigned>(start + offset), depth,
+                                       label[k], value, fieldOffset);
+                            ++hits;
+                        }
+                    }
+                }
+            }
+        }
+
+        WOWVR_INFO("Static-pointer camera scan: %d objects examined, %d matched a %.2f "
+                   "degree fov with an orthonormal basis.",
+                   examined, hits, expectedFovY * 57.2957795f);
+
+        // Two independent statics pointed at this one address holding half the decoded
+        // vertical field of view. Watch it rather than trust a single coincidence.
+        m_fovField = reinterpret_cast<float*>(0x00ABFC38u);
+    }
 }

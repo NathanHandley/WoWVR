@@ -36,6 +36,20 @@ namespace wowvr
         // frame with the projection's current vertical scale.
         void ActiveTest(float currentVerticalScale);
 
+        // Read-only check of the published 3.3.5a (build 12340) camera offsets. Nothing
+        // is written and no pointer is followed without first checking it is readable,
+        // so this cannot destabilise the client the way the old write-probe did. The
+        // decoded field of view from the projection matrix is the ground truth it is
+        // validated against.
+        void ProbeKnownOffsets(float verticalScale, float aspect);
+
+        // Bounded read-only sweep of the exe's writable static sections for a pointer
+        // that lands on a camera-shaped object.
+        void ScanStaticsForCamera(float verticalScale);
+
+        // Reports whether the located field still agrees with the decoded projection.
+        void WatchFovField(float verticalScale);
+
         bool Found() const { return m_fov != nullptr; }
         bool Searching() const { return m_fov == nullptr && m_candidateCount > 0; }
 
@@ -80,6 +94,7 @@ namespace wowvr
         float m_activeBaseline = 0.0f;
         int m_activeSettleFrames = 0;
         bool m_activeTestDone = false;
+        float* m_fovField = nullptr;
         float m_scannedFar = 0.0f;
         float m_scannedVerticalScale = 0.0f;
 

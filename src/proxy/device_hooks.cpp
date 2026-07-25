@@ -186,6 +186,14 @@ namespace wowvr
         float g_sceneProjectionRaw[16] = {};
         bool g_haveSceneProjectionRaw = false;
 
+        // The register the scene camera was actually discovered in, by shape, at the head
+        // of an upload. Other registers only ever join the table by matching its contents
+        // exactly, and those are general-purpose - c0 in particular is the water's
+        // combined transform and holds model data for other shaders. The primary must
+        // always be restored; the secondaries must not be restored over whatever else
+        // now lives there.
+        UINT g_primaryCameraRegister = 0xFFFFFFFFu;
+
         static constexpr int kMaxPatchedBlocks = 8;
         PatchedBlock g_patchedBlocks[kMaxPatchedBlocks];
         int g_patchedBlockCount = 0;
@@ -226,10 +234,11 @@ namespace wowvr
                 block->startRegister = startRegister;
             }
 
-            if (Report().IsActive())
+            if (Report().IsActive() || Cfg().logWorldDrawTo > 0)
             {
-                WOWVR_INFO("  camera register c%u registered (table now %d)",
-                           startRegister, g_patchedBlockCount);
+                WOWVR_INFO("  camera register c%u registered as %s (table now %d)",
+                           startRegister, combined ? "COMBINED" : "plain",
+                           g_patchedBlockCount);
             }
 
             block->combined = combined;
@@ -517,6 +526,9 @@ namespace wowvr
         // record of what the game wanted.
         float g_depthRanges[16][2] = {};
         int g_depthRangeCount = 0;
+        // The viewport the game last asked for, kept separate from g_currentViewport
+        // because BeginEye overwrites that one with the eye rect.
+        D3DVIEWPORT9 g_gameViewport = {};
         float g_gameViewportMinZ = 0.0f;
         float g_gameViewportMaxZ = 1.0f;
         RECT g_gameScissor = {};
@@ -1300,6 +1312,25 @@ namespace wowvr
             // then keep re-checking the candidates until exactly one is still telling
             // the truth. Done off the back of a presented frame so the one-off scan
             // hitch is not inside a visible one.
+            // One read-only look at the published 3.3.5a offsets, once the projection
+            // has been decoded so there is something to validate the field of view
+            // against. Cheap, and it needs no scan.
+            static bool s_knownOffsetsProbed = false;
+            if (Cfg().scanForCamera && !s_knownOffsetsProbed && g_frameCount == 240
+                && Projection().HasSceneProjection())
+            {
+                s_knownOffsetsProbed = true;
+                Camera().ProbeKnownOffsets(Projection().SceneVerticalScale(),
+                                           Projection().SceneAspect());
+                Camera().ScanStaticsForCamera(Projection().SceneVerticalScale());
+            }
+
+            if (Cfg().scanForCamera && g_frameCount > 240 && (g_frameCount % 300) == 0
+                && Projection().HasSceneProjection())
+            {
+                Camera().WatchFovField(Projection().SceneVerticalScale());
+            }
+
             if (Cfg().scanForCamera && Projection().HasSceneProjection() && !Camera().Found())
             {
                 const bool restart = Camera().ShouldRescan(Projection().SceneFar(),
@@ -1606,6 +1637,15 @@ namespace wowvr
                 IDirect3DBaseTexture9* texture = nullptr;
                 device->GetTexture(0, &texture);
 
+                // Every stage, not just the first. A model coming out as a flat colour
+                // with the right silhouette looks far more like it is sampling the wrong
+                // texture than like a transform fault, so what is bound where matters.
+                IDirect3DBaseTexture9* stage[4] = {};
+                for (DWORD st = 0; st < 4; ++st)
+                {
+                    device->GetTexture(st, &stage[st]);
+                }
+
                 IDirect3DVertexShader9* shader = nullptr;
                 device->GetVertexShader(&shader);
 
@@ -1615,7 +1655,7 @@ namespace wowvr
                 // to the viewer's head.
                 WOWVR_INFO("world draw %-4d: prims=%-6u tex=%p vs=%p blend=%s ztest=%s "
                            "depth=%.3f..%.3f  camShader=%d camFixed=%d cwrite=%X atest=%d "
-                           "ortho=%d",
+                           "ortho=%d vp=%ux%u+%u+%u tex0=%p tex1=%p tex2=%p tex3=%p",
                            g_worldDrawIndex, g_lastPrimitiveCount,
                            static_cast<void*>(texture), static_cast<void*>(shader),
                            g_alphaBlendEnabled ? "on" : "off",
@@ -1623,7 +1663,16 @@ namespace wowvr
                            g_currentViewport.MinZ, g_currentViewport.MaxZ,
                            g_patchedBlockCount, g_haveFixedProjectionSource ? 1 : 0,
                            g_colorWriteMask, g_alphaTestEnabled ? 1 : 0,
-                           g_fixedProjectionIsOrtho ? 1 : 0);
+                           g_fixedProjectionIsOrtho ? 1 : 0,
+                           g_gameViewport.Width, g_gameViewport.Height,
+                           g_gameViewport.X, g_gameViewport.Y,
+                           static_cast<void*>(stage[0]), static_cast<void*>(stage[1]),
+                           static_cast<void*>(stage[2]), static_cast<void*>(stage[3]));
+
+                for (DWORD st = 0; st < 4; ++st)
+                {
+                    if (stage[st] != nullptr) { stage[st]->Release(); }
+                }
 
                 // Which registers currently hold something that can be read back as a
                 // world-view-projection. This is the question that matters for a draw
@@ -1806,11 +1855,21 @@ namespace wowvr
             {
                 const PatchedBlock& block = g_patchedBlocks[i];
 
-                // A combined transform belongs to one object. Re-applying it to every
-                // draw overwrites whatever else that register is being used for, so it
-                // is only restored while the register still holds the matrix it was
-                // derived from.
-                if (block.combined && block.startRegister + 4 <= kShadowRegisters
+                // Restore only while the register still holds the matrix this block was
+                // derived from - except for the register the camera was actually
+                // discovered in, which is the camera's own home and must always be put
+                // back. Guarding that one too was tried and made things worse, because it
+                // dropped the VR camera on frames where a wide upload happened to cover
+                // it.
+                //
+                // The secondary registers do need the guard. c0 joins the table simply by
+                // holding the camera for a moment, but it is also the water's combined
+                // transform and carries model data for other shaders; stamping the camera
+                // back into it on every draw is what rendered models as flat silhouettes.
+                const bool isPrimary = !block.combined
+                    && block.startRegister == g_primaryCameraRegister;
+
+                if (!isPrimary && block.startRegister + 4 <= kShadowRegisters
                     && !MatricesMatch(&g_shadowConstants[block.startRegister][0], block.source))
                 {
                     continue;
@@ -1948,6 +2007,7 @@ namespace wowvr
             if (viewport != nullptr)
             {
                 g_currentViewport = *viewport;
+                g_gameViewport = *viewport;
                 g_gameViewportMinZ = viewport->MinZ;
                 g_gameViewportMaxZ = viewport->MaxZ;
 
@@ -1985,9 +2045,22 @@ namespace wowvr
         // corner of the side-by-side target, so without this most of the stereo
         // target keeps last frame's contents and the two eyes disagree about
         // everything outside that rectangle.
+        // Logged so the boundary between the shadow pass and the world pass can be
+        // seen: the pass that owns the frame is the one that clears before drawing.
+        void NoteClearForBoundary(DWORD flags)
+        {
+            if (Cfg().logWorldDrawTo > 0 && g_sequenceDumpArmed)
+            {
+                WOWVR_INFO("  >> Clear flags=0x%lX (after draw %d, backBuffer=%d)",
+                           flags, g_worldDrawIndex, g_renderingToBackBuffer ? 1 : 0);
+            }
+        }
+
         HRESULT WINAPI HookedClear(IDirect3DDevice9* device, DWORD rectCount, const D3DRECT* rects,
                                    DWORD flags, D3DCOLOR colour, float z, DWORD stencil)
         {
+            NoteClearForBoundary(flags);
+
             // The frame-start clear is the game's first act, before any draw, so the
             // redirect has to happen here rather than at the first draw. Otherwise the
             // clear lands on the real back buffer, the stereo depth buffer is never
@@ -2092,8 +2165,21 @@ namespace wowvr
                 // first. Different shaders keep the camera at different offsets within
                 // an upload, and anything missed here is drawn without the head
                 // rotation - which reads as geometry welded to the viewer's face.
-                static float patched[256 * 4];
+                // Sized generously and, crucially, BOUNDED. This previously held
+                // 256 float4s and was filled with memcpy(patched, data, vector4Count...)
+                // with no check on vector4Count, so any larger upload ran straight off
+                // the end of it. That is what corrupted whatever followed in memory and
+                // rendered models as flat silhouettes - worse with the client's extended
+                // shadows on, because those uploads are bigger.
+                const UINT kMaxPatchRegisters = 1024;
+                static float patched[kMaxPatchRegisters * 4];
                 bool anyPatched = false;
+
+                if (vector4Count > kMaxPatchRegisters)
+                {
+                    return g_originalSetVertexShaderConstantF(device, startRegister,
+                                                              data, vector4Count);
+                }
 
                 // The head of the upload is tested by shape, which is how the scene
                 // camera gets discovered in the first place. Every other offset is
@@ -2129,6 +2215,11 @@ namespace wowvr
 
                     memcpy(patched + offset * 4, left, sizeof(left));
                     RememberPatchedBlock(startRegister + offset, window, left, right);
+
+                    if (offset == 0)
+                    {
+                        g_primaryCameraRegister = startRegister;
+                    }
 
                     // Remember the camera itself so every other register holding it can
                     // be recognised.
@@ -2212,7 +2303,9 @@ namespace wowvr
                     RememberPatchedBlock(reg, data + offset * 4, left, right, true);
                 }
 
-                if (anyPatched)
+                // UseGameProjection doubles as a bisect for this: with it set the game's
+                // own constants go through untouched.
+                if (anyPatched && !Cfg().useGameProjection)
                 {
                     g_projectionPatchedThisFrame = true;
                     return g_originalSetVertexShaderConstantF(device, startRegister, patched, vector4Count);
@@ -2301,6 +2394,14 @@ namespace wowvr
                 // patch uses it to stay off the shadow map and the post-process
                 // passes, which reuse the same constant register as the scene camera.
                 g_renderingToBackBuffer = (width == g_backBufferWidth && height == g_backBufferHeight);
+
+                if (Cfg().logWorldDrawTo > 0 && g_sequenceDumpArmed)
+                {
+                    WOWVR_INFO("  >> SetRenderTarget %ux%u fmt=%u %s (after draw %d)",
+                               width, height, format,
+                               (surface == g_realBackBuffer) ? "= REAL BACK BUFFER" : "(offscreen)",
+                               g_worldDrawIndex);
+                }
 
                 if (Report().IsActive())
                 {

@@ -352,6 +352,22 @@ namespace wowvr
         // A world placement scales and rotates, it does not shear. Requiring the three
         // axes to be mutually perpendicular and the same length rejects the arrays of
         // bone and lighting constants that pass a bare affine test by chance.
+        bool Mat4IsNearIdentity(const Mat4& m, float tolerance)
+        {
+            for (int row = 0; row < 4; ++row)
+            {
+                for (int col = 0; col < 4; ++col)
+                {
+                    const float expected = (row == col) ? 1.0f : 0.0f;
+                    if (fabsf(m.m[row][col] - expected) > tolerance)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
         bool LooksLikeRigidPlacement(const Mat4& m)
         {
             float length[3];
@@ -483,6 +499,13 @@ namespace wowvr
         // Everything the game baked in ahead of the projection: world, view, and any
         // per-object placement. It is kept exactly as-is.
         const Mat4 worldView = Mat4Multiply(combined, inverseScene);
+
+        // NOTE: rejecting an identity residual here (which is what the camera register
+        // itself produces, since P * inverse(P) = I) was tried and is NOT correct as a
+        // blanket rule: it stopped every shader from resolving at all, including the
+        // water's genuine combined transform at c0. It also did not fix the flat-green
+        // model corruption, which persists with zero shaders resolved and therefore has
+        // another cause entirely.
 
         if (m_requireRigidResidual && !LooksLikeRigidPlacement(worldView))
         {
