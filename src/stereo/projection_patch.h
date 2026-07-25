@@ -36,6 +36,15 @@ namespace wowvr
         // Returns false to leave the upload alone.
         bool TryPatch(const float* uploaded, float* outLeft, float* outRight);
 
+        // Same, for a *combined* world-view-projection. Terrain hands the shader one
+        // matrix with the camera already multiplied in, so there is no projection to
+        // substitute. But if M = WV * P for the camera P we already know, then
+        // WV = M * inverse(P) can be recovered and re-emitted as WV * P_eye. The
+        // affine-ness of that residual is what confirms the identification.
+        bool TryPatchCombined(const float* uploaded, float* outLeft, float* outRight);
+
+        bool HasSceneMatrix() const { return m_haveSceneMatrix; }
+
         // Head yaw relative to the recentred origin, in radians, in the game's
         // left-handed convention. Drives the body-locked panel.
         float HeadYaw() const { return m_headYaw; }
@@ -73,6 +82,12 @@ namespace wowvr
 
         bool Decode(const float* uploaded, Decoded& out) const;
 
+        // The per-eye replacement for a projection, in row-vector form: the headset's
+        // frustum, the eye offset and the head correction, with the original depth
+        // terms carried over so depth behaves exactly as the client expects.
+        Mat4 BuildEyeProjection(int eye, float nearPlane, float farPlane,
+                                const Mat4& original) const;
+
         float m_sceneAspect = 16.0f / 9.0f;
         Mat4 m_headRotation = Mat4Identity();
         Mat4 m_neutralInverse = Mat4Identity();
@@ -98,6 +113,16 @@ namespace wowvr
 
         unsigned long long m_patched = 0;
         unsigned long long m_rejected = 0;
+
+        // Combined world-view-projection path, counted separately. A terrain chunk
+        // whose residual fails the affine test is drawn with the game's own narrow
+        // camera, so a non-zero reject count here is visible geometry, not noise.
+        unsigned long long m_combinedTried = 0;
+        unsigned long long m_combinedPatched = 0;
+        unsigned long long m_combinedNoScene = 0;
+        unsigned long long m_combinedNotAffine = 0;
+        Mat4 m_sceneMatrix;              // row-vector form of the scene projection
+        bool m_haveSceneMatrix = false;
         float m_sceneNear = 0.0f;
         float m_sceneFar = 0.0f;
         float m_sceneVerticalScale = 0.0f;

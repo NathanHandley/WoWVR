@@ -213,6 +213,8 @@ namespace wowvr
         }
 
         // Accepted: this is the player's camera, so remember what it is made of.
+        m_sceneMatrix = decoded.projection;
+        m_haveSceneMatrix = true;
         m_sceneNear = decoded.nearPlane;
         m_sceneFar = decoded.farPlane;
         m_sceneVerticalScale = decoded.verticalScale;
@@ -293,8 +295,107 @@ namespace wowvr
         return true;
     }
 
+    Mat4 ProjectionPatch::BuildEyeProjection(int eye, float nearPlane, float farPlane,
+                                             const Mat4& original) const
+    {
+        Mat4 replacement = original;
+
+        if (Vr().IsActive())
+        {
+            float tanLeft = 0.0f;
+            float tanRight = 0.0f;
+            float tanTop = 0.0f;
+            float tanBottom = 0.0f;
+            Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+
+            replacement = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                  nearPlane, farPlane);
+
+            // Depth terms carried over verbatim; see the note in TryPatch.
+            replacement.m[2][2] = original.m[2][2];
+            replacement.m[3][2] = original.m[3][2];
+            replacement.m[2][3] = original.m[2][3];
+            replacement.m[3][3] = original.m[3][3];
+        }
+
+        const float unitsPerMetre = Cfg().unitsPerMetre * Cfg().worldScale;
+        const Vec3 eyeOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
+
+        const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
+        const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
+        const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+
+        const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
+        const Mat4 correction = Cfg().headTracking
+            ? Mat4Multiply(translation, m_headRotation)
+            : translation;
+
+        return Mat4Multiply(correction, replacement);
+    }
+
+    bool ProjectionPatch::TryPatchCombined(const float* uploaded, float* outLeft, float* outRight)
+    {
+        ++m_combinedTried;
+
+        if (!m_haveSceneMatrix || !Vr().IsActive())
+        {
+            ++m_combinedNoScene;
+            return false;
+        }
+
+        Mat4 inverseScene;
+        if (!Mat4Inverse(m_sceneMatrix, inverseScene))
+        {
+            return false;
+        }
+
+        // The upload may be either way round; whichever orientation leaves an affine
+        // residual is the right reading.
+        const Mat4 asUploaded = MatrixFrom(uploaded);
+        const Mat4 transposed = Mat4Transpose(asUploaded);
+
+        Mat4 combined;
+        bool wasTransposed = false;
+
+        if (Mat4IsAffine(Mat4Multiply(asUploaded, inverseScene), 1.0e-3f))
+        {
+            combined = asUploaded;
+        }
+        else if (Mat4IsAffine(Mat4Multiply(transposed, inverseScene), 1.0e-3f))
+        {
+            combined = transposed;
+            wasTransposed = true;
+        }
+        else
+        {
+            ++m_combinedNotAffine;
+            return false;
+        }
+
+        // Everything the game baked in ahead of the projection: world, view, and any
+        // per-object placement. It is kept exactly as-is.
+        const Mat4 worldView = Mat4Multiply(combined, inverseScene);
+
+        for (int eye = 0; eye < EyeCount; ++eye)
+        {
+            const Mat4 eyeProjection = BuildEyeProjection(eye, m_sceneNear, m_sceneFar,
+                                                          m_sceneMatrix);
+            const Mat4 result = Mat4Multiply(worldView, eyeProjection);
+            MatrixTo(wasTransposed ? Mat4Transpose(result) : result,
+                     eye == EyeLeft ? outLeft : outRight);
+        }
+
+        ++m_patched;
+        ++m_combinedPatched;
+        return true;
+    }
+
     void ProjectionPatch::LogLastDecision() const
     {
+        WOWVR_INFO("Combined transform path: %llu offered, %llu rewritten, %llu skipped for "
+                   "no scene camera yet, %llu rejected as not affine",
+                   m_combinedTried, m_combinedPatched, m_combinedNoScene, m_combinedNotAffine);
+
         WOWVR_INFO("Projection patch: %llu patched, %llu left alone. Last seen aspect %.4f "
                    "(scene aspect %.4f), near %.3f, far %.1f",
                    m_patched, m_rejected, m_lastAspect, m_sceneAspect, m_lastNear, m_lastFar);

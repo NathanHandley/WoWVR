@@ -76,6 +76,68 @@ namespace wowvr
 
         // Defined below, once the stereo state it needs is in scope.
         bool StereoActive();
+        void ProbeForCombinedTransforms();
+
+        // A genuine world-view residual is a rigid transform, possibly uniformly scaled:
+        // its three basis rows are mutually perpendicular and the same length. A window
+        // straddling two entries of a 4x3 bone palette satisfies "affine" by accident
+        // but never satisfies this, which is what separates terrain's c4 from the bone
+        // array at c32 - patching the latter collapsed models into black shards.
+        bool IsPlausibleWorldView(const Mat4& m)
+        {
+            float lengths[3];
+            for (int row = 0; row < 3; ++row)
+            {
+                lengths[row] = sqrtf(m.m[row][0] * m.m[row][0]
+                                   + m.m[row][1] * m.m[row][1]
+                                   + m.m[row][2] * m.m[row][2]);
+                if (!(lengths[row] > 1.0e-4f) || !(lengths[row] < 1.0e4f))
+                {
+                    return false;
+                }
+            }
+
+            // Uniform scale across the three axes.
+            const float smallest = fminf(lengths[0], fminf(lengths[1], lengths[2]));
+            const float largest = fmaxf(lengths[0], fmaxf(lengths[1], lengths[2]));
+            if (largest > smallest * 1.05f)
+            {
+                return false;
+            }
+
+            // Mutually perpendicular.
+            for (int a = 0; a < 3; ++a)
+            {
+                for (int b = a + 1; b < 3; ++b)
+                {
+                    const float dot = m.m[a][0] * m.m[b][0]
+                                    + m.m[a][1] * m.m[b][1]
+                                    + m.m[a][2] * m.m[b][2];
+                    if (fabsf(dot) > 0.02f * lengths[a] * lengths[b])
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        bool IsNearlyIdentity(const Mat4& m)
+        {
+            for (int row = 0; row < 4; ++row)
+            {
+                for (int column = 0; column < 4; ++column)
+                {
+                    const float expected = (row == column) ? 1.0f : 0.0f;
+                    if (fabsf(m.m[row][column] - expected) > 1.0e-3f)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
 
 
         IDirect3DDevice9* g_device = nullptr;
@@ -108,16 +170,41 @@ namespace wowvr
             UINT startRegister = 0;
             float source[16] = {};   // the game's own matrix, kept so the eye versions
                                      // can be rebuilt against a fresh head pose
+            bool combined = false;   // holds a world-view-projection, not a projection
             float left[16] = {};
             float right[16] = {};
         };
+        // A shadow copy of the vertex shader constant file, holding what the *game*
+        // uploaded rather than what we forwarded. Needed because the camera can be read
+        // from registers we never see identified at the head of an upload, and the
+        // device cannot be queried: it was created PUREDEVICE.
+        static constexpr int kShadowRegisters = 256;
+        float g_shadowConstants[kShadowRegisters][4] = {};
+
+        // The scene projection exactly as the game supplied it, used to recognise every
+        // other register holding the same matrix.
+        float g_sceneProjectionRaw[16] = {};
+        bool g_haveSceneProjectionRaw = false;
+
         static constexpr int kMaxPatchedBlocks = 8;
         PatchedBlock g_patchedBlocks[kMaxPatchedBlocks];
         int g_patchedBlockCount = 0;
         bool g_haveEyeProjections = false;
 
+        // Registers found to carry a combined world-view-projection. Terrain uses one,
+        // and it is re-uploaded for every chunk, so these are re-derived on each upload
+        // rather than cached like a plain projection.
+        static constexpr int kMaxCombinedRegisters = 8;
+        UINT g_combinedRegisters[kMaxCombinedRegisters] = {};
+        int g_combinedRegisterCount = 0;
+        UINT g_combinedSeen[16] = {};
+        int g_combinedSeenCount = 0;
+        unsigned long long g_lastProbeFrame = 0;
+        int g_rejectionsLogged = 0;
+
         void RememberPatchedBlock(UINT startRegister, const float* source,
-                                  const float* left, const float* right)
+                                  const float* left, const float* right,
+                                  bool combined = false)
         {
             PatchedBlock* block = nullptr;
             for (int i = 0; i < g_patchedBlockCount; ++i)
@@ -139,6 +226,13 @@ namespace wowvr
                 block->startRegister = startRegister;
             }
 
+            if (Report().IsActive())
+            {
+                WOWVR_INFO("  camera register c%u registered (table now %d)",
+                           startRegister, g_patchedBlockCount);
+            }
+
+            block->combined = combined;
             memcpy(block->source, source, sizeof(block->source));
             memcpy(block->left, left, sizeof(block->left));
             memcpy(block->right, right, sizeof(block->right));
@@ -149,12 +243,180 @@ namespace wowvr
         // because WoW draws terrain *before* re-uploading its camera each frame: those
         // draws would otherwise inherit the previous frame's left-eye matrix, identical
         // in both eyes and a frame stale, which reads as terrain welded to the head.
+        bool MatricesMatch(const float* a, const float* b)
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                const float scale = (fabsf(b[i]) > 1.0f) ? fabsf(b[i]) : 1.0f;
+                if (fabsf(a[i] - b[i]) > 1.0e-5f * scale)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Finds every register currently holding the scene camera, by exact comparison
+        // against the matrix the game supplied - not by guessing at matrix shape, which
+        // matched thousands of unrelated constants per frame when it was tried.
+        void FindAllCameraRegisters()
+        {
+            if (!g_haveSceneProjectionRaw)
+            {
+                return;
+            }
+
+            int found = 0;
+            for (int reg = 0; reg + 4 <= kShadowRegisters; ++reg)
+            {
+                if (!MatricesMatch(&g_shadowConstants[reg][0], g_sceneProjectionRaw))
+                {
+                    continue;
+                }
+                ++found;
+
+                float left[16];
+                float right[16];
+                if (Projection().TryPatch(&g_shadowConstants[reg][0], left, right))
+                {
+                    RememberPatchedBlock(static_cast<UINT>(reg), &g_shadowConstants[reg][0],
+                                         left, right);
+                }
+            }
+
+            if (Report().IsActive())
+            {
+                WOWVR_INFO("  end-of-frame camera sweep: %d register(s) hold the scene "
+                           "matrix, table now %d", found, g_patchedBlockCount);
+            }
+        }
+
+        // Diagnostic: is any register holding a combined world-view-projection built on
+        // the camera we know? If M = WV * P then M * inverse(P) is affine, which is a
+        // property no unrelated constant satisfies by accident.
+        void ProbeForCombinedTransforms()
+        {
+            static int probeRuns = 0;
+            if (++probeRuns <= 6)
+            {
+                WOWVR_INFO("  combined probe run %d at frame %llu (scene matrix known: %s)",
+                           probeRuns, g_frameCount, g_haveSceneProjectionRaw ? "yes" : "no");
+            }
+
+            if (!g_haveSceneProjectionRaw)
+            {
+                return;
+            }
+
+            Mat4 sceneRaw;
+            memcpy(&sceneRaw.m[0][0], g_sceneProjectionRaw, sizeof(sceneRaw.m));
+
+            // The upload may be transposed; try the matrix both ways round.
+            Mat4 candidates[2] = { sceneRaw, Mat4Transpose(sceneRaw) };
+
+            for (int variant = 0; variant < 2; ++variant)
+            {
+                Mat4 inverse;
+                if (!Mat4Inverse(candidates[variant], inverse))
+                {
+                    continue;
+                }
+
+                int hits = 0;
+                for (int reg = 0; reg + 4 <= kShadowRegisters && hits < 6; ++reg)
+                {
+                    Mat4 m;
+                    memcpy(&m.m[0][0], &g_shadowConstants[reg][0], sizeof(m.m));
+
+                    const Mat4 residual = Mat4Multiply(m, inverse);
+                    const Mat4 residualT = Mat4Multiply(Mat4Transpose(m), inverse);
+
+                    // A register holding the camera itself passes trivially: P * P⁻¹ is
+                    // the identity, which is affine. Only a residual carrying a real
+                    // world-view component counts.
+                    // Registers from c31 upward are the bone palette: the frame report
+                    // shows uploads from c31 in multiples of three, i.e. 4x3 matrices.
+                    // A four-register window there straddles two bones and satisfies the
+                    // affine test by coincidence - that is what c32 was, and patching it
+                    // collapsed models into black shards. Terrain's own transform sits
+                    // well below that.
+                    const bool inBonePalette = reg >= 28;
+
+                    const bool direct = !inBonePalette && Mat4IsAffine(residual, 1.0e-3f)
+                        && !IsNearlyIdentity(residual);
+                    const bool flipped = !inBonePalette && Mat4IsAffine(residualT, 1.0e-3f)
+                        && !IsNearlyIdentity(residualT);
+
+                    // Anything affine and non-identity is reported with its measured
+                    // properties, so the acceptance thresholds can be set from data
+                    // instead of guessed at.
+                    if (!direct && !flipped)
+                    {
+                        const Mat4& r = Mat4IsAffine(residual, 1.0e-3f) ? residual : residualT;
+                        if ((Mat4IsAffine(residual, 1.0e-3f) || Mat4IsAffine(residualT, 1.0e-3f))
+                            && !IsNearlyIdentity(r) && g_rejectionsLogged < 8)
+                        {
+                            ++g_rejectionsLogged;
+                            float len[3];
+                            for (int row = 0; row < 3; ++row)
+                            {
+                                len[row] = sqrtf(r.m[row][0]*r.m[row][0]
+                                               + r.m[row][1]*r.m[row][1]
+                                               + r.m[row][2]*r.m[row][2]);
+                            }
+                            const float d01 = r.m[0][0]*r.m[1][0] + r.m[0][1]*r.m[1][1] + r.m[0][2]*r.m[1][2];
+                            WOWVR_INFO("  c%-3d affine residual rejected: row lengths %.4f %.4f %.4f, "
+                                       "dot01 %.5f", reg, len[0], len[1], len[2], d01);
+                        }
+                    }
+
+                    if (direct || flipped)
+                    {
+                        ++hits;
+
+                        bool known = false;
+                        for (int k = 0; k < g_combinedRegisterCount; ++k)
+                        {
+                            if (g_combinedRegisters[k] == static_cast<UINT>(reg))
+                            {
+                                known = true;
+                                break;
+                            }
+                        }
+                        // Accepted on sight. Requiring a second sighting was tried and
+                        // simply prevented discovery: the probe mostly runs before the
+                        // world is loaded, so terrain's register is rarely seen twice
+                        // before it is needed. The register-range exclusion above is
+                        // what keeps the bone palette out.
+                        if (!known && g_combinedRegisterCount < kMaxCombinedRegisters)
+                        {
+                            g_combinedRegisters[g_combinedRegisterCount++] = static_cast<UINT>(reg);
+                            WOWVR_INFO("  c%-3d carries a combined world-view-projection; "
+                                       "rebuilding it per eye", reg);
+                        }
+                    }
+                }
+                if (hits > 0)
+                {
+                    WOWVR_INFO("  combined-transform probe, P variant %d: %d register(s)",
+                               variant, hits);
+                }
+            }
+        }
+
         void RefreshPatchedBlocks()
         {
             for (int i = 0; i < g_patchedBlockCount; ++i)
             {
                 PatchedBlock& block = g_patchedBlocks[i];
-                Projection().TryPatch(block.source, block.left, block.right);
+                if (block.combined)
+                {
+                    Projection().TryPatchCombined(block.source, block.left, block.right);
+                }
+                else
+                {
+                    Projection().TryPatch(block.source, block.left, block.right);
+                }
             }
         }
 
@@ -213,6 +475,7 @@ namespace wowvr
         UINT g_lastPrimitiveCount = 0;
         bool g_projectionPatchedThisFrame = false;
         bool g_previousFrameHadCamera = true;
+        bool g_probeCombinedPending = false;
         bool g_stateBlockFailureLogged = false;
         bool g_sequenceDumpArmed = false;
         bool g_armSequenceNextFrame = false;
@@ -552,6 +815,8 @@ namespace wowvr
         // anything to do with how the two halves relate: mis-sized viewports, regions
         // that were never cleared, content drawn once instead of twice. Those are
         // exactly the bugs left, so this dumps the target itself.
+        int g_stereoDumpIndex = 0;
+
         void DumpStereoTarget(IDirect3DDevice9* device)
         {
             if (!g_stereo.IsReady())
@@ -577,9 +842,30 @@ namespace wowvr
                 D3DLOCKED_RECT locked = {};
                 if (SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
                 {
+                    // Numbered as well as fixed-name, so a run can take a series of
+                    // shots without each one overwriting the last.
+                    wchar_t numbered[64];
+                    swprintf_s(numbered, L"WoWVR_stereo_%02d.bmp", g_stereoDumpIndex);
                     SaveBgraBmp(ModuleFile(L"WoWVR_stereo.bmp").c_str(), locked.pBits,
                                 width, height, static_cast<uint32_t>(locked.Pitch));
+                    SaveBgraBmp(ModuleFile(numbered).c_str(), locked.pBits,
+                                width, height, static_cast<uint32_t>(locked.Pitch));
                     staging->UnlockRect();
+
+                    // The pose the shot was taken at. Without this a series of captures
+                    // cannot be told apart from a series where tracking had frozen -
+                    // which looks exactly like "everything is welded to the head".
+                    const Mat4& head = Vr().HeadToStage();
+                    const float yaw = atan2f(-head.m[2][0], head.m[2][2]) * 57.2957795f;
+                    const float pitch = asinf(head.m[2][1] > 1.0f ? 1.0f
+                                              : (head.m[2][1] < -1.0f ? -1.0f : head.m[2][1]))
+                                        * 57.2957795f;
+                    WOWVR_INFO("stereo dump %02d: head yaw %.2f deg, pitch %.2f deg, "
+                               "pos (%.3f, %.3f, %.3f), poseValid=%d, userPresent=%d",
+                               g_stereoDumpIndex, yaw, pitch,
+                               head.m[3][0], head.m[3][1], head.m[3][2],
+                               Vr().HasHeadPose() ? 1 : 0, Vr().UserIsPresent() ? 1 : 0);
+                    ++g_stereoDumpIndex;
                 }
             }
             else
@@ -752,6 +1038,7 @@ namespace wowvr
                 // Armed for the frame that is about to start, so the report covers a
                 // whole frame rather than whatever is left of the current one.
                 Report().RequestFrame(g_frameCount + 1);
+                g_probeCombinedPending = true;
                 WOWVR_INFO("F9: frame report armed for frame %llu.", g_frameCount + 1);
             }
 
@@ -821,6 +1108,8 @@ namespace wowvr
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
                     g_uiPanel.Update(Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
+
+                    FindAllCameraRegisters();
                     RefreshPatchedBlocks();
 
                 }
@@ -970,6 +1259,28 @@ namespace wowvr
             // Where every draw actually ended up. If world geometry is going somewhere
             // other than the stereo target, this says so directly instead of leaving it
             // to be inferred from a black screen.
+            // Probe at the first world draw, not at Present: the shadow is a live
+            // mirror, so by the end of the frame it holds the interface's constants and
+            // no longer resembles anything terrain was drawn with.
+            // Keeps looking for a while rather than stopping at the first hit: the
+            // registers are not all in use on any single frame, and stopping early left
+            // terrain's own transform undiscovered.
+            // Once per frame at most. UpdateDrawPeriod runs for every draw, so without
+            // this the scan fired several hundred times a frame.
+            if (g_frameCount > 30 && (g_frameCount % 30) == 0 && g_frameCount != g_lastProbeFrame
+                && g_renderingToBackBuffer && !g_uiPassStarted
+                && g_combinedRegisterCount < 1)
+            {
+                g_lastProbeFrame = g_frameCount;
+                g_probeCombinedPending = true;
+            }
+
+            if (g_probeCombinedPending && g_renderingToBackBuffer && !g_uiPassStarted)
+            {
+                g_probeCombinedPending = false;
+                ProbeForCombinedTransforms();
+            }
+
             if (!g_renderingToBackBuffer)      { ++g_drawsOffscreen; }
             else if (g_uiPassStarted)          { ++g_drawsToUi; }
             else if (g_stereoRedirected)
@@ -1181,9 +1492,21 @@ namespace wowvr
             // a patched projection, so they are simply drawn into each half as-is.
             for (int i = 0; i < g_patchedBlockCount; ++i)
             {
+                const PatchedBlock& block = g_patchedBlocks[i];
+
+                // A combined transform belongs to one object. Re-applying it to every
+                // draw overwrites whatever else that register is being used for, so it
+                // is only restored while the register still holds the matrix it was
+                // derived from.
+                if (block.combined && block.startRegister + 4 <= kShadowRegisters
+                    && !MatricesMatch(&g_shadowConstants[block.startRegister][0], block.source))
+                {
+                    continue;
+                }
+
                 g_originalSetVertexShaderConstantF(
-                    device, g_patchedBlocks[i].startRegister,
-                    eye == EyeLeft ? g_patchedBlocks[i].left : g_patchedBlocks[i].right, 4);
+                    device, block.startRegister,
+                    eye == EyeLeft ? block.left : block.right, 4);
             }
 
             // Rebuilt from whatever projection the game currently has set, not from a
@@ -1392,6 +1715,16 @@ namespace wowvr
                 && vector4Count <= 256
                 && g_renderingToBackBuffer;
 
+            // Shadow what the game uploaded, before any substitution.
+            if (data != nullptr && !g_duplicatingDraw
+                && startRegister < kShadowRegisters)
+            {
+                const UINT count = (startRegister + vector4Count <= kShadowRegisters)
+                    ? vector4Count : (kShadowRegisters - startRegister);
+                memcpy(&g_shadowConstants[startRegister][0], data,
+                       static_cast<size_t>(count) * 4 * sizeof(float));
+            }
+
             if (couldHoldAMatrix && !g_duplicatingDraw)
             {
                 // Every four-register window is offered to the patch, not just the
@@ -1401,16 +1734,27 @@ namespace wowvr
                 static float patched[256 * 4];
                 bool anyPatched = false;
 
-                // Only the head of the upload is tested. Sliding a window over the whole
-                // block was tried and matched thousands of times per frame - arrays of
-                // bone and lighting constants throw up four-register runs that look
-                // perspective-shaped by chance. Finding a camera at another offset needs
-                // an exact match against the known scene matrix, not a shape test.
-                for (UINT offset = 0; offset < 1; ++offset)
+                // The head of the upload is tested by shape, which is how the scene
+                // camera gets discovered in the first place. Every other offset is
+                // tested by *exact match* against that known matrix - WoW hands the
+                // same camera to different shaders at different offsets, and a shape
+                // test here matched thousands of unrelated constants per frame.
+                for (UINT offset = 0; offset + 4 <= vector4Count; ++offset)
                 {
+                    const float* window = data + offset * 4;
+
+                    if (offset != 0)
+                    {
+                        if (!g_haveSceneProjectionRaw
+                            || !MatricesMatch(window, g_sceneProjectionRaw))
+                        {
+                            continue;
+                        }
+                    }
+
                     float left[16];
                     float right[16];
-                    if (!Projection().TryPatch(data + offset * 4, left, right))
+                    if (!Projection().TryPatch(window, left, right))
                     {
                         continue;
                     }
@@ -1423,25 +1767,88 @@ namespace wowvr
                     }
 
                     memcpy(patched + offset * 4, left, sizeof(left));
-                    RememberPatchedBlock(startRegister + offset, data + offset * 4, left, right);
+                    RememberPatchedBlock(startRegister + offset, window, left, right);
+
+                    // Remember the camera itself so every other register holding it can
+                    // be recognised.
+                    memcpy(g_sceneProjectionRaw, window, sizeof(g_sceneProjectionRaw));
+                    g_haveSceneProjectionRaw = true;
                 }
 
-                // Any known camera register this upload writes over, without it still
-                // looking like the camera, is no longer the camera. Without this the
-                // matrix keeps being forced back into registers the game has reused for
-                // something else, which corrupts whatever reads them.
-                for (int i = g_patchedBlockCount - 1; i >= 0; --i)
+                // Drop a known camera register only when its *contents* have stopped
+                // being the camera. Testing whether the upload merely covers the
+                // register is wrong: WoW uploads a 46-register block from c0 that spans
+                // c2 without disturbing the camera sitting there, and dropping on
+                // coverage wiped the table every frame.
+                if (g_haveSceneProjectionRaw)
                 {
-                    const UINT reg = g_patchedBlocks[i].startRegister;
-                    const bool overwritten = reg >= startRegister
-                        && (reg + 4) <= (startRegister + vector4Count);
-                    const bool stillTheCamera = anyPatched && reg == startRegister;
-
-                    if (overwritten && !stillTheCamera)
+                    for (int i = g_patchedBlockCount - 1; i >= 0; --i)
                     {
-                        g_patchedBlocks[i] = g_patchedBlocks[g_patchedBlockCount - 1];
-                        --g_patchedBlockCount;
+                        const UINT reg = g_patchedBlocks[i].startRegister;
+                        const bool covered = reg >= startRegister
+                            && (reg + 4) <= (startRegister + vector4Count);
+                        if (!covered || reg + 4 > kShadowRegisters)
+                        {
+                            continue;
+                        }
+
+                        if (g_patchedBlocks[i].combined)
+                        {
+                            continue;
+                        }
+
+                        if (!MatricesMatch(&g_shadowConstants[reg][0], g_sceneProjectionRaw))
+                        {
+                            if (Report().IsActive())
+                            {
+                                WOWVR_INFO("  camera register c%u dropped: overwritten by an "
+                                           "upload of %u regs from c%u",
+                                           reg, vector4Count, startRegister);
+                            }
+                            g_patchedBlocks[i] = g_patchedBlocks[g_patchedBlockCount - 1];
+                            --g_patchedBlockCount;
+                        }
                     }
+                }
+
+                // Candidate registers for a combined world-view-projection, tried on
+                // every upload that covers them. No discovery step is needed because
+                // TryPatchCombined validates itself: it only rewrites a window whose
+                // residual against the known camera is genuinely affine, and returns
+                // false otherwise. Probing for these proved unreliable - it mostly ran
+                // before the world had loaded - while this cannot produce a false
+                // positive. All sit below the bone palette at c31.
+                // c4 only. c0, c8 and c12 were guesses and they wrecked models: those
+                // registers do other work for other shaders, and forcing a transform
+                // into them collapsed trees and made the player model vanish. c4 is the
+                // one that was actually confirmed to carry terrain's transform.
+                static const UINT kCombinedCandidates[] = { 4 };
+
+                for (int k = 0; k < static_cast<int>(sizeof(kCombinedCandidates)
+                                                     / sizeof(kCombinedCandidates[0])); ++k)
+                {
+                    const UINT reg = kCombinedCandidates[k];
+                    if (reg < startRegister || reg + 4 > startRegister + vector4Count)
+                    {
+                        continue;
+                    }
+
+                    const UINT offset = reg - startRegister;
+                    float left[16];
+                    float right[16];
+                    if (!Projection().TryPatchCombined(data + offset * 4, left, right))
+                    {
+                        continue;
+                    }
+
+                    if (!anyPatched)
+                    {
+                        memcpy(patched, data,
+                               static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                        anyPatched = true;
+                    }
+                    memcpy(patched + offset * 4, left, sizeof(left));
+                    RememberPatchedBlock(reg, data + offset * 4, left, right, true);
                 }
 
                 if (anyPatched)
