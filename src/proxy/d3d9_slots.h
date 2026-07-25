@@ -39,6 +39,7 @@ namespace wowvr
             constexpr unsigned SetTransform = 44;
             constexpr unsigned SetViewport = 47;
             constexpr unsigned SetRenderState = 57;
+            constexpr unsigned SetScissorRect = 75;
             constexpr unsigned DrawPrimitive = 81;
             constexpr unsigned DrawIndexedPrimitive = 82;
             constexpr unsigned DrawPrimitiveUP = 83;

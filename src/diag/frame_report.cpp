@@ -253,7 +253,8 @@ namespace wowvr
         }
     }
 
-    void FrameReport::NoteDrawContext(bool toBackBuffer, bool usingSceneCamera, bool depthTestOn)
+    void FrameReport::NoteDrawContext(bool toBackBuffer, bool usingSceneCamera, bool depthTestOn,
+                                      uint32_t viewportX, uint32_t viewportWidth, bool duplicated)
     {
         if (!m_active)
         {
@@ -267,7 +268,10 @@ namespace wowvr
             DrawPhase& current = m_phases[m_phaseCount - 1];
             if (current.toBackBuffer == toBackBuffer
                 && current.usingSceneCamera == usingSceneCamera
-                && current.depthTestOn == depthTestOn)
+                && current.depthTestOn == depthTestOn
+                && current.viewportX == viewportX
+                && current.viewportWidth == viewportWidth
+                && current.duplicated == duplicated)
             {
                 ++current.draws;
                 return;
@@ -285,6 +289,9 @@ namespace wowvr
         phase.depthTestOn = depthTestOn;
         phase.draws = 1;
         phase.firstDrawIndex = m_drawIndex;
+        phase.viewportX = viewportX;
+        phase.viewportWidth = viewportWidth;
+        phase.duplicated = duplicated;
     }
 
     void FrameReport::LogDrawPhases() const
@@ -293,11 +300,14 @@ namespace wowvr
         for (int i = 0; i < m_phaseCount; ++i)
         {
             const DrawPhase& phase = m_phases[i];
-            WOWVR_INFO("    from draw %-5u  %-5u draws  target=%-10s depth=%-8s alphaBlend=%s",
+            WOWVR_INFO("    from draw %-5u  %-5u draws  target=%-10s depth=%-7s blend=%-3s "
+                       "viewport x=%-5u w=%-5u  %s",
                        phase.firstDrawIndex, phase.draws,
                        phase.toBackBuffer ? "backbuffer" : "offscreen",
                        phase.usingSceneCamera ? "tested" : "ignored",
-                       phase.depthTestOn ? "on" : "off");
+                       phase.depthTestOn ? "on" : "off",
+                       phase.viewportX, phase.viewportWidth,
+                       phase.duplicated ? "PER-EYE" : "once");
         }
         if (m_phaseCount >= kMaxPhases)
         {

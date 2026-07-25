@@ -161,6 +161,9 @@ namespace wowvr
         config.vrEnabled = ReadBool(path, L"VR", L"Enabled", config.vrEnabled);
         config.flatDebug = ReadBool(path, L"VR", L"FlatDebug", config.flatDebug);
         config.stereo = ReadBool(path, L"VR", L"Stereo", config.stereo);
+        config.skipPostProcess = ReadBool(path, L"VR", L"SkipPostProcess", config.skipPostProcess);
+        config.skipScreenSpaceWorldDraws =
+            ReadBool(path, L"VR", L"SkipScreenSpaceWorldDraws", config.skipScreenSpaceWorldDraws);
         config.renderScale = ReadFloat(path, L"VR", L"RenderScale", config.renderScale);
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);

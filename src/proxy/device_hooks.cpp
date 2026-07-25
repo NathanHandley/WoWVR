@@ -33,9 +33,11 @@ namespace wowvr
         typedef HRESULT (WINAPI *CreateVertexShaderFn)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
         typedef HRESULT (WINAPI *SetVertexShaderFn)(IDirect3DDevice9*, IDirect3DVertexShader9*);
         typedef HRESULT (WINAPI *SetFVFFn)(IDirect3DDevice9*, DWORD);
+        typedef HRESULT (WINAPI *SetVertexDeclarationFn)(IDirect3DDevice9*, IDirect3DVertexDeclaration9*);
         typedef HRESULT (WINAPI *SetRenderTargetFn)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
         typedef HRESULT (WINAPI *SetDepthStencilSurfaceFn)(IDirect3DDevice9*, IDirect3DSurface9*);
         typedef HRESULT (WINAPI *SetViewportFn)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+        typedef HRESULT (WINAPI *SetScissorRectFn)(IDirect3DDevice9*, const RECT*);
         typedef HRESULT (WINAPI *ClearFn)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
         typedef HRESULT (WINAPI *SetRenderStateFn)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
         typedef HRESULT (WINAPI *DrawPrimitiveFn)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
@@ -52,9 +54,11 @@ namespace wowvr
         CreateVertexShaderFn g_originalCreateVertexShader = nullptr;
         SetVertexShaderFn g_originalSetVertexShader = nullptr;
         SetFVFFn g_originalSetFVF = nullptr;
+        SetVertexDeclarationFn g_originalSetVertexDeclaration = nullptr;
         SetRenderTargetFn g_originalSetRenderTarget = nullptr;
         SetDepthStencilSurfaceFn g_originalSetDepthStencilSurface = nullptr;
         SetViewportFn g_originalSetViewport = nullptr;
+        SetScissorRectFn g_originalSetScissorRect = nullptr;
         ClearFn g_originalClear = nullptr;
         SetRenderStateFn g_originalSetRenderState = nullptr;
 
@@ -124,6 +128,29 @@ namespace wowvr
         unsigned long long g_panelSkipped = 0;
         const char* g_lastSkipReason = "none";
 
+        // Draw routing counters, summed over the reporting interval.
+        unsigned long long g_drawsToStereo = 0;
+        unsigned long long g_drawsToUi = 0;
+        unsigned long long g_drawsOffscreen = 0;
+        unsigned long long g_drawsStrayBackBuffer = 0;
+        int g_lastPeriodCount = 0;
+
+        // Pre-transformed vertices carry absolute screen coordinates and ignore the
+        // view and projection entirely. Duplicating such a draw per eye does not move
+        // it, so it lands in the same place both times and is merely clipped
+        // differently - which is what a hard edge at the game's own width looks like.
+        bool g_vertexFormatIsPreTransformed = false;
+        unsigned long long g_preTransformedWorldDraws = 0;
+
+        // Scissor state. The scissor rectangle is in the game's own screen space, so
+        // inside the wider side-by-side target it clips everything to the game's
+        // 1920x1080 corner no matter what viewport a draw is given.
+        D3DVIEWPORT9 g_currentViewport = {};
+        RECT g_gameScissor = {};
+        bool g_haveGameScissor = false;
+        bool g_scissorTestEnabled = false;
+        unsigned long long g_scissoredWorldDraws = 0;
+
 
         // Frame cost accounting. The copy-based presenter moves a whole eye buffer
         // through system memory every frame, and the only way to know whether that is
@@ -178,8 +205,23 @@ namespace wowvr
             Projection().LogLastDecision();
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
+            WOWVR_INFO("Draw routing: stereo %llu, ui %llu, offscreen %llu, "
+                       "STRAY-to-backbuffer %llu; periods last frame %d",
+                       g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
+                       g_drawsStrayBackBuffer, g_lastPeriodCount);
+            WOWVR_INFO("World draws using pre-transformed screen coordinates: %llu",
+                       g_preTransformedWorldDraws);
+            WOWVR_INFO("World draws with the scissor test on: %llu (game scissor %ld,%ld - %ld,%ld)",
+                       g_scissoredWorldDraws, g_gameScissor.left, g_gameScissor.top,
+                       g_gameScissor.right, g_gameScissor.bottom);
+            g_preTransformedWorldDraws = 0;
+            g_scissoredWorldDraws = 0;
             g_panelDrawn = 0;
             g_panelSkipped = 0;
+            g_drawsToStereo = 0;
+            g_drawsToUi = 0;
+            g_drawsOffscreen = 0;
+            g_drawsStrayBackBuffer = 0;
         }
 
         void ReleaseFrameResources()
@@ -399,6 +441,50 @@ namespace wowvr
             g_originalSetRenderTarget(device, 0, g_realBackBuffer);
         }
 
+        // Writes the whole side-by-side target, unscaled and uncropped, to a BMP.
+        //
+        // The per-eye dumps are taken after a StretchRect out of one half, which hides
+        // anything to do with how the two halves relate: mis-sized viewports, regions
+        // that were never cleared, content drawn once instead of twice. Those are
+        // exactly the bugs left, so this dumps the target itself.
+        void DumpStereoTarget(IDirect3DDevice9* device)
+        {
+            if (!g_stereo.IsReady())
+            {
+                return;
+            }
+
+            const uint32_t width = g_stereo.EyeWidth() * 2;
+            const uint32_t height = g_stereo.EyeHeight();
+
+            IDirect3DSurface9* staging = nullptr;
+            HRESULT hr = device->CreateOffscreenPlainSurface(width, height, D3DFMT_A8R8G8B8,
+                                                             D3DPOOL_SYSTEMMEM, &staging, nullptr);
+            if (FAILED(hr) || staging == nullptr)
+            {
+                WOWVR_WARN("Could not create a staging surface for the stereo dump (0x%08lx).", hr);
+                return;
+            }
+
+            hr = device->GetRenderTargetData(g_stereo.Color(), staging);
+            if (SUCCEEDED(hr))
+            {
+                D3DLOCKED_RECT locked = {};
+                if (SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                {
+                    SaveBgraBmp(ModuleFile(L"WoWVR_stereo.bmp").c_str(), locked.pBits,
+                                width, height, static_cast<uint32_t>(locked.Pitch));
+                    staging->UnlockRect();
+                }
+            }
+            else
+            {
+                WOWVR_WARN("GetRenderTargetData for the stereo dump failed (0x%08lx).", hr);
+            }
+
+            staging->Release();
+        }
+
         void SubmitFrame(IDirect3DDevice9* device)
         {
             if (!g_resourcesReady || !Vr().IsActive())
@@ -454,6 +540,11 @@ namespace wowvr
                 }
 
                 g_presenter.Upload(eye, g_eyeTargets[eye].LockedPixels(), g_eyeTargets[eye].LockedPitch());
+
+                if (dumpThisFrame && eye == EyeLeft)
+                {
+                    DumpStereoTarget(device);
+                }
 
                 if (dumpThisFrame)
                 {
@@ -598,6 +689,7 @@ namespace wowvr
             }
 
             // The world/UI split is per-frame state.
+            g_lastPeriodCount = g_backBufferDrawPeriod;
             g_backBufferDrawPeriod = 0;
             g_wasDrawingToBackBuffer = false;
             g_uiPassStarted = false;
@@ -659,6 +751,19 @@ namespace wowvr
             // start of a frame the back buffer is already bound from the last Present,
             // so the game never rebinds it and a bind-driven counter misses the world
             // pass completely.
+            // Where every draw actually ended up. If world geometry is going somewhere
+            // other than the stereo target, this says so directly instead of leaving it
+            // to be inferred from a black screen.
+            if (!g_renderingToBackBuffer)      { ++g_drawsOffscreen; }
+            else if (g_uiPassStarted)          { ++g_drawsToUi; }
+            else if (g_stereoRedirected)
+            {
+                ++g_drawsToStereo;
+                if (g_vertexFormatIsPreTransformed) { ++g_preTransformedWorldDraws; }
+                if (g_scissorTestEnabled) { ++g_scissoredWorldDraws; }
+            }
+            else                               { ++g_drawsStrayBackBuffer; }
+
             const bool nowOnBackBuffer = g_renderingToBackBuffer;
             const bool periodStarted = nowOnBackBuffer && !g_wasDrawingToBackBuffer;
             g_wasDrawingToBackBuffer = nowOnBackBuffer;
@@ -740,6 +845,27 @@ namespace wowvr
             }
         }
 
+        // True for the post-process composite: the batch after the world but before
+        // the interface proper.
+        bool ShouldSkipDraw()
+        {
+            if (!StereoActive() || !g_renderingToBackBuffer || g_duplicatingDraw)
+            {
+                return false;
+            }
+
+            // The post-process composite: after the world, before the interface.
+            if (Cfg().skipPostProcess && g_backBufferDrawPeriod >= 2 && !g_uiPassStarted)
+            {
+                return true;
+            }
+
+            // Screen-space overlays inside the world pass, which cannot be duplicated
+            // usefully because their coordinates are absolute.
+            return Cfg().skipScreenSpaceWorldDraws && !g_uiPassStarted
+                && g_vertexFormatIsPreTransformed;
+        }
+
         bool ShouldDuplicateDraw()
         {
             // The UI is deliberately excluded: it is laid out for a 1920x1080 screen
@@ -758,6 +884,7 @@ namespace wowvr
             viewport.Height = g_stereo.EyeHeight();
             viewport.MinZ = 0.0f;
             viewport.MaxZ = 1.0f;
+            g_currentViewport = viewport;
             g_originalSetViewport(device, &viewport);
 
             // Only the scene camera gets swapped. UI and other ortho passes never had
@@ -766,6 +893,24 @@ namespace wowvr
             {
                 g_originalSetVertexShaderConstantF(device, g_projectionRegister,
                                                    g_eyeProjection[eye], 4);
+            }
+
+            // The scissor rectangle is in the game's screen space, which inside the
+            // side-by-side target clips everything to its 1920x1080 corner. Rescale it
+            // into whichever half is being drawn.
+            // In the world pass the game's scissor rectangle is its entire screen, so
+            // it clips nothing - but expressed in the game's coordinates it lands over
+            // its own 1920x1080 corner of the wider stereo target and cuts everything
+            // off at that edge. Clipping to the whole eye is the faithful translation,
+            // and unlike scaling the game's rectangle it cannot land somewhere odd.
+            if (g_scissorTestEnabled)
+            {
+                RECT scissor;
+                scissor.left = static_cast<LONG>(viewport.X);
+                scissor.top = 0;
+                scissor.right = static_cast<LONG>(viewport.X + viewport.Width);
+                scissor.bottom = static_cast<LONG>(viewport.Height);
+                g_originalSetScissorRect(device, &scissor);
             }
         }
 
@@ -777,6 +922,7 @@ namespace wowvr
             case D3DRS_ZWRITEENABLE:     g_depthWriteEnabled = (value != 0); break;
             case D3DRS_ALPHABLENDENABLE: g_alphaBlendEnabled = (value != 0); break;
             case D3DRS_ZFUNC:            g_depthFunction = value; break;
+            case D3DRS_SCISSORTESTENABLE: g_scissorTestEnabled = (value != 0); break;
             default: break;
             }
             return g_originalSetRenderState(device, state, value);
@@ -791,7 +937,25 @@ namespace wowvr
 
             const bool depthLike = g_depthTestEnabled && g_depthWriteEnabled
                                 && g_depthFunction != D3DCMP_ALWAYS;
-            Report().NoteDrawContext(g_renderingToBackBuffer, depthLike, g_alphaBlendEnabled);
+            Report().NoteDrawContext(g_renderingToBackBuffer, depthLike, g_alphaBlendEnabled,
+                                     g_currentViewport.X, g_currentViewport.Width,
+                                     ShouldDuplicateDraw());
+        }
+
+        HRESULT WINAPI HookedSetScissorRect(IDirect3DDevice9* device, const RECT* rect)
+        {
+            if (g_duplicatingDraw)
+            {
+                // Ours for the duration of the duplication.
+                return D3D_OK;
+            }
+
+            if (rect != nullptr)
+            {
+                g_gameScissor = *rect;
+                g_haveGameScissor = true;
+            }
+            return g_originalSetScissorRect(device, rect);
         }
 
         HRESULT WINAPI HookedSetViewport(IDirect3DDevice9* device, const D3DVIEWPORT9* viewport)
@@ -801,6 +965,10 @@ namespace wowvr
             if (g_duplicatingDraw)
             {
                 return D3D_OK;
+            }
+            if (viewport != nullptr)
+            {
+                g_currentViewport = *viewport;
             }
             return g_originalSetViewport(device, viewport);
         }
@@ -828,7 +996,12 @@ namespace wowvr
                 g_stereoHasContent = true;
             }
 
-            if (StereoActive() && !g_duplicatingDraw && rectCount == 0)
+            // Any rects the game supplies are deliberately discarded. They describe its
+            // own 1920x1080 screen, which covers all of the left eye and only the first
+            // third of the right one inside the side-by-side target - leaving a
+            // brighter rectangle of cleared sky against stale content everywhere else.
+            // Clearing more than asked is always safe; clearing less is not.
+            if (StereoActive() && !g_duplicatingDraw)
             {
                 D3DVIEWPORT9 whole = {};
                 whole.X = 0;
@@ -931,7 +1104,33 @@ namespace wowvr
             {
                 Report().NoteFixedFunctionVertexPipeline();
             }
+            g_vertexFormatIsPreTransformed = ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW);
             return g_originalSetFVF(device, fvf);
+        }
+
+        HRESULT WINAPI HookedSetVertexDeclaration(IDirect3DDevice9* device,
+                                                  IDirect3DVertexDeclaration9* declaration)
+        {
+            g_vertexFormatIsPreTransformed = false;
+
+            if (declaration != nullptr)
+            {
+                D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1] = {};
+                UINT count = 0;
+                if (SUCCEEDED(declaration->GetDeclaration(elements, &count)))
+                {
+                    for (UINT i = 0; i < count; ++i)
+                    {
+                        if (elements[i].Usage == D3DDECLUSAGE_POSITIONT)
+                        {
+                            g_vertexFormatIsPreTransformed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return g_originalSetVertexDeclaration(device, declaration);
         }
 
         HRESULT WINAPI HookedSetRenderTarget(IDirect3DDevice9* device, DWORD index,
@@ -993,6 +1192,11 @@ namespace wowvr
             UpdateDrawPeriod(device);
             MaybeStartUiPass(device);
 
+            if (ShouldSkipDraw())
+            {
+                return D3D_OK;
+            }
+
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
@@ -1021,6 +1225,11 @@ namespace wowvr
 
             UpdateDrawPeriod(device);
             MaybeStartUiPass(device);
+
+            if (ShouldSkipDraw())
+            {
+                return D3D_OK;
+            }
 
             if (!ShouldDuplicateDraw())
             {
@@ -1053,6 +1262,11 @@ namespace wowvr
             UpdateDrawPeriod(device);
             MaybeStartUiPass(device);
 
+            if (ShouldSkipDraw())
+            {
+                return D3D_OK;
+            }
+
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawPrimitiveUP(device, type, primitiveCount, vertexData, stride);
@@ -1084,6 +1298,11 @@ namespace wowvr
 
             UpdateDrawPeriod(device);
             MaybeStartUiPass(device);
+
+            if (ShouldSkipDraw())
+            {
+                return D3D_OK;
+            }
 
             if (!ShouldDuplicateDraw())
             {
@@ -1134,12 +1353,16 @@ namespace wowvr
                      g_originalSetVertexShader, "SetVertexShader");
             HookSlot(device, slot::device9::SetFVF, &HookedSetFVF,
                      g_originalSetFVF, "SetFVF");
+            HookSlot(device, slot::device9::SetVertexDeclaration, &HookedSetVertexDeclaration,
+                     g_originalSetVertexDeclaration, "SetVertexDeclaration");
             HookSlot(device, slot::device9::SetRenderTarget, &HookedSetRenderTarget,
                      g_originalSetRenderTarget, "SetRenderTarget");
             HookSlot(device, slot::device9::SetDepthStencilSurface, &HookedSetDepthStencilSurface,
                      g_originalSetDepthStencilSurface, "SetDepthStencilSurface");
             HookSlot(device, slot::device9::SetViewport, &HookedSetViewport,
                      g_originalSetViewport, "SetViewport");
+            HookSlot(device, slot::device9::SetScissorRect, &HookedSetScissorRect,
+                     g_originalSetScissorRect, "SetScissorRect");
             HookSlot(device, slot::device9::Clear, &HookedClear,
                      g_originalClear, "Clear");
             HookSlot(device, slot::device9::SetRenderState, &HookedSetRenderState,

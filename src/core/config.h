@@ -18,6 +18,21 @@ namespace wowvr
         // image shown to both eyes: flat, and noticeably wrong on a headset with
         // canted displays, but a useful comparison if stereo misbehaves.
         bool stereo = true;
+
+        // Drops the bloom/glow composite while stereo is on. It is a full-screen
+        // quad drawn with the scene projection, so head tracking swings it across
+        // the view as a diagonal band, and it is computed by downsampling the
+        // side-by-side target, so its contents are both eyes squashed together.
+        // Wrong either way; dropping it costs only the glow effect.
+        bool skipPostProcess = true;
+
+        // Drops world-pass draws that use pre-transformed (screen-space) vertices.
+        // Those ignore the view and projection and carry absolute pixel coordinates,
+        // so duplicating them per eye does not move them: they land over the game's
+        // own 1920x1080 rectangle inside the wider stereo target and are merely
+        // clipped differently by each eye. Full-screen tints and weather overlays are
+        // the usual culprits.
+        bool skipScreenSpaceWorldDraws = true;
         // Multiplier on the runtime's recommended per-eye size. Below 1.0 by default
         // because the current presenter moves every frame through system memory, and
         // SteamVR's recommendation for an Index is already heavily supersampled.
