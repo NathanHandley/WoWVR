@@ -106,6 +106,8 @@ namespace wowvr
         struct PatchedBlock
         {
             UINT startRegister = 0;
+            float source[16] = {};   // the game's own matrix, kept so the eye versions
+                                     // can be rebuilt against a fresh head pose
             float left[16] = {};
             float right[16] = {};
         };
@@ -114,28 +116,46 @@ namespace wowvr
         int g_patchedBlockCount = 0;
         bool g_haveEyeProjections = false;
 
-        void RememberPatchedBlock(UINT startRegister, const float* left, const float* right)
+        void RememberPatchedBlock(UINT startRegister, const float* source,
+                                  const float* left, const float* right)
         {
+            PatchedBlock* block = nullptr;
             for (int i = 0; i < g_patchedBlockCount; ++i)
             {
                 if (g_patchedBlocks[i].startRegister == startRegister)
                 {
-                    memcpy(g_patchedBlocks[i].left, left, sizeof(g_patchedBlocks[i].left));
-                    memcpy(g_patchedBlocks[i].right, right, sizeof(g_patchedBlocks[i].right));
-                    return;
+                    block = &g_patchedBlocks[i];
+                    break;
                 }
             }
 
-            if (g_patchedBlockCount >= kMaxPatchedBlocks)
+            if (block == nullptr)
             {
-                return;
+                if (g_patchedBlockCount >= kMaxPatchedBlocks)
+                {
+                    return;
+                }
+                block = &g_patchedBlocks[g_patchedBlockCount++];
+                block->startRegister = startRegister;
             }
 
-            PatchedBlock& block = g_patchedBlocks[g_patchedBlockCount++];
-            block.startRegister = startRegister;
-            memcpy(block.left, left, sizeof(block.left));
-            memcpy(block.right, right, sizeof(block.right));
+            memcpy(block->source, source, sizeof(block->source));
+            memcpy(block->left, left, sizeof(block->left));
+            memcpy(block->right, right, sizeof(block->right));
             g_haveEyeProjections = true;
+        }
+
+        // Rebuilds every known camera register against the current head pose. Needed
+        // because WoW draws terrain *before* re-uploading its camera each frame: those
+        // draws would otherwise inherit the previous frame's left-eye matrix, identical
+        // in both eyes and a frame stale, which reads as terrain welded to the head.
+        void RefreshPatchedBlocks()
+        {
+            for (int i = 0; i < g_patchedBlockCount; ++i)
+            {
+                PatchedBlock& block = g_patchedBlocks[i];
+                Projection().TryPatch(block.source, block.left, block.right);
+            }
         }
 
         // The same thing again for the fixed-function pipeline. Not every world draw
@@ -801,6 +821,7 @@ namespace wowvr
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
                     g_uiPanel.Update(Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
+                    RefreshPatchedBlocks();
 
                 }
             }
@@ -831,8 +852,6 @@ namespace wowvr
             // upload, which arrives after the first back buffer draw.
             g_previousFrameHadCamera = g_projectionPatchedThisFrame;
             g_projectionPatchedThisFrame = false;
-            g_patchedBlockCount = 0;
-            g_haveEyeProjections = false;
 
             g_sequenceDumpArmed = g_armSequenceNextFrame;
             g_armSequenceNextFrame = false;
@@ -1101,15 +1120,18 @@ namespace wowvr
                 IDirect3DVertexShader9* shader = nullptr;
                 device->GetVertexShader(&shader);
 
+                // The decisive columns are the last two: whether this draw actually had a
+                // head-rotated camera put in front of it on either path. Geometry that
+                // gets neither is drawn with the game's own camera and ends up welded
+                // to the viewer's head.
                 WOWVR_INFO("world draw %-4d: prims=%-6u tex=%p vs=%p blend=%s ztest=%s "
-                           "zwrite=%s zfunc=%lu preT=%s",
+                           "depth=%.3f..%.3f  camShader=%d camFixed=%d",
                            g_worldDrawIndex, g_lastPrimitiveCount,
                            static_cast<void*>(texture), static_cast<void*>(shader),
                            g_alphaBlendEnabled ? "on" : "off",
                            g_depthTestEnabled ? "on" : "off",
-                           g_depthWriteEnabled ? "on" : "off",
-                           g_depthFunction,
-                           g_vertexFormatIsPreTransformed ? "yes" : "no");
+                           g_currentViewport.MinZ, g_currentViewport.MaxZ,
+                           g_patchedBlockCount, g_haveFixedProjectionSource ? 1 : 0);
 
                 if (texture != nullptr) { texture->Release(); }
                 if (shader != nullptr) { shader->Release(); }
@@ -1401,7 +1423,25 @@ namespace wowvr
                     }
 
                     memcpy(patched + offset * 4, left, sizeof(left));
-                    RememberPatchedBlock(startRegister + offset, left, right);
+                    RememberPatchedBlock(startRegister + offset, data + offset * 4, left, right);
+                }
+
+                // Any known camera register this upload writes over, without it still
+                // looking like the camera, is no longer the camera. Without this the
+                // matrix keeps being forced back into registers the game has reused for
+                // something else, which corrupts whatever reads them.
+                for (int i = g_patchedBlockCount - 1; i >= 0; --i)
+                {
+                    const UINT reg = g_patchedBlocks[i].startRegister;
+                    const bool overwritten = reg >= startRegister
+                        && (reg + 4) <= (startRegister + vector4Count);
+                    const bool stillTheCamera = anyPatched && reg == startRegister;
+
+                    if (overwritten && !stillTheCamera)
+                    {
+                        g_patchedBlocks[i] = g_patchedBlocks[g_patchedBlockCount - 1];
+                        --g_patchedBlockCount;
+                    }
                 }
 
                 if (anyPatched)
