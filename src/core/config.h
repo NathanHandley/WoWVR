@@ -117,6 +117,13 @@ namespace wowvr
         // alt-tab still works.
         bool confineCursor = false;
 
+        // Treat the interface panel as premultiplied alpha: blend the alpha channel on
+        // its own factors while the interface renders, and composite the panel without
+        // multiplying by alpha a second time. Off reverts to straight-alpha compositing,
+        // which darkens anything translucent and turns additive highlights and glows
+        // into black patches.
+        bool premultipliedUi = true;
+
         // [Mirror]
         bool desktopMirror = true;      // keep drawing something in the game window
 

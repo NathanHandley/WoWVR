@@ -76,6 +76,34 @@ namespace wowvr
         bool g_depthTestEnabled = true;
         bool g_depthWriteEnabled = true;
         bool g_alphaBlendEnabled = false;
+
+        // The interface is drawn into a target of its own that starts fully
+        // transparent, and that changes what its blend states mean.
+        //
+        // On the real back buffer there is no alpha channel to speak of and every draw
+        // lands on top of an opaque image. Give the same draws a transparent target and
+        // the alpha channel suddenly matters, because it is what later decides how much
+        // of the world the panel hides. Two things then go wrong. Ordinary blended draws
+        // compute alpha with the same SRCALPHA factor as colour, so coverage comes out
+        // squared instead of accumulated. Worse, an additive draw - which is what a
+        // highlight or a glow is - writes alpha where it should write none at all: on a
+        // back buffer it only ever adds light, but here it manufactures coverage, and
+        // that coverage then punches a hole in the world at composite time. A glow whose
+        // colour is added but whose alpha says "I cover this" reads as a black patch
+        // that fades in and out with the animation.
+        //
+        // The fix is to keep colour and alpha on separate blend factors while the panel
+        // is the target, so the colour channel accumulates premultiplied as it always
+        // did and the alpha channel records only genuine coverage.
+        DWORD g_srcBlend = D3DBLEND_ONE;
+        DWORD g_destBlend = D3DBLEND_ZERO;
+        bool g_uiTargetBound = false;
+        bool g_uiAlphaOverrideActive = false;
+        unsigned long long g_additiveUiDraws = 0;
+
+        // Defined with the other render state handling, further down.
+        void ApplyUiAlphaBlend(IDirect3DDevice9* device);
+        void EndUiAlphaOverride(IDirect3DDevice9* device);
         DWORD g_depthFunction = D3DCMP_LESSEQUAL;
         DrawPrimitiveFn g_originalDrawPrimitive = nullptr;
         DrawIndexedPrimitiveFn g_originalDrawIndexedPrimitive = nullptr;
@@ -761,6 +789,10 @@ namespace wowvr
                        static_cast<void*>(g_gameWindow), g_cursorCacheCount,
                        g_activeCursor != nullptr ? "shown" : "hidden",
                        g_cursorDrawn, g_lastCursorU, g_lastCursorV);
+            WOWVR_INFO("UI panel compositing: %s, %llu additive interface draws given a "
+                       "no-coverage alpha blend",
+                       Cfg().premultipliedUi ? "premultiplied" : "straight alpha",
+                       g_additiveUiDraws);
             WOWVR_INFO("Cursor: %llu stale-pointer substitutions after focus changes, "
                        "last game art %p, focus %s, confined %s",
                        g_staleCursorSubstitutions, static_cast<void*>(g_lastGameCursor),
@@ -1350,6 +1382,11 @@ namespace wowvr
 
         void CompositeUiPanel(IDirect3DDevice9* device)
         {
+            // The interface pass is over either way, so the alpha override has to come
+            // off before anything else is drawn - including this composite.
+            EndUiAlphaOverride(device);
+            g_uiTargetBound = false;
+
             if (!g_uiRendered || !g_uiPanel.IsReady() || !g_stereoHasContent)
             {
                 ++g_panelSkipped;
@@ -1410,7 +1447,13 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
             g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
             g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
-            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            // The panel's colour is already scaled by its own alpha - that is what
+            // blending onto a transparent target produces - so multiplying by alpha a
+            // second time here would darken everything translucent towards black.
+            // Premultiplied compositing adds the colour as it stands and uses alpha
+            // only to decide how much of the world shows through.
+            g_originalSetRenderState(device, D3DRS_SRCBLEND,
+                                     Cfg().premultipliedUi ? D3DBLEND_ONE : D3DBLEND_SRCALPHA);
             g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
             g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
 
@@ -1501,9 +1544,16 @@ namespace wowvr
                         { left + artWidth, top - artHeight, 0.0f, 1.0f, 1.0f },
                     };
 
+                    // Built straight rather than premultiplied, so it needs the
+                    // ordinary blend even when the panel itself is composited
+                    // premultiplied.
                     device->SetTexture(0, g_activeCursor->texture);
+                    g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
                     g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, pointer,
                                               sizeof(PanelVertex));
+                    g_originalSetRenderState(device, D3DRS_SRCBLEND,
+                                             Cfg().premultipliedUi ? D3DBLEND_ONE
+                                                                   : D3DBLEND_SRCALPHA);
                     device->SetTexture(0, g_uiPanel.Texture());
                 }
             }
@@ -1891,6 +1941,7 @@ namespace wowvr
             g_uiPassStarted = false;
             g_stereoHasContent = false;
             g_uiRendered = false;
+            g_uiTargetBound = false;
 
             // Whether the frame just finished ever had a 3D camera. Used next frame to
             // recognise a loading screen; asking within the frame races the camera
@@ -2205,6 +2256,11 @@ namespace wowvr
                     // covers end up over the world.
                     g_originalClear(device, 0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0);
                     g_uiRendered = true;
+
+                    // From here the alpha channel means coverage, not opacity, and has
+                    // to be blended on its own terms.
+                    g_uiTargetBound = true;
+                    ApplyUiAlphaBlend(device);
                 }
             }
         }
@@ -2676,6 +2732,40 @@ namespace wowvr
             }
         }
 
+        // Chooses how the alpha channel should blend, given what the game asked for on
+        // colour. An additive draw is recognised by its destination factor leaving the
+        // existing pixel intact: those add light and must not claim any coverage.
+        void ApplyUiAlphaBlend(IDirect3DDevice9* device)
+        {
+            if (!g_uiTargetBound || !Cfg().premultipliedUi)
+            {
+                return;
+            }
+
+            const bool additive = (g_destBlend == D3DBLEND_ONE);
+            if (additive)
+            {
+                ++g_additiveUiDraws;
+            }
+
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SRCBLENDALPHA,
+                                     additive ? D3DBLEND_ZERO : D3DBLEND_ONE);
+            g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA,
+                                     additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
+            g_uiAlphaOverrideActive = true;
+        }
+
+        void EndUiAlphaOverride(IDirect3DDevice9* device)
+        {
+            if (!g_uiAlphaOverrideActive)
+            {
+                return;
+            }
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_uiAlphaOverrideActive = false;
+        }
+
         HRESULT WINAPI HookedSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value)
         {
             switch (state)
@@ -2689,7 +2779,27 @@ namespace wowvr
             case D3DRS_ALPHATESTENABLE:  g_alphaTestEnabled = (value != 0); break;
             default: break;
             }
-            return g_originalSetRenderState(device, state, value);
+
+            // The separate-alpha states belong to us while the panel is bound. The
+            // client is from an era that never touched them, but if it ever does, ours
+            // has to win or the coverage channel goes wrong again.
+            if (g_uiTargetBound && Cfg().premultipliedUi
+                && (state == D3DRS_SEPARATEALPHABLENDENABLE
+                    || state == D3DRS_SRCBLENDALPHA
+                    || state == D3DRS_DESTBLENDALPHA))
+            {
+                return D3D_OK;
+            }
+
+            const HRESULT hr = g_originalSetRenderState(device, state, value);
+
+            if (state == D3DRS_SRCBLEND || state == D3DRS_DESTBLEND)
+            {
+                if (state == D3DRS_SRCBLEND) { g_srcBlend = value; }
+                else                         { g_destBlend = value; }
+                ApplyUiAlphaBlend(device);
+            }
+            return hr;
         }
 
         // WoW never re-uploads its projection and never turns the depth test off, so

@@ -193,6 +193,8 @@ namespace wowvr
         config.panelOpacity = ReadFloat(path, L"Panel", L"Opacity", config.panelOpacity);
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
+        config.premultipliedUi =
+            ReadBool(path, L"Panel", L"PremultipliedUi", config.premultipliedUi);
 
         config.desktopMirror = ReadBool(path, L"Mirror", L"DesktopMirror", config.desktopMirror);
 
