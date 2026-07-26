@@ -107,6 +107,16 @@ namespace wowvr
         float panelFollowSpeed = 4.0f;  // higher = panel catches up to your body faster
         float panelOpacity = 1.0f;
 
+        // The pointer is drawn at the size the game uses, which is small seen through a
+        // headset. This multiplies it without touching where it actually points.
+        float cursorScale = 1.5f;
+
+        // Keeps the mouse inside the game window while the game has focus. Wearing the
+        // headset you cannot see the pointer leave, and once it has, the panel stops
+        // drawing it and clicks land in whatever is behind. Released on focus loss, so
+        // alt-tab still works.
+        bool confineCursor = false;
+
         // [Mirror]
         bool desktopMirror = true;      // keep drawing something in the game window
 
@@ -164,6 +174,10 @@ namespace wowvr
 
         // Log what the post-process skip rule discards.
         bool logSkippedDraws = false;
+
+        // Logs what the pointer's shape was chosen from, whenever that changes:
+        // focus, the handle the client last set, and the global cursor.
+        bool logCursorDecisions = false;
 
         // Log the shadow cascade constants c224..c235 as uploaded.
         bool logShadowConstants = false;

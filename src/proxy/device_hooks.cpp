@@ -20,6 +20,10 @@
 
 #include <d3d9.h>
 
+#include <cstring>
+#include <iterator>
+#include <vector>
+
 namespace wowvr
 {
     namespace
@@ -543,13 +547,64 @@ namespace wowvr
         unsigned long long g_substCombined[kShadowRegisters] = {};
 
         // The game uses the hardware cursor, which never reaches the render target, so
-        // in the headset there is nothing to aim with. This draws one onto the panel.
+        // in the headset there is nothing to aim with. This lifts the real bitmap out
+        // of Windows and draws it onto the panel, so the pointer changes shape with
+        // context - gauntlet, cast, loot, interact - exactly as it does on the desktop.
         HWND g_gameWindow = nullptr;
-        IDirect3DTexture9* g_cursorTexture = nullptr;
-        bool g_cursorTextureFailed = false;
+
+        struct CursorArt
+        {
+            HCURSOR source = nullptr;
+            IDirect3DTexture9* texture = nullptr;   // null means "this shape would not build"
+            int width = 0;
+            int height = 0;
+            int hotspotX = 0;
+            int hotspotY = 0;
+        };
+
+        // A small fixed cache. The game cycles through a handful of shapes and each one
+        // costs several GDI round trips to build, which is not something to be doing in
+        // the middle of a frame every time the pointer crosses a button.
+        const int kCursorCacheSize = 32;
+        CursorArt g_cursorCache[kCursorCacheSize];
+        int g_cursorCacheCount = 0;
+        bool g_cursorCacheFullLogged = false;
+        const CursorArt* g_activeCursor = nullptr;
         unsigned long long g_cursorDrawn = 0;
         float g_lastCursorU = -1.0f;
         float g_lastCursorV = -1.0f;
+
+        // Telling the game's own pointer art apart from Windows' standard cursors.
+        //
+        // GetCursorInfo reports a single global cursor, and that is only ever whatever
+        // the last window to handle WM_SETCURSOR asked for. Alt-tab away and it becomes
+        // some other application's; come back, and the game only puts its own back when
+        // Windows next sends it WM_SETCURSOR - which does not reliably happen if the
+        // pointer has not moved. On the desktop nobody notices, because the first mouse
+        // movement corrects it. In the headset we draw from that same stale state, so
+        // it just stays wrong.
+        //
+        // Asking the client instead does not work: it calls SetCursor(NULL) and applies
+        // its real art by some other route, so there is nothing useful to intercept.
+        // What does work is that the shared system cursors have the same handle in every
+        // process, and the client never uses one inside its own window. So a standard
+        // handle appearing while the game holds focus means the global state is stale
+        // rather than that the pointer genuinely changed, and the last art the game did
+        // own is a far better answer than the arrow Windows happens to be showing.
+        HCURSOR g_systemCursors[16] = {};
+        int g_systemCursorCount = 0;
+        HCURSOR g_lastGameCursor = nullptr;
+        unsigned long long g_staleCursorSubstitutions = 0;
+
+        // Whether the pointer is currently confined to the game window, so ClipCursor
+        // is only called when the answer actually changes.
+        bool g_cursorConfined = false;
+        RECT g_confinedTo = {};
+
+        bool GameHasFocus()
+        {
+            return g_gameWindow != nullptr && GetForegroundWindow() == g_gameWindow;
+        }
 
         // Pre-transformed vertices carry absolute screen coordinates and ignore the
         // view and projection entirely. Duplicating such a draw per eye does not move
@@ -701,10 +756,16 @@ namespace wowvr
                        static_cast<unsigned>(kShadowRegisters),
                        g_oversizeUploads, g_beyondShadowMirror);
 
-            WOWVR_INFO("Cursor: window %p, texture %s, drawn %llu, last position %.3f, %.3f",
-                       static_cast<void*>(g_gameWindow),
-                       g_cursorTexture != nullptr ? "ok" : "MISSING",
+            WOWVR_INFO("Cursor: window %p, %d shape(s) cached, current %s, drawn %llu, "
+                       "last position %.3f, %.3f",
+                       static_cast<void*>(g_gameWindow), g_cursorCacheCount,
+                       g_activeCursor != nullptr ? "shown" : "hidden",
                        g_cursorDrawn, g_lastCursorU, g_lastCursorV);
+            WOWVR_INFO("Cursor: %llu stale-pointer substitutions after focus changes, "
+                       "last game art %p, focus %s, confined %s",
+                       g_staleCursorSubstitutions, static_cast<void*>(g_lastGameCursor),
+                       GameHasFocus() ? "held" : "elsewhere",
+                       g_cursorConfined ? "yes" : "no");
             WOWVR_INFO("World draws using pre-transformed screen coordinates: %llu",
                        g_preTransformedWorldDraws);
             WOWVR_INFO("World draws with the scissor test on: %llu (game scissor %ld,%ld - %ld,%ld)",
@@ -826,71 +887,396 @@ namespace wowvr
         // straight into the stereo target. Because it is real geometry at a real
         // distance the compositor stops treating it as a flat sheet at infinity, which
         // is what made it swim about when the head moved.
-        // A plain arrow, built here rather than shipped as a file. 'X' is the outline,
-        // '.' the fill, everything else transparent.
-        void EnsureCursorTexture(IDirect3DDevice9* device)
+        // Every cursor Windows shares between processes. Loading them is cheap and they
+        // are stable for the life of the session.
+        void CacheSystemCursors()
         {
-            if (g_cursorTexture != nullptr || g_cursorTextureFailed)
+            static const wchar_t* const kStandard[] = {
+                IDC_ARROW, IDC_IBEAM, IDC_WAIT, IDC_CROSS, IDC_UPARROW,
+                IDC_SIZENWSE, IDC_SIZENESW, IDC_SIZEWE, IDC_SIZENS, IDC_SIZEALL,
+                IDC_NO, IDC_HAND, IDC_APPSTARTING, IDC_HELP,
+            };
+
+            g_systemCursorCount = 0;
+            for (int i = 0; i < static_cast<int>(std::size(kStandard)); ++i)
+            {
+                HCURSOR cursor = LoadCursorW(nullptr, kStandard[i]);
+                if (cursor != nullptr
+                    && g_systemCursorCount < static_cast<int>(std::size(g_systemCursors)))
+                {
+                    g_systemCursors[g_systemCursorCount] = cursor;
+                    ++g_systemCursorCount;
+                }
+            }
+            WOWVR_INFO("Cached %d standard Windows cursors, used to spot a stale pointer "
+                       "after a focus change.", g_systemCursorCount);
+        }
+
+        bool IsSystemCursor(HCURSOR cursor)
+        {
+            for (int i = 0; i < g_systemCursorCount; ++i)
+            {
+                if (g_systemCursors[i] == cursor)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Keeps the pointer inside the game window while the game holds focus. Wearing
+        // the headset there is no way to see it wander off, and once it has left, the
+        // panel stops drawing it and clicks land on whatever else is out there.
+        //
+        // The clip is dropped the moment focus goes elsewhere, so alt-tab still works
+        // and a crash cannot leave the desktop with a trapped pointer.
+        void UpdateCursorConfinement()
+        {
+            const bool wanted = Cfg().confineCursor && GameHasFocus();
+            if (!wanted)
+            {
+                if (g_cursorConfined)
+                {
+                    ClipCursor(nullptr);
+                    g_cursorConfined = false;
+                }
+                return;
+            }
+
+            RECT client = {};
+            POINT topLeft = {};
+            if (!GetClientRect(g_gameWindow, &client)
+                || client.right <= client.left || client.bottom <= client.top)
+            {
+                return;
+            }
+            if (!ClientToScreen(g_gameWindow, &topLeft))
             {
                 return;
             }
 
-            static const char* kArrow[16] = {
-                "X               ",
-                "XX              ",
-                "X.X             ",
-                "X..X            ",
-                "X...X           ",
-                "X....X          ",
-                "X.....X         ",
-                "X......X        ",
-                "X.......X       ",
-                "X........X      ",
-                "X.....XXXXX     ",
-                "X..X..X         ",
-                "X.X X..X        ",
-                "XX  X..X        ",
-                "X    X..X       ",
-                "      XX        ",
-            };
+            RECT screen = {};
+            screen.left = topLeft.x;
+            screen.top = topLeft.y;
+            screen.right = topLeft.x + (client.right - client.left);
+            screen.bottom = topLeft.y + (client.bottom - client.top);
 
-            // Managed pool so it survives a device reset without needing to be rebuilt.
-            if (FAILED(device->CreateTexture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
-                                             &g_cursorTexture, nullptr))
-                || g_cursorTexture == nullptr)
+            // Only when it changes: the window can be moved, and re-clipping every
+            // frame regardless would be a syscall per frame for nothing.
+            if (g_cursorConfined
+                && screen.left == g_confinedTo.left && screen.top == g_confinedTo.top
+                && screen.right == g_confinedTo.right && screen.bottom == g_confinedTo.bottom)
             {
-                g_cursorTextureFailed = true;
-                WOWVR_WARN("Could not create the cursor texture; the pointer will not be drawn.");
                 return;
+            }
+
+            if (ClipCursor(&screen))
+            {
+                g_cursorConfined = true;
+                g_confinedTo = screen;
+            }
+        }
+
+        // Copies a GDI bitmap into a 32-bit top-down BGRA buffer, whatever depth it was
+        // stored at. A negative height is what asks GDI for top-down rows.
+        bool ReadBitmapPixels(HDC dc, HBITMAP bitmap, int width, int height,
+                              std::vector<uint32_t>& pixels)
+        {
+            BITMAPINFO info = {};
+            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+
+            pixels.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+            return GetDIBits(dc, bitmap, 0, static_cast<UINT>(height), pixels.data(), &info,
+                             DIB_RGB_COLORS) != 0;
+        }
+
+        // Flattens the two source bitmaps into straight (not premultiplied) BGRA, which
+        // is what the panel's SRCALPHA/INVSRCALPHA blend expects.
+        void ComposeCursorPixels(const std::vector<uint32_t>* colour,
+                                 const std::vector<uint32_t>* mask,
+                                 int width, int height, std::vector<uint32_t>& out)
+        {
+            // A 32-bit cursor carries its own alpha; an older colour cursor leaves that
+            // byte at zero and expects the AND mask to decide instead. Telling the two
+            // apart by inspection is more reliable than trusting the bit depth.
+            bool colourHasAlpha = false;
+            if (colour != nullptr)
+            {
+                for (size_t i = 0; i < colour->size() && !colourHasAlpha; ++i)
+                {
+                    colourHasAlpha = ((*colour)[i] & 0xFF000000u) != 0;
+                }
+            }
+
+            for (int y = 0; y < height; ++y)
+            {
+                for (int x = 0; x < width; ++x)
+                {
+                    const size_t index = static_cast<size_t>(y) * width + x;
+
+                    if (colour != nullptr)
+                    {
+                        const uint32_t texel = (*colour)[index];
+                        if (colourHasAlpha)
+                        {
+                            out[index] = texel;
+                            continue;
+                        }
+                        // A set AND-mask bit means "leave the screen as it is".
+                        const bool transparent =
+                            mask != nullptr && ((*mask)[index] & 0x00FFFFFFu) != 0;
+                        out[index] = transparent ? 0x00000000u : (texel | 0xFF000000u);
+                        continue;
+                    }
+
+                    if (mask == nullptr)
+                    {
+                        continue;
+                    }
+
+                    // Monochrome: the AND mask sits directly above the XOR mask in one
+                    // double-height bitmap.
+                    const uint32_t andBit = (*mask)[index] & 0x00FFFFFFu;
+                    const uint32_t xorBit =
+                        (*mask)[static_cast<size_t>(y + height) * width + x] & 0x00FFFFFFu;
+                    if (andBit != 0)
+                    {
+                        // Either transparent, or an inversion of whatever is behind it.
+                        // A texture cannot invert, so that case is drawn white.
+                        out[index] = (xorBit != 0) ? 0xFFFFFFFFu : 0x00000000u;
+                    }
+                    else
+                    {
+                        out[index] = (xorBit != 0) ? 0xFFFFFFFFu : 0xFF000000u;
+                    }
+                }
+            }
+        }
+
+        bool UploadCursorTexture(IDirect3DDevice9* device, const std::vector<uint32_t>& pixels,
+                                 int width, int height, CursorArt& art)
+        {
+            // Managed pool so it survives a device reset without needing to be rebuilt.
+            IDirect3DTexture9* texture = nullptr;
+            if (FAILED(device->CreateTexture(static_cast<UINT>(width), static_cast<UINT>(height),
+                                             1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                             &texture, nullptr))
+                || texture == nullptr)
+            {
+                return false;
             }
 
             D3DLOCKED_RECT locked = {};
-            if (FAILED(g_cursorTexture->LockRect(0, &locked, nullptr, 0)))
+            if (FAILED(texture->LockRect(0, &locked, nullptr, 0)))
             {
-                g_cursorTexture->Release();
-                g_cursorTexture = nullptr;
-                g_cursorTextureFailed = true;
-                return;
+                texture->Release();
+                return false;
             }
 
-            for (int y = 0; y < 16; ++y)
+            for (int y = 0; y < height; ++y)
             {
-                uint32_t* row = reinterpret_cast<uint32_t*>(
-                    static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch);
-                for (int x = 0; x < 16; ++x)
-                {
-                    const char pixel = kArrow[y][x];
-                    row[x] = (pixel == 'X') ? 0xFF000000u
-                           : (pixel == '.') ? 0xFFFFFFFFu
-                           : 0x00000000u;
-                }
+                memcpy(static_cast<uint8_t*>(locked.pBits) + y * locked.Pitch,
+                       pixels.data() + static_cast<size_t>(y) * width,
+                       static_cast<size_t>(width) * sizeof(uint32_t));
             }
-            g_cursorTexture->UnlockRect(0);
+            texture->UnlockRect(0);
+
+            art.texture = texture;
+            return true;
         }
 
-        // Where the pointer sits inside the game window, 0..1. False when it is outside
-        // or the window is not known yet.
-        bool CursorPanelPosition(float& u, float& v)
+        // Turns a Windows cursor handle into something drawable. Handles both forms the
+        // API hands back: a colour bitmap plus mask, and the older monochrome cursor
+        // where the shape lives entirely in a double-height AND/XOR mask.
+        bool BuildCursorArt(IDirect3DDevice9* device, HCURSOR cursor, CursorArt& art)
+        {
+            ICONINFO info = {};
+            if (!GetIconInfo(cursor, &info))
+            {
+                return false;
+            }
+
+            BITMAP maskInfo = {};
+            BITMAP colourInfo = {};
+            const bool haveMask = info.hbmMask != nullptr
+                                  && GetObjectW(info.hbmMask, sizeof(maskInfo), &maskInfo) != 0;
+            const bool haveColour = info.hbmColor != nullptr
+                                    && GetObjectW(info.hbmColor, sizeof(colourInfo), &colourInfo) != 0;
+
+            bool built = false;
+            int width = 0;
+            int height = 0;
+            if (haveMask || haveColour)
+            {
+                width = haveColour ? colourInfo.bmWidth : maskInfo.bmWidth;
+                // Only half of a monochrome mask is the visible shape.
+                height = haveColour ? colourInfo.bmHeight : maskInfo.bmHeight / 2;
+            }
+
+            if (width > 0 && height > 0 && width <= 256 && height <= 256)
+            {
+                HDC dc = CreateCompatibleDC(nullptr);
+                if (dc != nullptr)
+                {
+                    std::vector<uint32_t> colour;
+                    std::vector<uint32_t> mask;
+                    const bool colourRead =
+                        haveColour && ReadBitmapPixels(dc, info.hbmColor, width, height, colour);
+                    const bool maskRead =
+                        haveMask && ReadBitmapPixels(dc, info.hbmMask, maskInfo.bmWidth,
+                                                     maskInfo.bmHeight, mask);
+
+                    if (colourRead || maskRead)
+                    {
+                        std::vector<uint32_t> pixels(
+                            static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+                        ComposeCursorPixels(colourRead ? &colour : nullptr,
+                                            maskRead ? &mask : nullptr, width, height, pixels);
+                        built = UploadCursorTexture(device, pixels, width, height, art);
+                    }
+                    DeleteDC(dc);
+                }
+            }
+
+            if (built)
+            {
+                art.source = cursor;
+                art.width = width;
+                art.height = height;
+                art.hotspotX = static_cast<int>(info.xHotspot);
+                art.hotspotY = static_cast<int>(info.yHotspot);
+            }
+
+            // GetIconInfo hands over copies, and they are ours to release.
+            if (info.hbmMask != nullptr) { DeleteObject(info.hbmMask); }
+            if (info.hbmColor != nullptr) { DeleteObject(info.hbmColor); }
+            return built;
+        }
+
+        // The art for whatever cursor Windows is showing right now, built the first time
+        // each shape appears. Null when the cursor is hidden - which is what the game
+        // does during mouse-look, and drawing nothing there is correct, not a failure.
+        const CursorArt* CurrentCursorArt(IDirect3DDevice9* device)
+        {
+            CURSORINFO cursorInfo = {};
+            cursorInfo.cbSize = sizeof(cursorInfo);
+            const bool haveGlobal = GetCursorInfo(&cursorInfo) != FALSE;
+
+            // A hidden pointer stays hidden: that is the game suppressing it while you
+            // hold the right button to look around, and it must not be second-guessed.
+            HCURSOR shape = nullptr;
+            if (haveGlobal && (cursorInfo.flags & CURSOR_SHOWING) != 0)
+            {
+                shape = cursorInfo.hCursor;
+            }
+
+            if (shape != nullptr && GameHasFocus())
+            {
+                if (!IsSystemCursor(shape))
+                {
+                    // The game's own art. Remember it: this is what to fall back on if
+                    // Windows leaves a standard cursor behind after a focus change.
+                    g_lastGameCursor = shape;
+                }
+                else if (g_lastGameCursor != nullptr)
+                {
+                    shape = g_lastGameCursor;
+                    ++g_staleCursorSubstitutions;
+                }
+            }
+
+            if (Cfg().logCursorDecisions)
+            {
+                static bool lastFocus = false;
+                static HCURSOR lastGlobal = reinterpret_cast<HCURSOR>(1);
+                static HCURSOR lastShape = reinterpret_cast<HCURSOR>(1);
+                const bool focus = GameHasFocus();
+                if (focus != lastFocus || cursorInfo.hCursor != lastGlobal || shape != lastShape)
+                {
+                    lastFocus = focus;
+                    lastGlobal = cursorInfo.hCursor;
+                    lastShape = shape;
+                    WOWVR_INFO("Cursor decision: focus=%s global=%p (%s) drawing=%p "
+                               "lastGameArt=%p flags=0x%lx substitutions=%llu",
+                               focus ? "yes" : "no", static_cast<void*>(cursorInfo.hCursor),
+                               IsSystemCursor(cursorInfo.hCursor) ? "standard" : "game art",
+                               static_cast<void*>(shape),
+                               static_cast<void*>(g_lastGameCursor),
+                               cursorInfo.flags, g_staleCursorSubstitutions);
+                }
+            }
+
+            if (shape == nullptr)
+            {
+                return nullptr;
+            }
+
+            for (int i = 0; i < g_cursorCacheCount; ++i)
+            {
+                if (g_cursorCache[i].source == shape)
+                {
+                    // A cached entry with no texture is a shape that already failed to
+                    // build; remembering that is what stops it being retried per frame.
+                    return (g_cursorCache[i].texture != nullptr) ? &g_cursorCache[i] : nullptr;
+                }
+            }
+
+            if (g_cursorCacheCount >= kCursorCacheSize)
+            {
+                if (!g_cursorCacheFullLogged)
+                {
+                    g_cursorCacheFullLogged = true;
+                    WOWVR_WARN("Saw more than %d cursor shapes; the pointer will keep the "
+                               "last one it managed to cache.", kCursorCacheSize);
+                }
+                return g_activeCursor;
+            }
+
+            CursorArt art;
+            const bool built = BuildCursorArt(device, shape, art);
+            if (!built)
+            {
+                art.source = shape;
+                art.texture = nullptr;
+            }
+            g_cursorCache[g_cursorCacheCount] = art;
+            ++g_cursorCacheCount;
+
+            if (!built)
+            {
+                WOWVR_WARN("Could not read cursor shape %p; it will not be drawn.", shape);
+                return nullptr;
+            }
+
+            WOWVR_INFO("Cached cursor shape %d: %dx%d, hotspot %d,%d.", g_cursorCacheCount,
+                       art.width, art.height, art.hotspotX, art.hotspotY);
+            return &g_cursorCache[g_cursorCacheCount - 1];
+        }
+
+        void ReleaseCursorTextures()
+        {
+            for (int i = 0; i < g_cursorCacheCount; ++i)
+            {
+                if (g_cursorCache[i].texture != nullptr)
+                {
+                    g_cursorCache[i].texture->Release();
+                }
+                g_cursorCache[i] = CursorArt();
+            }
+            g_cursorCacheCount = 0;
+            g_cursorCacheFullLogged = false;
+            g_activeCursor = nullptr;
+        }
+
+        // Where the pointer sits inside the game window, 0..1, along with the size of
+        // that window so the art can be scaled to match. False when the pointer is
+        // outside the window or the window is not known yet.
+        bool CursorPanelPosition(float& u, float& v, float& clientWidth, float& clientHeight)
         {
             if (g_gameWindow == nullptr)
             {
@@ -906,8 +1292,10 @@ namespace wowvr
                 return false;
             }
 
-            u = static_cast<float>(point.x) / static_cast<float>(client.right - client.left);
-            v = static_cast<float>(point.y) / static_cast<float>(client.bottom - client.top);
+            clientWidth = static_cast<float>(client.right - client.left);
+            clientHeight = static_cast<float>(client.bottom - client.top);
+            u = static_cast<float>(point.x) / clientWidth;
+            v = static_cast<float>(point.y) / clientHeight;
             return u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
         }
 
@@ -992,7 +1380,8 @@ namespace wowvr
                 }
             }
 
-            EnsureCursorTexture(device);
+            UpdateCursorConfinement();
+            g_activeCursor = CurrentCursorArt(device);
 
             const float width = Cfg().panelWidth;
             const float height = width * static_cast<float>(g_uiPanel.Height())
@@ -1082,28 +1471,39 @@ namespace wowvr
                 // sits on the interface rather than floating in front of it.
                 float u = 0.0f;
                 float v = 0.0f;
-                const bool havePointer = CursorPanelPosition(u, v);
+                float clientWidth = 0.0f;
+                float clientHeight = 0.0f;
+                const bool havePointer = CursorPanelPosition(u, v, clientWidth, clientHeight);
                 g_lastCursorU = havePointer ? u : -1.0f;
                 g_lastCursorV = havePointer ? v : -1.0f;
-                if (g_cursorTexture != nullptr && havePointer)
+                if (g_activeCursor != nullptr && havePointer && clientWidth > 0.0f)
                 {
                     ++g_cursorDrawn;
-                    const float size = width * 0.030f;
-                    const float left = -halfWidth + u * width;
-                    const float top = halfHeight - v * height;
+
+                    // Metres per game pixel, so the pointer covers the same fraction of
+                    // the interface here as it does on the desktop. Scale is on a knob
+                    // because a 32-pixel cursor at true size is small through a headset.
+                    const float scale = Cfg().cursorScale;
+                    const float pixel = (width / clientWidth) * scale;
+                    const float artWidth = g_activeCursor->width * pixel;
+                    const float artHeight = g_activeCursor->height * pixel;
+
+                    // Shifted by the hotspot so the part of the image that does the
+                    // pointing lands on the pixel being pointed at, rather than the
+                    // image's top-left corner. Panel Y runs up, image Y runs down.
+                    const float left = -halfWidth + u * width - g_activeCursor->hotspotX * pixel;
+                    const float top = halfHeight - v * height + g_activeCursor->hotspotY * pixel;
 
                     const PanelVertex pointer[4] = {
-                        { left,        top,        0.0f, 0.0f, 0.0f },
-                        { left + size, top,        0.0f, 1.0f, 0.0f },
-                        { left,        top - size, 0.0f, 0.0f, 1.0f },
-                        { left + size, top - size, 0.0f, 1.0f, 1.0f },
+                        { left,            top,             0.0f, 0.0f, 0.0f },
+                        { left + artWidth, top,             0.0f, 1.0f, 0.0f },
+                        { left,            top - artHeight, 0.0f, 0.0f, 1.0f },
+                        { left + artWidth, top - artHeight, 0.0f, 1.0f, 1.0f },
                     };
 
-                    device->SetTexture(0, g_cursorTexture);
-                    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    device->SetTexture(0, g_activeCursor->texture);
                     g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, pointer,
                                               sizeof(PanelVertex));
-                    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
                     device->SetTexture(0, g_uiPanel.Texture());
                 }
             }
@@ -3565,6 +3965,8 @@ namespace wowvr
                 g_gameWindow = focusWindow;
             }
 
+            CacheSystemCursors();
+
             if (FAILED(hr) || returnedDevice == nullptr || *returnedDevice == nullptr)
             {
                 WOWVR_WARN("CreateDevice failed (0x%08lx).", hr);
@@ -3643,6 +4045,17 @@ namespace wowvr
         }
 
         ReleaseFrameResources();
+        // Not released with the frame resources: these are managed-pool and survive a
+        // device reset, so they only need to go when the device itself does.
+        ReleaseCursorTextures();
+
+        // Never leave the pointer trapped, whatever else went wrong on the way out.
+        if (g_cursorConfined)
+        {
+            ClipCursor(nullptr);
+            g_cursorConfined = false;
+        }
+
         g_presenter.Shutdown();
         Vr().Shutdown();
         g_device = nullptr;

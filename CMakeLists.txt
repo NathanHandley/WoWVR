@@ -65,6 +65,8 @@ set(WOWVR_SOURCES
     src/proxy/dllmain.cpp
     src/proxy/exports.cpp
     src/proxy/exports.h
+    src/proxy/iat_hook.cpp
+    src/proxy/iat_hook.h
     src/proxy/real_d3d9.cpp
     src/proxy/real_d3d9.h
     src/proxy/vtable_hook.cpp

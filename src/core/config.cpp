@@ -191,6 +191,8 @@ namespace wowvr
         config.panelDeadzoneDegrees = ReadFloat(path, L"Panel", L"DeadzoneDegrees", config.panelDeadzoneDegrees);
         config.panelFollowSpeed = ReadFloat(path, L"Panel", L"FollowSpeed", config.panelFollowSpeed);
         config.panelOpacity = ReadFloat(path, L"Panel", L"Opacity", config.panelOpacity);
+        config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
+        config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
 
         config.desktopMirror = ReadBool(path, L"Mirror", L"DesktopMirror", config.desktopMirror);
 
@@ -203,6 +205,8 @@ namespace wowvr
         config.logShadowConstants =
             ReadBool(path, L"Debug", L"LogShadowConstants", config.logShadowConstants);
         config.logSkippedDraws = ReadBool(path, L"Debug", L"LogSkippedDraws", config.logSkippedDraws);
+        config.logCursorDecisions =
+            ReadBool(path, L"Debug", L"LogCursorDecisions", config.logCursorDecisions);
         config.fullTargetSingleEye =
             ReadBool(path, L"Debug", L"FullTargetSingleEye", config.fullTargetSingleEye);
         config.keepGameViewport = ReadBool(path, L"Debug", L"KeepGameViewport", config.keepGameViewport);
