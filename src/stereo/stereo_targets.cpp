@@ -22,7 +22,15 @@ namespace wowvr
 
         const uint32_t totalWidth = eyeWidth * 2;
 
-        HRESULT hr = device->CreateRenderTarget(totalWidth, eyeHeight, D3DFMT_A8R8G8B8,
+        // MUST match the client's own back-buffer format. Ours was A8R8G8B8 while the
+        // client renders into X8R8G8B8, which has no alpha channel. Anything the client
+        // does with DESTINATION ALPHA - and its projected shadows are a classic user of
+        // that - behaves completely differently against a surface that actually stores
+        // alpha, because on its own back buffer destination alpha always reads as opaque.
+        const D3DFORMAT colourFormat = (m_backBufferFormat != 0)
+            ? static_cast<D3DFORMAT>(m_backBufferFormat) : D3DFMT_X8R8G8B8;
+
+        HRESULT hr = device->CreateRenderTarget(totalWidth, eyeHeight, colourFormat,
                                                 D3DMULTISAMPLE_NONE, 0, FALSE, &m_color, nullptr);
         if (FAILED(hr))
         {

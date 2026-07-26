@@ -32,6 +32,8 @@ namespace wowvr
             constexpr unsigned CreateDepthStencilSurface = 29;
             constexpr unsigned StretchRect = 34;
             constexpr unsigned SetRenderTarget = 37;
+            constexpr unsigned GetRenderTarget = 38;
+            constexpr unsigned GetDepthStencilSurface = 40;
             constexpr unsigned SetDepthStencilSurface = 39;
             constexpr unsigned BeginScene = 41;
             constexpr unsigned EndScene = 42;
@@ -49,6 +51,8 @@ namespace wowvr
             constexpr unsigned CreateVertexShader = 91;
             constexpr unsigned SetVertexShader = 92;
             constexpr unsigned SetVertexShaderConstantF = 94;
+            constexpr unsigned CreatePixelShader = 106;
+            constexpr unsigned SetPixelShader = 107;
             constexpr unsigned Count = 119;
         }
     }

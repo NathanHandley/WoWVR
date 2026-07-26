@@ -48,6 +48,13 @@ namespace wowvr
         // secondary perspective camera, which still has to follow the head.
         bool PatchAnyPerspective(const float* uploaded, float* outLeft, float* outRight);
 
+        // Matrices DERIVED from the scene projection's inverse - the classic
+        // "reconstruct world position from the depth buffer, then transform into light
+        // space" constant. Substituting a new projection without rebuilding these leaves
+        // the reconstruction wrong, which is what made the whole shadow cascade read as
+        // shadowed. Recognised by scene * W being an orthographic light matrix.
+        bool TryPatchInverseDerived(const float* uploaded, float* outLeft, float* outRight);
+
         // Geometry that is effectively infinitely far away - the sky dome. It must turn
         // with the head but never translate: no per-eye offset, so both eyes see it
         // identically and it reads as infinitely distant, and no head displacement, so
@@ -83,6 +90,7 @@ namespace wowvr
         // Diagnostics for the log.
         unsigned long long PatchedCount() const { return m_patched; }
         unsigned long long RejectedCount() const { return m_rejected; }
+        unsigned long long InverseDerivedCount() const { return m_inverseDerivedPatched; }
         void LogLastDecision() const;
 
     private:
@@ -137,6 +145,7 @@ namespace wowvr
         unsigned long long m_combinedPatched = 0;
         unsigned long long m_combinedNoScene = 0;
         unsigned long long m_combinedNotAffine = 0;
+        unsigned long long m_inverseDerivedPatched = 0;
         bool m_requireRigidResidual = false;
         bool m_infiniteDistance = false;
         Mat4 m_sceneMatrix;              // row-vector form of the scene projection

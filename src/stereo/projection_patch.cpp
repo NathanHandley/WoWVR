@@ -247,6 +247,16 @@ namespace wowvr
                 float tanBottom = 0.0f;
                 Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
 
+                if (Cfg().symmetricEyeProjection)
+                {
+                    const float wide = (fabsf(tanLeft) > fabsf(tanRight))
+                        ? fabsf(tanLeft) : fabsf(tanRight);
+                    const float tall = (fabsf(tanTop) > fabsf(tanBottom))
+                        ? fabsf(tanTop) : fabsf(tanBottom);
+                    tanLeft = -wide; tanRight = wide;
+                    tanTop = -tall;  tanBottom = tall;
+                }
+
                 replacement = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
                                                       decoded.nearPlane, decoded.farPlane);
 
@@ -272,6 +282,15 @@ namespace wowvr
             const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
             const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
             const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+
+            if (Cfg().eyeProjectionPassThrough)
+            {
+                // Straight back out again, through every other step of the path.
+                const Mat4 unchanged = decoded.wasTransposed
+                    ? Mat4Transpose(decoded.projection) : decoded.projection;
+                MatrixTo(unchanged, eye == EyeLeft ? outLeft : outRight);
+                continue;
+            }
 
             if (m_infiniteDistance)
             {
@@ -316,6 +335,16 @@ namespace wowvr
             float tanTop = 0.0f;
             float tanBottom = 0.0f;
             Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+
+                if (Cfg().symmetricEyeProjection)
+                {
+                    const float wide = (fabsf(tanLeft) > fabsf(tanRight))
+                        ? fabsf(tanLeft) : fabsf(tanRight);
+                    const float tall = (fabsf(tanTop) > fabsf(tanBottom))
+                        ? fabsf(tanTop) : fabsf(tanBottom);
+                    tanLeft = -wide; tanRight = wide;
+                    tanTop = -tall;  tanBottom = tall;
+                }
 
             replacement = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
                                                   nearPlane, farPlane);
@@ -363,6 +392,42 @@ namespace wowvr
                     {
                         return false;
                     }
+                }
+            }
+            return true;
+        }
+
+        bool AllFiniteMatrix(const Mat4& m);
+        bool Mat4IsNearIdentity(const Mat4& m, float tolerance);
+
+        // A light's view-projection is orthographic: no perspective column.
+        bool LooksLikeLightMatrix(const Mat4& m)
+        {
+            if (!AllFiniteMatrix(m))
+            {
+                return false;
+            }
+            const bool orthographic = fabsf(m.m[3][3] - 1.0f) < 1.0e-3f
+                                   && fabsf(m.m[0][3]) < 1.0e-3f
+                                   && fabsf(m.m[1][3]) < 1.0e-3f
+                                   && fabsf(m.m[2][3]) < 1.0e-3f;
+            if (!orthographic)
+            {
+                return false;
+            }
+            // An identity product means the constant was just the plain inverse, which
+            // carries no light transform.
+            return !Mat4IsNearIdentity(m, 1.0e-3f);
+        }
+
+        bool AllFiniteMatrix(const Mat4& m)
+        {
+            for (int r = 0; r < 4; ++r)
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    const float v = m.m[r][c];
+                    if (!(v > -1.0e30f && v < 1.0e30f)) { return false; }
                 }
             }
             return true;
@@ -527,8 +592,67 @@ namespace wowvr
         return true;
     }
 
+    bool ProjectionPatch::TryPatchInverseDerived(const float* uploaded,
+                                                 float* outLeft, float* outRight)
+    {
+        if (!m_haveSceneMatrix || !Vr().IsActive())
+        {
+            return false;
+        }
+
+        // The upload may be either way round; whichever orientation makes scene * W an
+        // orthographic light matrix is the right reading.
+        const Mat4 asUploaded = MatrixFrom(uploaded);
+        const Mat4 transposed = Mat4Transpose(asUploaded);
+
+        Mat4 candidate;
+        Mat4 light;
+        bool wasTransposed = false;
+
+        light = Mat4Multiply(m_sceneMatrix, asUploaded);
+        if (LooksLikeLightMatrix(light))
+        {
+            candidate = asUploaded;
+        }
+        else
+        {
+            light = Mat4Multiply(m_sceneMatrix, transposed);
+            if (!LooksLikeLightMatrix(light))
+            {
+                return false;
+            }
+            candidate = transposed;
+            wasTransposed = true;
+        }
+
+        (void)candidate;
+
+        for (int eye = 0; eye < EyeCount; ++eye)
+        {
+            // Built against exactly what will be written into the projection register
+            // for this eye, since that is what the shader reconstructs from.
+            const Mat4 substituted =
+                BuildEyeProjection(eye, m_sceneNear, m_sceneFar, m_sceneMatrix);
+
+            Mat4 inverseEye;
+            if (!Mat4Inverse(substituted, inverseEye))
+            {
+                return false;
+            }
+
+            const Mat4 rebuilt = Mat4Multiply(inverseEye, light);
+            MatrixTo(wasTransposed ? Mat4Transpose(rebuilt) : rebuilt,
+                     eye == EyeLeft ? outLeft : outRight);
+        }
+
+        ++m_inverseDerivedPatched;
+        return true;
+    }
+
     void ProjectionPatch::LogLastDecision() const
     {
+        WOWVR_INFO("Inverse-derived constants rebuilt: %llu", m_inverseDerivedPatched);
+
         WOWVR_INFO("Combined transform path: %llu offered, %llu rewritten, %llu skipped for "
                    "no scene camera yet, %llu rejected as not affine",
                    m_combinedTried, m_combinedPatched, m_combinedNoScene, m_combinedNotAffine);

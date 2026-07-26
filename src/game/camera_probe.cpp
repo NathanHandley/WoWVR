@@ -620,6 +620,219 @@ namespace wowvr
                    fabsf(actual - expectedHalf) < 0.002f ? "TRACKS" : "diverged");
     }
 
+    bool CameraProbe::WidenGameFov(float desiredHalfAngleRadians)
+    {
+        // The address the static sweep converged on. Two independent statics pointed at
+        // it and its value tracked the projection decoded off the wire, so it is treated
+        // as known rather than searched for again.
+        if (m_fovField == nullptr)
+        {
+            m_fovField = reinterpret_cast<float*>(0x00ABFC38u);
+        }
+
+        if (!Readable(m_fovField, sizeof(float)))
+        {
+            return false;
+        }
+
+        // Never write over something that is not a plausible half field of view. This is
+        // the one guard standing between a targeted patch and the kind of scattergun
+        // write that crashed the client twice before.
+        const float current = *m_fovField;
+        const bool plausible = current > 0.15f && current < 1.4f;
+
+        if (!m_fovWidened)
+        {
+            if (!plausible)
+            {
+                WOWVR_WARN("Not widening the game's field of view: 0x%08X holds %.5f, "
+                           "which is not a half angle.",
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_fovField)),
+                           current);
+                return false;
+            }
+
+            DWORD previous = 0;
+            if (!VirtualProtect(m_fovField, sizeof(float), PAGE_READWRITE, &previous))
+            {
+                WOWVR_WARN("Could not make the field of view field writable.");
+                return false;
+            }
+
+            m_originalHalfFov = current;
+            m_fovWidened = true;
+            WOWVR_INFO("Widening the game's field of view: %.5f rad (%.2f deg full) -> "
+                       "%.5f rad (%.2f deg full).",
+                       m_originalHalfFov, m_originalHalfFov * 2.0f * 57.2957795f,
+                       desiredHalfAngleRadians,
+                       desiredHalfAngleRadians * 2.0f * 57.2957795f);
+        }
+
+        // Rewritten every frame: if the client refreshes this from a console variable we
+        // would otherwise be overwritten straight back.
+        *m_fovField = desiredHalfAngleRadians;
+        return true;
+    }
+
+    void CameraProbe::ScanForCameraObject(float verticalScale, float nearPlane, float farPlane)
+    {
+        const uintptr_t imageBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        if (imageBase == 0)
+        {
+            return;
+        }
+
+        const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
+        const IMAGE_NT_HEADERS* nt =
+            reinterpret_cast<const IMAGE_NT_HEADERS*>(imageBase + dos->e_lfanew);
+        const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+
+        const float wantHalfFov = atanf(1.0f / verticalScale);
+        int hits = 0;
+        int walked = 0;
+
+        WOWVR_INFO("Camera object scan: looking for fov %.5f, near %.4f, far %.1f "
+                   "together in one object.", wantHalfFov, nearPlane, farPlane);
+
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections && hits < 24; ++i, ++section)
+        {
+            if ((section->Characteristics & IMAGE_SCN_MEM_WRITE) == 0)
+            {
+                continue;
+            }
+
+            const uintptr_t start = imageBase + section->VirtualAddress;
+            const size_t size = section->Misc.VirtualSize;
+
+            for (size_t offset = 0; offset + sizeof(uintptr_t) <= size && hits < 24;
+                 offset += sizeof(uintptr_t))
+            {
+                if ((offset & 0xFFFu) == 0
+                    && !Readable(reinterpret_cast<const void*>(start + offset), 0x1000))
+                {
+                    offset += 0x1000 - sizeof(uintptr_t);
+                    continue;
+                }
+
+                const uintptr_t level1 = *reinterpret_cast<const uintptr_t*>(start + offset);
+                if (level1 < 0x10000u || (level1 & 3u) != 0
+                    || !Readable(reinterpret_cast<const void*>(level1), 0x200))
+                {
+                    continue;
+                }
+
+                // Two levels: the static may point at the camera, or at something that
+                // holds it. Every aligned pointer in the first 0x100 bytes is followed.
+                for (int depth = 0; depth < 2; ++depth)
+                {
+                    for (unsigned slot = 0; slot < (depth == 0 ? 1u : 64u); ++slot)
+                    {
+                        uintptr_t object = level1;
+                        if (depth == 1)
+                        {
+                            object = *reinterpret_cast<const uintptr_t*>(level1 + slot * 4);
+                            if (object < 0x10000u || (object & 3u) != 0)
+                            {
+                                continue;
+                            }
+                        }
+
+                        if (!Readable(reinterpret_cast<const void*>(object), 0x200))
+                        {
+                            continue;
+                        }
+
+                        ++walked;
+                        const uint8_t* base = reinterpret_cast<const uint8_t*>(object);
+
+                        for (unsigned f = 0; f + 4 <= 0x200 && hits < 24; f += 4)
+                        {
+                            const float value = *reinterpret_cast<const float*>(base + f);
+                            if (!AllFinite(&value, 1) || fabsf(value - wantHalfFov) > 0.004f)
+                            {
+                                continue;
+                            }
+
+                            // Field of view found; now require the clip planes nearby.
+                            bool sawNear = false;
+                            bool sawFar = false;
+                            unsigned nearAt = 0;
+                            unsigned farAt = 0;
+                            const unsigned lo = (f > 0x40) ? f - 0x40 : 0;
+                            for (unsigned g = lo; g + 4 <= f + 0x40 && g + 4 <= 0x200; g += 4)
+                            {
+                                const float v = *reinterpret_cast<const float*>(base + g);
+                                if (!AllFinite(&v, 1)) { continue; }
+                                if (!sawNear && fabsf(v - nearPlane) < 0.01f)
+                                {
+                                    sawNear = true; nearAt = g;
+                                }
+                                if (!sawFar && fabsf(v - farPlane) < farPlane * 0.01f)
+                                {
+                                    sawFar = true; farAt = g;
+                                }
+                            }
+
+                            if (sawNear && sawFar)
+                            {
+                                WOWVR_INFO("  CAMERA OBJECT 0x%08X via static 0x%08X "
+                                           "depth %d: fov at +0x%X, near at +0x%X, "
+                                           "far at +0x%X",
+                                           static_cast<unsigned>(object),
+                                           static_cast<unsigned>(start + offset), depth,
+                                           f, nearAt, farAt);
+                                ++hits;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        WOWVR_INFO("Camera object scan: %d objects walked, %d carried fov+near+far together.",
+                   walked, hits);
+    }
+
+    bool CameraProbe::WidenGameFovByFactor(float factor)
+    {
+        if (m_fovField == nullptr)
+        {
+            m_fovField = reinterpret_cast<float*>(0x00ABFC38u);
+        }
+
+        if (!Readable(m_fovField, sizeof(float)))
+        {
+            return false;
+        }
+
+        // The factor applies to the value the game shipped with, captured once, so that
+        // rewriting every frame cannot compound.
+        if (!m_fovWidened)
+        {
+            const float current = *m_fovField;
+            if (!(current > 0.15f && current < 1.4f))
+            {
+                return false;
+            }
+            m_originalHalfFov = current;
+        }
+
+        float target = m_originalHalfFov * factor;
+        if (target > 1.05f) { target = 1.05f; }
+
+        return WidenGameFov(target);
+    }
+
+    void CameraProbe::RestoreGameFov()
+    {
+        if (m_fovWidened && m_fovField != nullptr && Readable(m_fovField, sizeof(float)))
+        {
+            *m_fovField = m_originalHalfFov;
+            m_fovWidened = false;
+            WOWVR_INFO("Restored the game's field of view to %.5f rad.", m_originalHalfFov);
+        }
+    }
+
     void CameraProbe::ProbeKnownOffsets(float verticalScale, float aspect)
     {
         // Published layout for 3.3.5a build 12340: a static pointer to the world frame,

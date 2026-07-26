@@ -60,6 +60,10 @@ namespace wowvr
         SetDepthStencilSurfaceFn g_originalSetDepthStencilSurface = nullptr;
         SetViewportFn g_originalSetViewport = nullptr;
         SetScissorRectFn g_originalSetScissorRect = nullptr;
+        typedef HRESULT (WINAPI *GetRenderTargetFn)(IDirect3DDevice9*, DWORD, IDirect3DSurface9**);
+        typedef HRESULT (WINAPI *GetDepthStencilSurfaceFn)(IDirect3DDevice9*, IDirect3DSurface9**);
+        GetRenderTargetFn g_originalGetRenderTarget = nullptr;
+        GetDepthStencilSurfaceFn g_originalGetDepthStencilSurface = nullptr;
         ClearFn g_originalClear = nullptr;
         SetRenderStateFn g_originalSetRenderState = nullptr;
 
@@ -154,6 +158,7 @@ namespace wowvr
         // shadow map and the glow passes reuse the camera's constant register, so the
         // projection patch needs to know which pass it is looking at.
         uint32_t g_backBufferWidth = 0;
+        D3DFORMAT g_backBufferFormat = D3DFMT_UNKNOWN;
         uint32_t g_backBufferHeight = 0;
         bool g_renderingToBackBuffer = true;
 
@@ -456,6 +461,7 @@ namespace wowvr
         bool g_fixedProjectionIsOrtho = false;
 
         IDirect3DVertexShader9* g_currentVertexShader = nullptr;
+        IDirect3DPixelShader9* g_currentPixelShader = nullptr;
 
         // Set while the frame is being rendered into the side-by-side target. Guards
         // against duplicating draws that belong to the shadow or post passes.
@@ -489,6 +495,52 @@ namespace wowvr
         unsigned long long g_drawsStrayBackBuffer = 0;
         int g_lastPeriodCount = 0;
         unsigned long long g_skySliceDraws = 0;
+
+        // Upload sizes, to test whether a low sun really does push the constant blocks
+        // past the bounds of the scratch buffers.
+        UINT g_maxVector4Count = 0;
+        UINT g_maxStartPlusCount = 0;
+        unsigned long long g_oversizeUploads = 0;
+        unsigned long long g_beyondShadowMirror = 0;
+
+        // True while the client is rendering into its shadow map. The pass is recognised
+        // by the render target being the big square offscreen surface it clears twice a
+        // frame for its two cascades.
+        bool g_renderingShadowMap = false;
+        uint32_t g_shadowMapSize = 0;
+        unsigned long long g_shadowCascadesWidened = 0;
+        IDirect3DSurface9* g_shadowSurface = nullptr;
+        bool g_dumpShadowMapNext = false;
+        int g_shadowMapDumpIndex = 0;
+        unsigned long long g_shadowMapDraws = 0;
+        unsigned long long g_shadowMapPrims = 0;
+        IDirect3DVertexShader9* g_shadowCasterShaders[16] = {};
+        int g_shadowCasterShaderCount = 0;
+
+        // The light's orthographic matrix, captured while the shadow map is rendered.
+        // The world pass has to sample through the same transform, so finding it there
+        // is a matter of matching against this.
+        float g_lightOrtho[16] = {};
+        bool g_haveLightOrtho = false;
+        unsigned long long g_lightOrthoSeenInWorld = 0;
+        unsigned long long g_shadowCascadeRowsScaled = 0;
+        unsigned long long g_depthSubstituted = 0;
+        int g_shadowSamplerLogged = 0;
+        unsigned long long g_eyeStateRestored = 0;
+        unsigned long long g_renderTargetQueriesRedirected = 0;
+        unsigned long long g_postProcessDrawsSkipped = 0;
+        int g_skippedDrawsLogged = 0;
+        IDirect3DSurface9* g_gameDepthSurface = nullptr;
+        bool g_currentTargetIsStereo = false;
+        unsigned long long g_setRenderTargetFailures = 0;
+        unsigned long long g_depthSubstitutionDeclined = 0;
+
+        // Which registers the upload path actually rewrites, split by how they were
+        // identified. A register being rewritten that has no business being a camera is
+        // the whole question here.
+        unsigned long long g_substShape[kShadowRegisters] = {};
+        unsigned long long g_substExact[kShadowRegisters] = {};
+        unsigned long long g_substCombined[kShadowRegisters] = {};
 
         // The game uses the hardware cursor, which never reaches the render target, so
         // in the headset there is nothing to aim with. This draws one onto the panel.
@@ -595,6 +647,60 @@ namespace wowvr
                        "sky-slice eye draws %llu",
                        g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
                        g_drawsStrayBackBuffer, g_lastPeriodCount, g_skySliceDraws);
+            {
+                char line[512];
+                int used = 0;
+                for (UINT reg = 0; reg < kShadowRegisters; ++reg)
+                {
+                    if ((g_substShape[reg] | g_substExact[reg] | g_substCombined[reg]) == 0)
+                    {
+                        continue;
+                    }
+                    if (used < static_cast<int>(sizeof(line)) - 48)
+                    {
+                        used += sprintf_s(line + used, sizeof(line) - used,
+                                          "c%u[s%llu e%llu k%llu] ", reg,
+                                          g_substShape[reg], g_substExact[reg],
+                                          g_substCombined[reg]);
+                    }
+                }
+                line[used] = 0;
+                WOWVR_INFO("Registers rewritten (s=byShape e=byExactMatch k=combined): %s",
+                           used ? line : "(none)");
+            }
+
+            WOWVR_INFO("SetRenderTarget failures: %llu", g_setRenderTargetFailures);
+
+            WOWVR_INFO("Post-process draws skipped: %llu", g_postProcessDrawsSkipped);
+
+            WOWVR_INFO("Eye state restored after %llu duplicated draws; render-target "
+                       "queries answered with the client's own surface %llu times",
+                       g_eyeStateRestored, g_renderTargetQueriesRedirected);
+
+            WOWVR_INFO("Depth surface substituted %llu times, declined %llu times "
+                       "(declined = the client's own offscreen passes, including its shadow map)",
+                       g_depthSubstituted, g_depthSubstitutionDeclined);
+
+            WOWVR_INFO("Shadow cascade transforms scaled %llu times",
+                       g_shadowCascadeRowsScaled);
+
+            WOWVR_INFO("Light matrix seen in the world pass %llu times (have it: %d)",
+                       g_lightOrthoSeenInWorld, g_haveLightOrtho ? 1 : 0);
+
+            WOWVR_INFO("Shadow map: %llu caster draws, %llu primitives written into it",
+                       g_shadowMapDraws, g_shadowMapPrims);
+
+            WOWVR_INFO("Shadow map: %ux%u, %llu cascades widened by %.2fx",
+                       g_shadowMapSize, g_shadowMapSize, g_shadowCascadesWidened,
+                       Cfg().shadowCoverageScale);
+
+            WOWVR_INFO("Constant uploads: largest %u regs, highest register touched %u "
+                       "(shadow mirror holds %u); %llu uploads over the 1024 patch bound, "
+                       "%llu reaching past the mirror",
+                       g_maxVector4Count, g_maxStartPlusCount,
+                       static_cast<unsigned>(kShadowRegisters),
+                       g_oversizeUploads, g_beyondShadowMirror);
+
             WOWVR_INFO("Cursor: window %p, texture %s, drawn %llu, last position %.3f, %.3f",
                        static_cast<void*>(g_gameWindow),
                        g_cursorTexture != nullptr ? "ok" : "MISSING",
@@ -681,6 +787,7 @@ namespace wowvr
             bool stereoReady = true;
             if (Cfg().stereo)
             {
+                g_stereo.SetBackBufferFormat(static_cast<uint32_t>(g_backBufferFormat));
                 stereoReady = g_stereo.Create(device, width, height);
                 stereoReady = g_uiPanel.Create(device, g_backBufferWidth, g_backBufferHeight)
                               && stereoReady;
@@ -802,6 +909,55 @@ namespace wowvr
             u = static_cast<float>(point.x) / static_cast<float>(client.right - client.left);
             v = static_cast<float>(point.y) / static_cast<float>(client.bottom - client.top);
             return u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
+        }
+
+        // Reads the client's shadow map back to a BMP. If the cascade box shows as
+        // uniformly shadowed in the world, the first thing to establish is whether the
+        // map has any caster depths in it at all.
+        void DumpShadowMap(IDirect3DDevice9* device)
+        {
+            g_dumpShadowMapNext = false;
+            if (g_shadowSurface == nullptr)
+            {
+                return;
+            }
+
+            D3DSURFACE_DESC desc = {};
+            if (FAILED(g_shadowSurface->GetDesc(&desc)))
+            {
+                return;
+            }
+
+            IDirect3DSurface9* staging = nullptr;
+            if (FAILED(device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                           D3DPOOL_SYSTEMMEM, &staging, nullptr))
+                || staging == nullptr)
+            {
+                WOWVR_WARN("Could not create a staging surface for the shadow map.");
+                return;
+            }
+
+            const HRESULT hr = device->GetRenderTargetData(g_shadowSurface, staging);
+            if (SUCCEEDED(hr))
+            {
+                D3DLOCKED_RECT locked = {};
+                if (SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                {
+                    wchar_t name[64];
+                    swprintf_s(name, L"WoWVR_shadowmap_%02d.bmp", g_shadowMapDumpIndex++);
+                    SaveBgraBmp(ModuleFile(name).c_str(), locked.pBits,
+                                desc.Width, desc.Height, static_cast<uint32_t>(locked.Pitch));
+                    staging->UnlockRect();
+                    WOWVR_INFO("Shadow map %ux%u fmt=%d written to %S",
+                               desc.Width, desc.Height, static_cast<int>(desc.Format), name);
+                }
+            }
+            else
+            {
+                WOWVR_WARN("GetRenderTargetData on the shadow map failed (0x%08lx).", hr);
+            }
+
+            staging->Release();
         }
 
         void CompositeUiPanel(IDirect3DDevice9* device)
@@ -972,6 +1128,46 @@ namespace wowvr
         // exactly the bugs left, so this dumps the target itself.
         int g_stereoDumpIndex = 0;
 
+        // A stamp fixed at first use, so a session's shots never overwrite the previous
+        // session's. Without it every run restarted at 00 and quietly clobbered whatever
+        // was there.
+        const wchar_t* SessionStamp()
+        {
+            static wchar_t stamp[24] = {};
+            if (stamp[0] == 0)
+            {
+                SYSTEMTIME now = {};
+                GetLocalTime(&now);
+                swprintf_s(stamp, L"%02d%02d-%02d%02d",
+                           now.wMonth, now.wDay, now.wHour, now.wMinute);
+            }
+            return stamp;
+        }
+
+        // One line per shot, so the series can be read back without guessing which files
+        // belong to which run.
+        void AppendShotManifest(const wchar_t* file, float yaw, float pitch,
+                                float x, float y, float z)
+        {
+            wchar_t manifestName[64];
+            swprintf_s(manifestName, L"WoWVR_shots_%s.txt", SessionStamp());
+
+            FILE* manifest = nullptr;
+            if (_wfopen_s(&manifest, ModuleFile(manifestName).c_str(), L"a, ccs=UTF-8") != 0
+                || manifest == nullptr)
+            {
+                return;
+            }
+
+            SYSTEMTIME now = {};
+            GetLocalTime(&now);
+            fwprintf(manifest, L"%02d  %s  %02d:%02d:%02d  yaw %+7.2f  pitch %+7.2f  "
+                               L"pos (%+.3f, %+.3f, %+.3f)\n",
+                     g_stereoDumpIndex, file, now.wHour, now.wMinute, now.wSecond,
+                     yaw, pitch, x, y, z);
+            fclose(manifest);
+        }
+
         void DumpStereoTarget(IDirect3DDevice9* device)
         {
             if (!g_stereo.IsReady())
@@ -997,10 +1193,11 @@ namespace wowvr
                 D3DLOCKED_RECT locked = {};
                 if (SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
                 {
-                    // Numbered as well as fixed-name, so a run can take a series of
-                    // shots without each one overwriting the last.
+                    // Stamped with the session so a series never overwrites an earlier
+                    // run's, plus the fixed name for tooling that just wants the latest.
                     wchar_t numbered[64];
-                    swprintf_s(numbered, L"WoWVR_stereo_%02d.bmp", g_stereoDumpIndex);
+                    swprintf_s(numbered, L"WoWVR_shot_%s_%02d.bmp",
+                               SessionStamp(), g_stereoDumpIndex);
                     SaveBgraBmp(ModuleFile(L"WoWVR_stereo.bmp").c_str(), locked.pBits,
                                 width, height, static_cast<uint32_t>(locked.Pitch));
                     SaveBgraBmp(ModuleFile(numbered).c_str(), locked.pBits,
@@ -1020,6 +1217,9 @@ namespace wowvr
                                g_stereoDumpIndex, yaw, pitch,
                                head.m[3][0], head.m[3][1], head.m[3][2],
                                Vr().HasHeadPose() ? 1 : 0, Vr().UserIsPresent() ? 1 : 0);
+                    WOWVR_INFO("  saved %S", numbered);
+                    AppendShotManifest(numbered, yaw, pitch,
+                                       head.m[3][0], head.m[3][1], head.m[3][2]);
                     ++g_stereoDumpIndex;
                 }
             }
@@ -1203,6 +1403,7 @@ namespace wowvr
                 // Armed separately: SubmitFrame consumes g_dumpNextFrame before the
                 // per-frame reset runs, so keying off it there never fires.
                 g_armSequenceNextFrame = (Cfg().dumpEveryNWorldDraws > 0);
+                g_dumpShadowMapNext = true;
                 WOWVR_INFO("F10: eye buffers will be written on the next frame%s.",
                            g_armSequenceNextFrame ? ", with a mid-frame draw sequence" : "");
             }
@@ -1323,6 +1524,26 @@ namespace wowvr
                 Camera().ProbeKnownOffsets(Projection().SceneVerticalScale(),
                                            Projection().SceneAspect());
                 Camera().ScanStaticsForCamera(Projection().SceneVerticalScale());
+                Camera().ScanForCameraObject(Projection().SceneVerticalScale(),
+                                             Projection().SceneNear(),
+                                             Projection().SceneFar());
+            }
+
+            // Tell the game how wide the headset actually sees, so it culls, streams and
+            // shadows for that instead of for its own 59 degree window. The vertical
+            // tangents come straight from the headset; CullFovScale adds margin on top so
+            // geometry does not pop in at the edge of a quick head turn.
+            // Deliberately not gated on StereoActive(): the redirect flag is already
+            // cleared by the time Present runs, so that test silently never fired.
+            if (Cfg().cullFovScale > 1.0f && Vr().IsActive())
+            {
+                // A multiplier on the game's OWN field of view, not on the headset's.
+                // Driving it from the headset tangents forced at least 109 degrees for
+                // any scale at all, and at 132 the client's rendering fell apart
+                // (464k corrupt pixels against a 1.7k baseline). Modest widening is what
+                // is wanted here: enough that geometry and shadows exist outside the
+                // game's own window, not so much that it destabilises the client.
+                Camera().WidenGameFovByFactor(Cfg().cullFovScale);
             }
 
             if (Cfg().scanForCamera && g_frameCount > 240 && (g_frameCount % 300) == 0
@@ -1394,7 +1615,8 @@ namespace wowvr
             }
 
             if (state == D3DTS_PROJECTION && matrix != nullptr && !g_duplicatingDraw
-                && Cfg().enabled && g_renderingToBackBuffer && !g_uiPassStarted)
+                && Cfg().enabled && Cfg().patchFixedFunction
+                && g_renderingToBackBuffer && !g_uiPassStarted)
             {
                 if (Projection().TryPatch(&matrix->_11, g_eyeFixedProjection[EyeLeft],
                                           g_eyeFixedProjection[EyeRight]))
@@ -1599,6 +1821,22 @@ namespace wowvr
             // The post-process composite: after the world, before the interface.
             if (Cfg().skipPostProcess && g_backBufferDrawPeriod >= 2 && !g_uiPassStarted)
             {
+                // Characterise what is being discarded. If the client applies any part of
+                // its shadowing in a later pass, this rule would be eating it, and that
+                // rule is live only when stereo is on - which matches the fault exactly.
+                if (Cfg().logSkippedDraws && g_skippedDrawsLogged < 24)
+                {
+                    ++g_skippedDrawsLogged;
+                    WOWVR_INFO("  SKIPPED post-process draw: prims=%u vs=%p ps=%p "
+                               "blend=%s ztest=%s period=%d",
+                               g_lastPrimitiveCount,
+                               static_cast<void*>(g_currentVertexShader),
+                               static_cast<void*>(g_currentPixelShader),
+                               g_alphaBlendEnabled ? "on" : "off",
+                               g_depthTestEnabled ? "on" : "off",
+                               g_backBufferDrawPeriod);
+                }
+                ++g_postProcessDrawsSkipped;
                 return true;
             }
 
@@ -1640,8 +1878,8 @@ namespace wowvr
                 // Every stage, not just the first. A model coming out as a flat colour
                 // with the right silhouette looks far more like it is sampling the wrong
                 // texture than like a transform fault, so what is bound where matters.
-                IDirect3DBaseTexture9* stage[4] = {};
-                for (DWORD st = 0; st < 4; ++st)
+                IDirect3DBaseTexture9* stage[8] = {};
+                for (DWORD st = 0; st < 8; ++st)
                 {
                     device->GetTexture(st, &stage[st]);
                 }
@@ -1655,7 +1893,7 @@ namespace wowvr
                 // to the viewer's head.
                 WOWVR_INFO("world draw %-4d: prims=%-6u tex=%p vs=%p blend=%s ztest=%s "
                            "depth=%.3f..%.3f  camShader=%d camFixed=%d cwrite=%X atest=%d "
-                           "ortho=%d vp=%ux%u+%u+%u tex0=%p tex1=%p tex2=%p tex3=%p",
+                           "ortho=%d vp=%ux%u+%u+%u ps=%p tex0=%p s4=%p s5=%p s6=%p s7=%p",
                            g_worldDrawIndex, g_lastPrimitiveCount,
                            static_cast<void*>(texture), static_cast<void*>(shader),
                            g_alphaBlendEnabled ? "on" : "off",
@@ -1666,10 +1904,12 @@ namespace wowvr
                            g_fixedProjectionIsOrtho ? 1 : 0,
                            g_gameViewport.Width, g_gameViewport.Height,
                            g_gameViewport.X, g_gameViewport.Y,
-                           static_cast<void*>(stage[0]), static_cast<void*>(stage[1]),
-                           static_cast<void*>(stage[2]), static_cast<void*>(stage[3]));
+                           static_cast<void*>(g_currentPixelShader),
+                           static_cast<void*>(stage[0]), static_cast<void*>(stage[4]),
+                           static_cast<void*>(stage[5]), static_cast<void*>(stage[6]),
+                           static_cast<void*>(stage[7]));
 
-                for (DWORD st = 0; st < 4; ++st)
+                for (DWORD st = 0; st < 8; ++st)
                 {
                     if (stage[st] != nullptr) { stage[st]->Release(); }
                 }
@@ -1695,6 +1935,19 @@ namespace wowvr
                 }
                 affine[used] = 0;
                 WOWVR_INFO("      recoverable transforms: %s", used ? affine : "(none)");
+
+                // What the shader will actually read for its shadow cascades on THIS
+                // draw. The upload order differs between mono and stereo, so only the
+                // resident value at draw time is a fair comparison.
+                if (Cfg().logShadowConstants)
+                {
+                    for (UINT reg = 224; reg <= 226; ++reg)
+                    {
+                        const float* v = &g_shadowConstants[reg][0];
+                        WOWVR_INFO("      resident c%u = %+.6f %+.6f %+.6f %+.6f",
+                                   reg, v[0], v[1], v[2], v[3]);
+                    }
+                }
 
                 if (texture != nullptr) { texture->Release(); }
                 if (shader != nullptr) { shader->Release(); }
@@ -1816,6 +2069,23 @@ namespace wowvr
             }
         }
 
+        // Put back what the client had before we started drawing eyes. BeginEye clamps
+        // the scissor to one eye's half of the side-by-side target and narrows the
+        // viewport to match; leaving those in place meant the client's NEXT offscreen
+        // pass - its 2048x2048 shadow map above all - was rendered through a scissor
+        // sized for an eye, so only a rectangle of the shadow map ever received casters.
+        // That is what turned shadows into blocky shapes that track the player.
+        void EndEyes(IDirect3DDevice9* device)
+        {
+            if (g_scissorTestEnabled)
+            {
+                g_originalSetScissorRect(device, &g_gameScissor);
+            }
+            g_originalSetViewport(device, &g_gameViewport);
+            g_currentViewport = g_gameViewport;
+            ++g_eyeStateRestored;
+        }
+
         bool ShouldDuplicateDraw()
         {
             // The UI is deliberately excluded: it is laid out for a 1920x1080 screen
@@ -1833,6 +2103,12 @@ namespace wowvr
             viewport.Width = g_stereo.EyeWidth();
             viewport.Height = g_stereo.EyeHeight();
 
+            if (Cfg().fullTargetSingleEye)
+            {
+                viewport.X = 0;
+                viewport.Width = g_stereo.EyeWidth() * 2;
+            }
+
             // The game's depth range is carried over rather than reset to 0..1.
             // Squashing geometry into a narrow slice at the far end of the range is how
             // an engine keeps a distant backdrop behind everything else, and forcing the
@@ -1847,7 +2123,10 @@ namespace wowvr
             }
 
             g_currentViewport = viewport;
-            g_originalSetViewport(device, &viewport);
+            if (!Cfg().keepGameViewport)
+            {
+                g_originalSetViewport(device, &viewport);
+            }
 
             // Only the scene camera gets swapped. UI and other ortho passes never had
             // a patched projection, so they are simply drawn into each half as-is.
@@ -1883,7 +2162,8 @@ namespace wowvr
             // The current shader's own combined transform, rebuilt from the constants
             // as they stand right now. Unlike the remembered blocks this is never
             // cached across draws: the register holds a different object every time.
-            if (Cfg().perShaderCombined && g_currentVertexShader != nullptr)
+            if (Cfg().patchCombined && Cfg().perShaderCombined
+                && g_currentVertexShader != nullptr)
             {
                 ShaderCombined* entry = FindShaderCombined(g_currentVertexShader);
                 if (entry != nullptr && entry->resolved)
@@ -1938,6 +2218,53 @@ namespace wowvr
             // and unlike scaling the game's rectangle it cannot land somewhere odd.
             Projection().SetInfiniteDistance(false);
 
+            // Is the shadow map still bound for the second eye? Shadows are correct with
+            // one eye and wrong with two while the cascade constants are identical, so
+            // what differs has to be device state at the time of the second draw.
+            // What is actually bound to the shadow sampler, and how big is it? A fixed,
+            // zone-independent shadow pattern suggests the terrain is sampling something
+            // that is not the shadow map at all, so identify it by size.
+            if (Cfg().logShadowConstants && g_shadowSamplerLogged < 40)
+            {
+                IDirect3DBaseTexture9* shadowTex = nullptr;
+                device->GetTexture(4, &shadowTex);
+                if (shadowTex != nullptr)
+                {
+                    static IDirect3DBaseTexture9* seen[8] = {};
+                    static int seenCount = 0;
+                    bool known = false;
+                    for (int i = 0; i < seenCount; ++i)
+                    {
+                        if (seen[i] == shadowTex) { known = true; break; }
+                    }
+                    if (!known && seenCount < 8)
+                    {
+                        seen[seenCount++] = shadowTex;
+                        ++g_shadowSamplerLogged;
+                        // GetType() avoids needing the IID symbol from d3d9 at link time.
+                        if (shadowTex->GetType() == D3DRTYPE_TEXTURE)
+                        {
+                            IDirect3DTexture9* tex2d =
+                                static_cast<IDirect3DTexture9*>(shadowTex);
+                            D3DSURFACE_DESC d = {};
+                            tex2d->GetLevelDesc(0, &d);
+                            WOWVR_INFO("  sampler s4 texture %p: %ux%u fmt=%d usage=0x%lX "
+                                       "levels=%u",
+                                       static_cast<void*>(shadowTex), d.Width, d.Height,
+                                       static_cast<int>(d.Format), d.Usage,
+                                       tex2d->GetLevelCount());
+                        }
+                        else
+                        {
+                            WOWVR_INFO("  sampler s4 texture %p: resource type %d",
+                                       static_cast<void*>(shadowTex),
+                                       static_cast<int>(shadowTex->GetType()));
+                        }
+                    }
+                    shadowTex->Release();
+                }
+            }
+
             if (g_scissorTestEnabled)
             {
                 RECT scissor;
@@ -1970,6 +2297,7 @@ namespace wowvr
         // are the next most likely tells for a 2D overlay pass.
         void NoteDrawForReport(int kind)
         {
+
             Report().NoteDraw(kind);
 
             const bool depthLike = g_depthTestEnabled && g_depthWriteEnabled
@@ -2074,6 +2402,7 @@ namespace wowvr
                 g_originalSetDepthStencilSurface(device, g_stereo.Depth());
                 g_stereoRedirected = true;
                 g_stereoHasContent = true;
+                g_currentTargetIsStereo = true;
             }
 
             // Any rects the game supplies are deliberately discarded. They describe its
@@ -2081,7 +2410,18 @@ namespace wowvr
             // third of the right one inside the side-by-side target - leaving a
             // brighter rectangle of cleared sky against stale content everywhere else.
             // Clearing more than asked is always safe; clearing less is not.
-            if (StereoActive() && !g_duplicatingDraw)
+            // ONLY when our side-by-side surface is the bound colour target.
+            //
+            // This used to test StereoActive(), which merely asks whether the redirect is
+            // in force - it says nothing about what is bound right now. So the client's
+            // clear of its own 2048x2048 SHADOW MAP was given a 2960x1644 viewport. A
+            // Clear is confined to the viewport, and that viewport then persisted into
+            // the caster pass, so shadow casters were rendered through a 2960-wide
+            // mapping into a 2048-wide target: stretched, clipped, and leaving regions
+            // that were never written at all. The result was a shadow pattern with fixed
+            // rectangular cutouts, identical in every zone, because its shape came from
+            // these two surface sizes rather than from the world.
+            if (StereoActive() && g_currentTargetIsStereo && !g_duplicatingDraw)
             {
                 D3DVIEWPORT9 whole = {};
                 whole.X = 0;
@@ -2098,6 +2438,42 @@ namespace wowvr
             return g_originalClear(device, rectCount, rects, flags, colour, z, stencil);
         }
 
+        // D3DCREATE_PUREDEVICE blocks most Get* state queries, but NOT these. If the
+        // client asks what it is drawing into and gets our wide side-by-side surface
+        // instead of its own 1920x1080 back buffer, anything it derives from those
+        // dimensions is wrong. Hand back what it believes it bound.
+        HRESULT WINAPI HookedGetRenderTarget(IDirect3DDevice9* device, DWORD index,
+                                             IDirect3DSurface9** surface)
+        {
+            const HRESULT hr = g_originalGetRenderTarget(device, index, surface);
+            if (SUCCEEDED(hr) && index == 0 && surface != nullptr && *surface != nullptr
+                && g_stereoRedirected && g_stereo.IsReady()
+                && *surface == g_stereo.Color() && g_realBackBuffer != nullptr)
+            {
+                (*surface)->Release();
+                g_realBackBuffer->AddRef();
+                *surface = g_realBackBuffer;
+                ++g_renderTargetQueriesRedirected;
+            }
+            return hr;
+        }
+
+        HRESULT WINAPI HookedGetDepthStencilSurface(IDirect3DDevice9* device,
+                                                    IDirect3DSurface9** surface)
+        {
+            const HRESULT hr = g_originalGetDepthStencilSurface(device, surface);
+            if (SUCCEEDED(hr) && surface != nullptr && *surface != nullptr
+                && g_stereo.IsReady() && *surface == g_stereo.Depth()
+                && g_gameDepthSurface != nullptr)
+            {
+                (*surface)->Release();
+                g_gameDepthSurface->AddRef();
+                *surface = g_gameDepthSurface;
+                ++g_renderTargetQueriesRedirected;
+            }
+            return hr;
+        }
+
         HRESULT WINAPI HookedSetDepthStencilSurface(IDirect3DDevice9* device,
                                                     IDirect3DSurface9* surface)
         {
@@ -2110,6 +2486,27 @@ namespace wowvr
                 if (SUCCEEDED(surface->GetDesc(&desc))
                     && desc.Width == g_backBufferWidth && desc.Height == g_backBufferHeight)
                 {
+                    // ONLY while the scene is actually going into our side-by-side
+                    // target. The client also binds a back-buffer-sized depth surface for
+                    // its shadow map; substituting ours there sent the casters' depth
+                    // into the wrong buffer and left the shadow texture empty, which is
+                    // why shadows worked in mono and vanished in stereo.
+                    g_gameDepthSurface = surface;
+
+                    // Only when the colour target ACTUALLY IS our side-by-side surface.
+                    // Keying this off "are we rendering to the back buffer" was wrong:
+                    // the client sets its depth surface BEFORE switching render target,
+                    // so at that moment we still believed we were on the back buffer and
+                    // handed it our depth buffer. Its shadow-caster pass then wrote depth
+                    // into our surface instead of its own, leaving the shadow map holding
+                    // whatever was there - a fixed, zone-independent pattern.
+                    if (!g_currentTargetIsStereo)
+                    {
+                        ++g_depthSubstitutionDeclined;
+                        return g_originalSetDepthStencilSurface(device, surface);
+                    }
+
+                    ++g_depthSubstituted;
                     return g_originalSetDepthStencilSurface(device, g_stereo.Depth());
                 }
             }
@@ -2136,6 +2533,17 @@ namespace wowvr
                 && g_renderingToBackBuffer;
 
             // Shadow what the game uploaded, before any substitution.
+            if (data != nullptr && !g_duplicatingDraw)
+            {
+                if (vector4Count > g_maxVector4Count) { g_maxVector4Count = vector4Count; }
+                if (startRegister + vector4Count > g_maxStartPlusCount)
+                {
+                    g_maxStartPlusCount = startRegister + vector4Count;
+                }
+                if (vector4Count > 1024) { ++g_oversizeUploads; }
+                if (startRegister + vector4Count > kShadowRegisters) { ++g_beyondShadowMirror; }
+            }
+
             if (data != nullptr && !g_duplicatingDraw
                 && startRegister < kShadowRegisters)
             {
@@ -2153,6 +2561,62 @@ namespace wowvr
                 WOWVR_INFO("    upload at draw %d: c%u..c%u (%u regs)",
                            g_worldDrawIndex, startRegister,
                            startRegister + vector4Count - 1, vector4Count);
+            }
+
+            // Widen the shadow cascade so its coverage extends past what the headset can
+            // see. Scaling columns 0 and 1 of the light's orthographic projection zooms
+            // it out about the NDC origin, which carries the translation terms in m30/m31
+            // along with it - so the box grows without the centre drifting.
+            static float widened[1024 * 4];
+            if (g_renderingShadowMap && Cfg().shadowCoverageScale > 1.0f
+                && !g_duplicatingDraw && data != nullptr
+                && vector4Count >= 4 && vector4Count <= 1024)
+            {
+                const float* w = data;
+                const bool orthographic = fabsf(w[15] - 1.0f) < 1.0e-3f
+                                       && fabsf(w[11]) < 1.0e-3f
+                                       && fabsf(w[0]) > 1.0e-6f && fabsf(w[5]) > 1.0e-6f;
+                if (orthographic)
+                {
+                    memcpy(g_lightOrtho, data, sizeof(g_lightOrtho));
+                    g_haveLightOrtho = true;
+                    memcpy(widened, data,
+                           static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                    const float inverse = 1.0f / Cfg().shadowCoverageScale;
+                    for (int row = 0; row < 4; ++row)
+                    {
+                        widened[row * 4 + 0] *= inverse;
+                        widened[row * 4 + 1] *= inverse;
+                    }
+                    ++g_shadowCascadesWidened;
+                    return g_originalSetVertexShaderConstantF(device, startRegister,
+                                                              widened, vector4Count);
+                }
+            }
+
+            // While the shadow map is being drawn, report any window that looks like a
+            // projection. The light's own view-projection is what decides how much of the
+            // world the shadow map covers, and widening it is the lever for the coverage
+            // boundary sweeping through the VR view.
+            if (g_renderingShadowMap && Cfg().logWorldDrawTo > 0 && !g_duplicatingDraw
+                && data != nullptr && vector4Count >= 4)
+            {
+                for (UINT offset = 0; offset + 4 <= vector4Count; ++offset)
+                {
+                    const float* w = data + offset * 4;
+                    const bool perspective = fabsf(w[15]) < 1.0e-3f && fabsf(w[11]) > 0.5f;
+                    const bool orthographic = fabsf(w[15] - 1.0f) < 1.0e-3f
+                                           && fabsf(w[11]) < 1.0e-3f
+                                           && fabsf(w[0]) > 1.0e-6f && fabsf(w[5]) > 1.0e-6f;
+                    if (perspective || orthographic)
+                    {
+                        WOWVR_INFO("  shadow-map upload c%u..c%u, %s at c%u: "
+                                   "[%.5f %.5f] [%.5f %.5f] w=%.3f",
+                                   startRegister, startRegister + vector4Count - 1,
+                                   perspective ? "PERSPECTIVE" : "ORTHOGRAPHIC",
+                                   startRegister + offset, w[0], w[5], w[10], w[14], w[15]);
+                    }
+                }
             }
 
             // Only while drawing the scene itself. Offscreen passes - the shadow map
@@ -2190,13 +2654,25 @@ namespace wowvr
                 {
                     const float* window = data + offset * 4;
 
-                    if (offset != 0)
+                    // The shape test exists to BOOTSTRAP discovery of the scene camera
+                    // and nothing else. Leaving it live afterwards meant any upload
+                    // beginning with something merely perspective-shaped got rewritten
+                    // with the eye projection: c0 and c10 were being overwritten
+                    // thousands of times a frame, which is what rendered models as flat
+                    // silhouettes. Whether such an upload appears at all depends on the
+                    // scene - hence the maddening correlation with time of day.
+                    //
+                    // Once the camera is known, every window must match it exactly. The
+                    // register it was discovered in is still allowed to be re-tested by
+                    // shape so a genuine change of camera can still be picked up.
+                    const bool bootstrapping = !g_haveSceneProjectionRaw;
+                    const bool isPrimaryRegister =
+                        (startRegister + offset) == g_primaryCameraRegister;
+
+                    if (!bootstrapping && !isPrimaryRegister
+                        && !MatricesMatch(window, g_sceneProjectionRaw))
                     {
-                        if (!g_haveSceneProjectionRaw
-                            || !MatricesMatch(window, g_sceneProjectionRaw))
-                        {
-                            continue;
-                        }
+                        continue;
                     }
 
                     float left[16];
@@ -2214,6 +2690,11 @@ namespace wowvr
                     }
 
                     memcpy(patched + offset * 4, left, sizeof(left));
+                    if (startRegister + offset < kShadowRegisters)
+                    {
+                        if (offset == 0) { ++g_substShape[startRegister]; }
+                        else { ++g_substExact[startRegister + offset]; }
+                    }
                     RememberPatchedBlock(startRegister + offset, window, left, right);
 
                     if (offset == 0)
@@ -2263,6 +2744,176 @@ namespace wowvr
                     }
                 }
 
+                // Dump the cascade transforms exactly as the client uploads them. Shadows are
+            // correct in mono and wrong in stereo, so comparing these two logs says
+            // whether the lookup's INPUT differs or whether the fault is downstream.
+            if (Cfg().logShadowConstants && !g_duplicatingDraw && data != nullptr
+                && !g_renderingShadowMap)
+            {
+                static int s_logged = 0;
+                if (s_logged < 3 && startRegister <= 224
+                    && startRegister + vector4Count >= 236)
+                {
+                    ++s_logged;
+                    for (UINT reg = 224; reg <= 235; ++reg)
+                    {
+                        const float* v = data + (reg - startRegister) * 4;
+                        WOWVR_INFO("  cascade c%u = %+.6f %+.6f %+.6f %+.6f",
+                                   reg, v[0], v[1], v[2], v[3]);
+                    }
+                }
+            }
+
+            // The terrain shader's shadow-cascade transforms. Disassembling it showed the
+            // shadow coordinates are built from the WORLD position, not the projection:
+            //   oT5 = (c224, c225, c226, c233) . worldPos     cascade 0
+            //   oT6 = (c227, c228, c229, c234) . worldPos     cascade 1
+            //   oT7 = (c230, c231, c232, c235) . worldPos     cascade 2
+            // Scaling the x and y rows of each widens the area a cascade covers, which
+            // has to match whatever the shadow map was rendered with or casters are
+            // written at one scale and sampled at another.
+            if (Cfg().shadowCoverageScale > 1.0f && !g_renderingShadowMap
+                && !g_duplicatingDraw && data != nullptr && vector4Count <= 1024)
+            {
+                static const UINT kCascadeXY[6] = { 224, 225, 227, 228, 230, 231 };
+                const float inverse = 1.0f / Cfg().shadowCoverageScale;
+                bool touched = false;
+
+                for (int k = 0; k < 6; ++k)
+                {
+                    const UINT reg = kCascadeXY[k];
+                    if (reg < startRegister || reg >= startRegister + vector4Count)
+                    {
+                        continue;
+                    }
+
+                    if (!anyPatched)
+                    {
+                        memcpy(patched, data,
+                               static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                        anyPatched = true;
+                    }
+
+                    const UINT offset = (reg - startRegister) * 4;
+                    for (int component = 0; component < 4; ++component)
+                    {
+                        patched[offset + component] = data[offset + component] * inverse;
+                    }
+                    touched = true;
+                }
+
+                // The compare-depth rows. Their translation component is the bias: making
+                // the fragment read as slightly nearer the light stops it shadowing
+                // itself once each texel covers more ground.
+                if (Cfg().shadowDepthBias != 0.0f)
+                {
+                    static const UINT kCascadeZ[3] = { 226, 229, 232 };
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const UINT reg = kCascadeZ[k];
+                        if (reg < startRegister || reg >= startRegister + vector4Count)
+                        {
+                            continue;
+                        }
+                        if (!anyPatched)
+                        {
+                            memcpy(patched, data,
+                                   static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                            anyPatched = true;
+                        }
+                        const UINT offset = (reg - startRegister) * 4;
+                        patched[offset + 3] = data[offset + 3] - Cfg().shadowDepthBias;
+                        touched = true;
+                    }
+                }
+
+                if (touched) { ++g_shadowCascadeRowsScaled; }
+            }
+
+            // Any orthographic matrix appearing in the WORLD pass. If the terrain samples
+            // the shadow map through a transform of its own, it has to be one of these.
+            if (Cfg().logWorldDrawTo > 0 && !g_renderingShadowMap && !g_duplicatingDraw
+                && data != nullptr && vector4Count >= 4 && g_renderingToBackBuffer)
+            {
+                for (UINT offset = 0; offset + 4 <= vector4Count; ++offset)
+                {
+                    const float* w = data + offset * 4;
+                    const bool ortho = fabsf(w[15] - 1.0f) < 1.0e-3f
+                                    && fabsf(w[3]) < 1.0e-3f && fabsf(w[7]) < 1.0e-3f
+                                    && fabsf(w[11]) < 1.0e-3f
+                                    && fabsf(w[0]) > 1.0e-6f && fabsf(w[5]) > 1.0e-6f;
+                    if (ortho)
+                    {
+                        WOWVR_INFO("  world-pass ORTHO at c%u (upload c%u..c%u): "
+                                   "m00=%.5f m11=%.5f m22=%.5f m30=%.3f m31=%.3f",
+                                   startRegister + offset, startRegister,
+                                   startRegister + vector4Count - 1,
+                                   w[0], w[5], w[10], w[12], w[13]);
+                    }
+                }
+            }
+
+            // The same light transform, seen again during the world pass: this is how the
+            // terrain samples the shadow map, and it must be scaled by exactly the same
+            // factor as the render side or casters are written at one scale and looked
+            // up at another.
+            if (g_haveLightOrtho && Cfg().shadowCoverageScale > 1.0f && !g_renderingShadowMap
+                && !g_duplicatingDraw && data != nullptr && vector4Count >= 4
+                && vector4Count <= 1024)
+            {
+                for (UINT offset = 0; offset + 4 <= vector4Count; ++offset)
+                {
+                    if (!MatricesMatch(data + offset * 4, g_lightOrtho))
+                    {
+                        continue;
+                    }
+
+                    ++g_lightOrthoSeenInWorld;
+                    if (!anyPatched)
+                    {
+                        memcpy(patched, data,
+                               static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                        anyPatched = true;
+                    }
+
+                    const float inverse = 1.0f / Cfg().shadowCoverageScale;
+                    for (int row = 0; row < 4; ++row)
+                    {
+                        patched[offset * 4 + row * 4 + 0] =
+                            g_lightOrtho[row * 4 + 0] * inverse;
+                        patched[offset * 4 + row * 4 + 1] =
+                            g_lightOrtho[row * 4 + 1] * inverse;
+                    }
+                }
+            }
+
+            // Matrices derived from the scene projection's inverse. These have to be
+                // rebuilt against the projection we are about to substitute, or anything
+                // that reconstructs position from depth reads the wrong place - which is
+                // what made the entire shadow cascade render as shadowed.
+                if (Cfg().patchInverseDerived)
+                {
+                    for (UINT offset = 0; offset + 4 <= vector4Count; ++offset)
+                    {
+                        float left[16];
+                        float right[16];
+                        if (!Projection().TryPatchInverseDerived(data + offset * 4, left, right))
+                        {
+                            continue;
+                        }
+
+                        if (!anyPatched)
+                        {
+                            memcpy(patched, data,
+                                   static_cast<size_t>(vector4Count) * 4 * sizeof(float));
+                            anyPatched = true;
+                        }
+                        memcpy(patched + offset * 4, left, sizeof(left));
+                        RememberPatchedBlock(startRegister + offset, data + offset * 4,
+                                             left, right, true);
+                    }
+                }
+
                 // Candidate registers for a combined world-view-projection, tried on
                 // every upload that covers them. No discovery step is needed because
                 // TryPatchCombined validates itself: it only rewrites a window whose
@@ -2288,7 +2939,8 @@ namespace wowvr
                     const UINT offset = reg - startRegister;
                     float left[16];
                     float right[16];
-                    if (!Projection().TryPatchCombined(data + offset * 4, left, right))
+                    if (!Cfg().patchCombined
+                        || !Projection().TryPatchCombined(data + offset * 4, left, right))
                     {
                         continue;
                     }
@@ -2300,12 +2952,13 @@ namespace wowvr
                         anyPatched = true;
                     }
                     memcpy(patched + offset * 4, left, sizeof(left));
+                    if (reg < kShadowRegisters) { ++g_substCombined[reg]; }
                     RememberPatchedBlock(reg, data + offset * 4, left, right, true);
                 }
 
                 // UseGameProjection doubles as a bisect for this: with it set the game's
                 // own constants go through untouched.
-                if (anyPatched && !Cfg().useGameProjection)
+                if (anyPatched && !Cfg().useGameProjection && Cfg().patchConstants)
                 {
                     g_projectionPatchedThisFrame = true;
                     return g_originalSetVertexShaderConstantF(device, startRegister, patched, vector4Count);
@@ -2315,11 +2968,92 @@ namespace wowvr
             return g_originalSetVertexShaderConstantF(device, startRegister, data, vector4Count);
         }
 
+        // Writes a shader's bytecode out so it can be disassembled offline. The terrain
+        // shader is the one that matters: knowing how it derives its shadow coordinate is
+        // the only way left to find out what actually depends on the projection.
+        void DumpShaderBytecode(const DWORD* function, IDirect3DVertexShader9* handle)
+        {
+            if (function == nullptr || !Cfg().dumpShaders)
+            {
+                return;
+            }
+
+            // The token stream ends with 0x0000FFFF.
+            size_t words = 0;
+            while (words < 65536 && function[words] != 0x0000FFFFu)
+            {
+                ++words;
+            }
+            ++words;
+
+            wchar_t name[64];
+            swprintf_s(name, L"WoWVR_vs_%p.bin", static_cast<void*>(handle));
+
+            FILE* file = nullptr;
+            if (_wfopen_s(&file, ModuleFile(name).c_str(), L"wb") == 0 && file != nullptr)
+            {
+                fwrite(function, sizeof(DWORD), words, file);
+                fclose(file);
+                WOWVR_INFO("Vertex shader %p bytecode written (%zu tokens).",
+                           static_cast<void*>(handle), words);
+            }
+        }
+
+        typedef HRESULT (WINAPI *CreatePixelShaderFn)(IDirect3DDevice9*, const DWORD*,
+                                                      IDirect3DPixelShader9**);
+        typedef HRESULT (WINAPI *SetPixelShaderFn)(IDirect3DDevice9*, IDirect3DPixelShader9*);
+        CreatePixelShaderFn g_originalCreatePixelShader = nullptr;
+        SetPixelShaderFn g_originalSetPixelShader = nullptr;
+
+        void DumpPixelShaderBytecode(const DWORD* function, IDirect3DPixelShader9* handle)
+        {
+            if (function == nullptr || !Cfg().dumpShaders)
+            {
+                return;
+            }
+
+            size_t words = 0;
+            while (words < 65536 && function[words] != 0x0000FFFFu) { ++words; }
+            ++words;
+
+            wchar_t name[64];
+            swprintf_s(name, L"WoWVR_ps_%p.bin", static_cast<void*>(handle));
+
+            FILE* file = nullptr;
+            if (_wfopen_s(&file, ModuleFile(name).c_str(), L"wb") == 0 && file != nullptr)
+            {
+                fwrite(function, sizeof(DWORD), words, file);
+                fclose(file);
+            }
+        }
+
+        HRESULT WINAPI HookedCreatePixelShader(IDirect3DDevice9* device, const DWORD* function,
+                                               IDirect3DPixelShader9** shader)
+        {
+            const HRESULT hr = g_originalCreatePixelShader(device, function, shader);
+            if (SUCCEEDED(hr) && shader != nullptr && *shader != nullptr)
+            {
+                DumpPixelShaderBytecode(function, *shader);
+            }
+            return hr;
+        }
+
+        HRESULT WINAPI HookedSetPixelShader(IDirect3DDevice9* device, IDirect3DPixelShader9* shader)
+        {
+            if (!g_duplicatingDraw) { g_currentPixelShader = shader; }
+            return g_originalSetPixelShader(device, shader);
+        }
+
         HRESULT WINAPI HookedCreateVertexShader(IDirect3DDevice9* device, const DWORD* function,
                                                 IDirect3DVertexShader9** shader)
         {
             Report().NoteVertexShaderCreated(0);
-            return g_originalCreateVertexShader(device, function, shader);
+            const HRESULT hr = g_originalCreateVertexShader(device, function, shader);
+            if (SUCCEEDED(hr) && shader != nullptr && *shader != nullptr)
+            {
+                DumpShaderBytecode(function, *shader);
+            }
+            return hr;
         }
 
         HRESULT WINAPI HookedSetVertexShader(IDirect3DDevice9* device, IDirect3DVertexShader9* shader)
@@ -2394,6 +3128,27 @@ namespace wowvr
                 // patch uses it to stay off the shadow map and the post-process
                 // passes, which reuse the same constant register as the scene camera.
                 g_renderingToBackBuffer = (width == g_backBufferWidth && height == g_backBufferHeight);
+                const bool nowShadow = (surface != nullptr && width == height && width >= 512);
+
+                // Leaving the shadow map is the moment its contents are complete, so
+                // that is when it is worth reading back.
+                if (g_renderingShadowMap && !nowShadow && g_dumpShadowMapNext
+                    && g_shadowSurface != nullptr)
+                {
+                    DumpShadowMap(device);
+                }
+
+                if (surface != g_realBackBuffer)
+                {
+                    g_currentTargetIsStereo = (g_stereo.IsReady() && surface == g_stereo.Color());
+                }
+
+                g_renderingShadowMap = nowShadow;
+                if (nowShadow)
+                {
+                    g_shadowMapSize = width;
+                    g_shadowSurface = surface;
+                }
 
                 if (Cfg().logWorldDrawTo > 0 && g_sequenceDumpArmed)
                 {
@@ -2418,13 +3173,32 @@ namespace wowvr
                     {
                         g_stereoRedirected = true;
                         g_stereoHasContent = true;
+                        g_currentTargetIsStereo = true;
                         const HRESULT hr = g_originalSetRenderTarget(device, 0, g_stereo.Color());
                         g_originalSetDepthStencilSurface(device, g_stereo.Depth());
                         return hr;
                     }
                 }
             }
-            return g_originalSetRenderTarget(device, index, surface);
+            const HRESULT rtResult = g_originalSetRenderTarget(device, index, surface);
+            if (FAILED(rtResult))
+            {
+                // Our depth surface is 2960x1644. D3D9 demands the depth surface be at
+                // least as large as the colour target in BOTH dimensions, and the
+                // client's shadow map is 2048x2048 - taller than ours. If that is what is
+                // failing, the caster pass never reaches its own target and the shadow
+                // map keeps whatever it already held: a fixed pattern, identical in every
+                // zone.
+                ++g_setRenderTargetFailures;
+                if (g_setRenderTargetFailures < 6)
+                {
+                    D3DSURFACE_DESC d = {};
+                    if (surface != nullptr) { surface->GetDesc(&d); }
+                    WOWVR_WARN("SetRenderTarget FAILED (0x%08lx) for %ux%u fmt=%d",
+                               rtResult, d.Width, d.Height, static_cast<int>(d.Format));
+                }
+            }
+            return rtResult;
         }
 
         HRESULT WINAPI HookedDrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
@@ -2433,6 +3207,29 @@ namespace wowvr
             if (Report().IsActive())
             {
                 NoteDrawForReport(FrameReport::DrawPrimitive);
+            }
+
+            if (g_renderingShadowMap && !g_duplicatingDraw)
+            {
+                ++g_shadowMapDraws;
+                g_shadowMapPrims += primitiveCount;
+
+                // Which shaders actually cast. If the character's shader never appears
+                // here, the caster is missing and no lookup can produce its shadow.
+                if (g_shadowCasterShaderCount < 16)
+                {
+                    bool known = false;
+                    for (int i = 0; i < g_shadowCasterShaderCount; ++i)
+                    {
+                        if (g_shadowCasterShaders[i] == g_currentVertexShader) { known = true; break; }
+                    }
+                    if (!known)
+                    {
+                        g_shadowCasterShaders[g_shadowCasterShaderCount++] = g_currentVertexShader;
+                        WOWVR_INFO("  shadow caster shader %p (prims=%u)",
+                                   static_cast<void*>(g_currentVertexShader), primitiveCount);
+                    }
+                }
             }
 
             UpdateDrawPeriod(device);
@@ -2450,13 +3247,15 @@ namespace wowvr
 
             g_duplicatingDraw = true;
             HRESULT hr = D3D_OK;
-            for (int eye = 0; eye < EyeCount; ++eye)
+            const int eyeCount = (Cfg().singleEyeOnly || Cfg().fullTargetSingleEye) ? 1 : EyeCount;
+            for (int eye = 0; eye < eyeCount; ++eye)
             {
                 BeginEye(device, eye);
                 const HRESULT eyeResult = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            EndEyes(device);
             NoteWorldDrawForSequence(device);
             ResolveCombinedRegisterForShader();
             return hr;
@@ -2469,6 +3268,29 @@ namespace wowvr
             if (Report().IsActive())
             {
                 NoteDrawForReport(FrameReport::DrawIndexedPrimitive);
+            }
+
+            if (g_renderingShadowMap && !g_duplicatingDraw)
+            {
+                ++g_shadowMapDraws;
+                g_shadowMapPrims += primitiveCount;
+
+                // Which shaders actually cast. If the character's shader never appears
+                // here, the caster is missing and no lookup can produce its shadow.
+                if (g_shadowCasterShaderCount < 16)
+                {
+                    bool known = false;
+                    for (int i = 0; i < g_shadowCasterShaderCount; ++i)
+                    {
+                        if (g_shadowCasterShaders[i] == g_currentVertexShader) { known = true; break; }
+                    }
+                    if (!known)
+                    {
+                        g_shadowCasterShaders[g_shadowCasterShaderCount++] = g_currentVertexShader;
+                        WOWVR_INFO("  shadow caster shader %p (prims=%u)",
+                                   static_cast<void*>(g_currentVertexShader), primitiveCount);
+                    }
+                }
             }
 
             UpdateDrawPeriod(device);
@@ -2489,7 +3311,8 @@ namespace wowvr
 
             g_duplicatingDraw = true;
             HRESULT hr = D3D_OK;
-            for (int eye = 0; eye < EyeCount; ++eye)
+            const int eyeCount = (Cfg().singleEyeOnly || Cfg().fullTargetSingleEye) ? 1 : EyeCount;
+            for (int eye = 0; eye < eyeCount; ++eye)
             {
                 BeginEye(device, eye);
                 const HRESULT eyeResult = g_originalDrawIndexedPrimitive(
@@ -2498,6 +3321,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            EndEyes(device);
             NoteWorldDrawForSequence(device);
             ResolveCombinedRegisterForShader();
             return hr;
@@ -2509,6 +3333,29 @@ namespace wowvr
             if (Report().IsActive())
             {
                 NoteDrawForReport(FrameReport::DrawPrimitiveUP);
+            }
+
+            if (g_renderingShadowMap && !g_duplicatingDraw)
+            {
+                ++g_shadowMapDraws;
+                g_shadowMapPrims += primitiveCount;
+
+                // Which shaders actually cast. If the character's shader never appears
+                // here, the caster is missing and no lookup can produce its shadow.
+                if (g_shadowCasterShaderCount < 16)
+                {
+                    bool known = false;
+                    for (int i = 0; i < g_shadowCasterShaderCount; ++i)
+                    {
+                        if (g_shadowCasterShaders[i] == g_currentVertexShader) { known = true; break; }
+                    }
+                    if (!known)
+                    {
+                        g_shadowCasterShaders[g_shadowCasterShaderCount++] = g_currentVertexShader;
+                        WOWVR_INFO("  shadow caster shader %p (prims=%u)",
+                                   static_cast<void*>(g_currentVertexShader), primitiveCount);
+                    }
+                }
             }
 
             UpdateDrawPeriod(device);
@@ -2526,7 +3373,8 @@ namespace wowvr
 
             g_duplicatingDraw = true;
             HRESULT hr = D3D_OK;
-            for (int eye = 0; eye < EyeCount; ++eye)
+            const int eyeCount = (Cfg().singleEyeOnly || Cfg().fullTargetSingleEye) ? 1 : EyeCount;
+            for (int eye = 0; eye < eyeCount; ++eye)
             {
                 BeginEye(device, eye);
                 const HRESULT eyeResult = g_originalDrawPrimitiveUP(device, type, primitiveCount,
@@ -2534,6 +3382,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            EndEyes(device);
             NoteWorldDrawForSequence(device);
             ResolveCombinedRegisterForShader();
             return hr;
@@ -2548,6 +3397,29 @@ namespace wowvr
             if (Report().IsActive())
             {
                 NoteDrawForReport(FrameReport::DrawIndexedPrimitiveUP);
+            }
+
+            if (g_renderingShadowMap && !g_duplicatingDraw)
+            {
+                ++g_shadowMapDraws;
+                g_shadowMapPrims += primitiveCount;
+
+                // Which shaders actually cast. If the character's shader never appears
+                // here, the caster is missing and no lookup can produce its shadow.
+                if (g_shadowCasterShaderCount < 16)
+                {
+                    bool known = false;
+                    for (int i = 0; i < g_shadowCasterShaderCount; ++i)
+                    {
+                        if (g_shadowCasterShaders[i] == g_currentVertexShader) { known = true; break; }
+                    }
+                    if (!known)
+                    {
+                        g_shadowCasterShaders[g_shadowCasterShaderCount++] = g_currentVertexShader;
+                        WOWVR_INFO("  shadow caster shader %p (prims=%u)",
+                                   static_cast<void*>(g_currentVertexShader), primitiveCount);
+                    }
+                }
             }
 
             UpdateDrawPeriod(device);
@@ -2567,7 +3439,8 @@ namespace wowvr
 
             g_duplicatingDraw = true;
             HRESULT hr = D3D_OK;
-            for (int eye = 0; eye < EyeCount; ++eye)
+            const int eyeCount = (Cfg().singleEyeOnly || Cfg().fullTargetSingleEye) ? 1 : EyeCount;
+            for (int eye = 0; eye < eyeCount; ++eye)
             {
                 BeginEye(device, eye);
                 const HRESULT eyeResult = g_originalDrawIndexedPrimitiveUP(
@@ -2576,6 +3449,7 @@ namespace wowvr
                 if (FAILED(eyeResult)) { hr = eyeResult; }
             }
             g_duplicatingDraw = false;
+            EndEyes(device);
             NoteWorldDrawForSequence(device);
             ResolveCombinedRegisterForShader();
             return hr;
@@ -2603,6 +3477,10 @@ namespace wowvr
                      g_originalSetTransform, "SetTransform");
             HookSlot(device, slot::device9::SetVertexShaderConstantF, &HookedSetVertexShaderConstantF,
                      g_originalSetVertexShaderConstantF, "SetVertexShaderConstantF");
+            HookSlot(device, slot::device9::CreatePixelShader, &HookedCreatePixelShader,
+                     g_originalCreatePixelShader, "CreatePixelShader");
+            HookSlot(device, slot::device9::SetPixelShader, &HookedSetPixelShader,
+                     g_originalSetPixelShader, "SetPixelShader");
             HookSlot(device, slot::device9::CreateVertexShader, &HookedCreateVertexShader,
                      g_originalCreateVertexShader, "CreateVertexShader");
             HookSlot(device, slot::device9::SetVertexShader, &HookedSetVertexShader,
@@ -2613,6 +3491,10 @@ namespace wowvr
                      g_originalSetVertexDeclaration, "SetVertexDeclaration");
             HookSlot(device, slot::device9::SetRenderTarget, &HookedSetRenderTarget,
                      g_originalSetRenderTarget, "SetRenderTarget");
+            HookSlot(device, slot::device9::GetRenderTarget, &HookedGetRenderTarget,
+                     g_originalGetRenderTarget, "GetRenderTarget");
+            HookSlot(device, slot::device9::GetDepthStencilSurface, &HookedGetDepthStencilSurface,
+                     g_originalGetDepthStencilSurface, "GetDepthStencilSurface");
             HookSlot(device, slot::device9::SetDepthStencilSurface, &HookedSetDepthStencilSurface,
                      g_originalSetDepthStencilSurface, "SetDepthStencilSurface");
             HookSlot(device, slot::device9::SetViewport, &HookedSetViewport,
@@ -2712,6 +3594,7 @@ namespace wowvr
             if (parameters != nullptr && parameters->BackBufferHeight > 0)
             {
                 g_backBufferWidth = parameters->BackBufferWidth;
+                g_backBufferFormat = parameters->BackBufferFormat;
                 g_backBufferHeight = parameters->BackBufferHeight;
                 Projection().SetSceneAspect(static_cast<float>(g_backBufferWidth)
                                           / static_cast<float>(g_backBufferHeight));
@@ -2745,6 +3628,20 @@ namespace wowvr
 
     void ShutdownRenderer()
     {
+        // Say plainly what this session captured, so the files can be found afterwards
+        // without hunting through the folder by timestamp.
+        if (g_stereoDumpIndex > 0)
+        {
+            WOWVR_INFO("Captured %d screenshot%s this session: WoWVR_shot_%S_00.bmp "
+                       "through _%02d.bmp, listed in WoWVR_shots_%S.txt",
+                       g_stereoDumpIndex, g_stereoDumpIndex == 1 ? "" : "s",
+                       SessionStamp(), g_stereoDumpIndex - 1, SessionStamp());
+        }
+        else
+        {
+            WOWVR_INFO("No screenshots were captured this session.");
+        }
+
         ReleaseFrameResources();
         g_presenter.Shutdown();
         Vr().Shutdown();

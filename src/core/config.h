@@ -53,9 +53,42 @@ namespace wowvr
         // per-frame one.
         bool perShaderCombined = true;
 
+        // Rewrite combined world-view-projection transforms at all. Off is a bisect: if
+        // the terrain shader derives its shadow lookup from the same matrix that
+        // positions the vertex, then rewriting it necessarily corrupts the shadow.
+        bool patchCombined = true;
+
+        // Rebuild constants derived from inverse(sceneProjection) against the eye
+        // projection. Needed for the client's shadow lookup.
+        bool patchInverseDerived = false;
+
+        // Write every vertex shader's bytecode to disk on creation, for offline
+        // disassembly. Off by default: it is a few hundred small files.
+        bool dumpShaders = false;
+
         // [Camera]
         bool headTracking = true;       // HMD orientation drives the in-game view
         float cullFovScale = 1.6f;
+
+        // Widens the client's shadow cascades so their coverage reaches past what the
+        // headset can see. WoW sizes them for its own ~59 degree view - the near cascade
+        // spans about 13 yards - so in VR the edge of the coverage is visible as a
+        // dark-edged region that slides with the player.
+        //
+        // BOTH sides must be scaled by the same factor or casters are written at one
+        // scale and sampled at another: the light's projection while the shadow map is
+        // rendered, AND the terrain shader's cascade transforms at c224/c225, c227/c228,
+        // c230/c231. Scaling only one is worse than doing nothing.
+        //
+        // 1.0 disables it. Widening ALONE is not enough: growing the world area each
+        // shadow texel covers outruns the client's baked-in depth bias and everything
+        // self-shadows, so ShadowDepthBias has to grow with it.
+        float shadowCoverageScale = 1.0f;
+
+        // Bias added to each cascade's compare depth, needed once a cascade is widened.
+        // The compare depth is dot(worldPos, c226) for cascade 0, so its translation
+        // component is exactly where the bias belongs.
+        float shadowDepthBias = 0.0f;
 
         // Searches process memory for WoW's camera. Off by default: each pass walks
         // hundreds of megabytes with the render thread blocked, which the player feels
@@ -98,6 +131,42 @@ namespace wowvr
         // panel, the render targets - stays exactly as it is. If an artefact survives
         // this, the projection substitution is not what causes it.
         bool useGameProjection = false;
+
+        // Independent bisects for the two substitution paths, so they can be told apart.
+        bool patchConstants = true;
+        bool patchFixedFunction = true;
+
+        // Substitute the game's own projection back, unchanged, through the same path.
+        // Separates "our substitution machinery is broken" from "the wider field of view
+        // is what the client cannot cope with".
+        bool eyeProjectionPassThrough = false;
+
+        // Draw only the left eye, still into the side-by-side target. Separates "drawing
+        // everything twice" from "rendering into our own target" as the cause of a fault
+        // that only appears in stereo.
+        bool singleEyeOnly = false;
+
+        // Build each eye's frustum symmetrically instead of off-centre. The Index's eyes
+        // are canted, so the projection centre sits ~9% off middle; anything that looks
+        // the shadow up in screen space would be displaced by exactly that much.
+        bool symmetricEyeProjection = false;
+
+        // Leave the client's own viewport alone during the eye passes. The image will be
+        // wrong (both eyes overlap), but it isolates whether anything in the shadow path
+        // depends on the viewport we substitute.
+        bool keepGameViewport = false;
+
+        // Draw a single eye across the WHOLE side-by-side target, so the viewport and
+        // the render target coincide. If anything derives a screen-space lookup from the
+        // viewport while sampling the full target, this is the configuration where the
+        // two agree and the fault should disappear.
+        bool fullTargetSingleEye = false;
+
+        // Log what the post-process skip rule discards.
+        bool logSkippedDraws = false;
+
+        // Log the shadow cascade constants c224..c235 as uploaded.
+        bool logShadowConstants = false;
 
         // Logs full state for world draws in this range of the dumped frame, so an
         // artefact narrowed down by the sequence dump can be identified rather than

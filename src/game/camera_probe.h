@@ -47,8 +47,20 @@ namespace wowvr
         // that lands on a camera-shaped object.
         void ScanStaticsForCamera(float verticalScale);
 
+        // Looks for the camera OBJECT the renderer actually consumes, rather than the
+        // setting. Keyed on three values at once - field of view, near plane and far
+        // plane - which together are a far more specific signature than any one of them.
+        void ScanForCameraObject(float verticalScale, float nearPlane, float farPlane);
+
         // Reports whether the located field still agrees with the decoded projection.
         void WatchFovField(float verticalScale);
+
+        // Widens the game's own field of view so that it culls, streams tiles and sizes
+        // its shadow frustum for what VR actually displays. Returns true once the field
+        // is under our control. The original is kept and put back on shutdown.
+        bool WidenGameFov(float desiredHalfAngleRadians);
+        bool WidenGameFovByFactor(float factor);
+        void RestoreGameFov();
 
         bool Found() const { return m_fov != nullptr; }
         bool Searching() const { return m_fov == nullptr && m_candidateCount > 0; }
@@ -95,6 +107,8 @@ namespace wowvr
         int m_activeSettleFrames = 0;
         bool m_activeTestDone = false;
         float* m_fovField = nullptr;
+        float m_originalHalfFov = 0.0f;
+        bool m_fovWidened = false;
         float m_scannedFar = 0.0f;
         float m_scannedVerticalScale = 0.0f;
 

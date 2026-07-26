@@ -98,7 +98,18 @@ target_compile_definitions(wowvr_d3d9 PRIVATE
     UNICODE
     _UNICODE)
 
+# AddressSanitizer, off by default. Configure with -DWOWVR_ASAN=ON to hunt memory
+# corruption: the green-model fault is decided at startup and is exactly the kind of
+# thing inspection keeps missing. Needs clang_rt.asan_dynamic-i386.dll beside the exe.
+option(WOWVR_ASAN "Build the proxy with AddressSanitizer" OFF)
+
 target_compile_options(wowvr_d3d9 PRIVATE /W4 /permissive- /Zi)
+
+if(WOWVR_ASAN)
+    target_compile_options(wowvr_d3d9 PRIVATE /fsanitize=address /Oy-)
+    target_link_options(wowvr_d3d9 PRIVATE /INCREMENTAL:NO)
+    message(STATUS "WoWVR: AddressSanitizer enabled")
+endif()
 target_link_options(wowvr_d3d9 PRIVATE
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/d3d9.def"
     # Delay-loaded so that a missing or broken SteamVR install degrades to "the game

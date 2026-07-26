@@ -19,6 +19,9 @@ namespace wowvr
     {
     public:
         bool Create(IDirect3DDevice9* device, uint32_t eyeWidth, uint32_t eyeHeight);
+
+        // The client's back-buffer format, so the stereo target can be created to match.
+        void SetBackBufferFormat(uint32_t format) { m_backBufferFormat = format; }
         void Destroy();
 
         bool IsReady() const { return m_color != nullptr && m_depth != nullptr; }
@@ -30,6 +33,7 @@ namespace wowvr
         IDirect3DSurface9* Depth() const { return m_depth; }
 
     private:
+        uint32_t m_backBufferFormat = 0;   // D3DFORMAT; 0 = unknown
         IDirect3DSurface9* m_color = nullptr;
         IDirect3DSurface9* m_depth = nullptr;
         uint32_t m_eyeWidth = 0;

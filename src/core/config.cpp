@@ -168,11 +168,20 @@ namespace wowvr
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);
         config.unitsPerMetre = ReadFloat(path, L"VR", L"UnitsPerMetre", config.unitsPerMetre);
+        config.patchCombined =
+            ReadInt(path, L"VR", L"PatchCombined", config.patchCombined ? 1 : 0) != 0;
+        config.dumpShaders = ReadBool(path, L"Debug", L"DumpShaders", config.dumpShaders);
+        config.patchInverseDerived =
+            ReadInt(path, L"VR", L"PatchInverseDerived", config.patchInverseDerived ? 1 : 0) != 0;
         config.perShaderCombined =
             ReadInt(path, L"VR", L"PerShaderCombined", config.perShaderCombined ? 1 : 0) != 0;
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);
+        config.shadowDepthBias =
+            ReadFloat(path, L"Camera", L"ShadowDepthBias", config.shadowDepthBias);
+        config.shadowCoverageScale =
+            ReadFloat(path, L"Camera", L"ShadowCoverageScale", config.shadowCoverageScale);
         config.scanForCamera = ReadBool(path, L"Camera", L"ScanForCamera", config.scanForCamera);
         config.probeCameraByWriting =
             ReadBool(path, L"Camera", L"ProbeCameraByWriting", config.probeCameraByWriting);
@@ -190,6 +199,20 @@ namespace wowvr
         config.logWorldDrawFrom = ReadInt(path, L"Debug", L"LogWorldDrawFrom", config.logWorldDrawFrom);
         config.logWorldDrawTo = ReadInt(path, L"Debug", L"LogWorldDrawTo", config.logWorldDrawTo);
         config.useGameProjection = ReadBool(path, L"Debug", L"UseGameProjection", config.useGameProjection);
+        config.patchConstants = ReadBool(path, L"Debug", L"PatchConstants", config.patchConstants);
+        config.logShadowConstants =
+            ReadBool(path, L"Debug", L"LogShadowConstants", config.logShadowConstants);
+        config.logSkippedDraws = ReadBool(path, L"Debug", L"LogSkippedDraws", config.logSkippedDraws);
+        config.fullTargetSingleEye =
+            ReadBool(path, L"Debug", L"FullTargetSingleEye", config.fullTargetSingleEye);
+        config.keepGameViewport = ReadBool(path, L"Debug", L"KeepGameViewport", config.keepGameViewport);
+        config.symmetricEyeProjection =
+            ReadBool(path, L"Debug", L"SymmetricEyeProjection", config.symmetricEyeProjection);
+        config.singleEyeOnly = ReadBool(path, L"Debug", L"SingleEyeOnly", config.singleEyeOnly);
+        config.eyeProjectionPassThrough =
+            ReadBool(path, L"Debug", L"EyeProjectionPassThrough", config.eyeProjectionPassThrough);
+        config.patchFixedFunction =
+            ReadBool(path, L"Debug", L"PatchFixedFunction", config.patchFixedFunction);
         config.dumpEveryNWorldDraws =
             ReadInt(path, L"Debug", L"DumpEveryNWorldDraws", config.dumpEveryNWorldDraws);
         config.projectionProbeXScale =
