@@ -97,12 +97,15 @@ namespace wowvr
 
         if (m_recenterRequested)
         {
-            // Neutral is wherever the head was, and whichever way it pointed, when
-            // recentre was asked for, so the game's own camera stays the origin.
-            m_neutralInverse = TransposeRotation(headRotation);
+            // Neutral keeps only the head's yaw. The stage frame is gravity-aligned,
+            // so pitch and roll have an absolute reference; folding them into the
+            // neutral would bake a tilted head into the origin and tilt the horizon
+            // for the rest of the session. Yaw is the only axis with no absolute
+            // reference, so it is the only axis recentring resets.
+            m_neutralInverse = Mat4RotationY(-Mat4YawOf(headRotation));
             m_neutralPosition = headPosition;
             m_recenterRequested = false;
-            WOWVR_INFO("Head tracking recentred.");
+            WOWVR_INFO("Head tracking recentred (yaw only, horizon stays level).");
         }
 
         // Rotation of the head relative to neutral, then inverted: rotating the head
