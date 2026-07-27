@@ -29,11 +29,18 @@ namespace wowvr
             L"Enabled=1\r\n"
             L"; 1 runs without a headset and shows both eyes side-by-side in the game window.\r\n"
             L"FlatDebug=0\r\n"
-            L"; Multiplier on the per-eye render size SteamVR asks for. SteamVR's\r\n"
-            L"; recommendation for an Index is already supersampled well past native,\r\n"
-            L"; and every frame currently makes a round trip through system memory, so\r\n"
-            L"; the default backs off. Raise it once the zero-copy presenter lands.\r\n"
+            L"; Multiplier on the per-eye render size SteamVR asks for. The default\r\n"
+            L"; (copy) presenter pays a GPU readback proportional to pixel count, so\r\n"
+            L"; the default backs off; with UseD3D9On12=1 that cost disappears and\r\n"
+            L"; this can go to 1.0.\r\n"
             L"RenderScale=0.6\r\n"
+            L"; 1 hands frames to the compositor through a shared GPU surface; 0 forces\r\n"
+            L"; the old copy through system memory (also the automatic fallback).\r\n"
+            L"ZeroCopyPresenter=1\r\n"
+            L"; 1 runs the client through Windows' D3D9On12 layer - the only route to a\r\n"
+            L"; true zero-copy present on this client, but the layer roughly thirds the\r\n"
+            L"; frame rate, so it is off by default.\r\n"
+            L"UseD3D9On12=0\r\n"
             L"; Interpupillary distance in metres. 0 uses the value reported by the headset.\r\n"
             L"IpdOverride=0.0\r\n"
             L"; Above 1.0 the world feels bigger, below 1.0 it feels like a diorama.\r\n"
@@ -165,6 +172,9 @@ namespace wowvr
         config.skipScreenSpaceWorldDraws =
             ReadBool(path, L"VR", L"SkipScreenSpaceWorldDraws", config.skipScreenSpaceWorldDraws);
         config.renderScale = ReadFloat(path, L"VR", L"RenderScale", config.renderScale);
+        config.zeroCopyPresenter =
+            ReadBool(path, L"VR", L"ZeroCopyPresenter", config.zeroCopyPresenter);
+        config.useD3D9On12 = ReadBool(path, L"VR", L"UseD3D9On12", config.useD3D9On12);
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);
         config.unitsPerMetre = ReadFloat(path, L"VR", L"UnitsPerMetre", config.unitsPerMetre);

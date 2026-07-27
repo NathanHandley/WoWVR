@@ -14,11 +14,13 @@
 #include "proxy/real_d3d9.h"
 
 #include <d3d9.h>
+#include <d3d9on12.h>
 
 namespace
 {
     IDirect3D9* (WINAPI *g_realDirect3DCreate9)(UINT) = nullptr;
     HRESULT     (WINAPI *g_realDirect3DCreate9Ex)(UINT, IDirect3D9Ex**) = nullptr;
+    IDirect3D9* (WINAPI *g_realDirect3DCreate9On12)(UINT, D3D9ON12_ARGS*, UINT) = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +104,9 @@ namespace wowvr
             reinterpret_cast<IDirect3D9* (WINAPI*)(UINT)>(RealProc("Direct3DCreate9"));
         g_realDirect3DCreate9Ex =
             reinterpret_cast<HRESULT (WINAPI*)(UINT, IDirect3D9Ex**)>(RealProc("Direct3DCreate9Ex"));
+        g_realDirect3DCreate9On12 =
+            reinterpret_cast<IDirect3D9* (WINAPI*)(UINT, D3D9ON12_ARGS*, UINT)>(
+                RealProc("Direct3DCreate9On12"));
 
         if (g_realDirect3DCreate9 == nullptr)
         {
@@ -147,8 +152,36 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
         return nullptr;
     }
 
-    IDirect3D9* real = g_realDirect3DCreate9(SDKVersion);
-    WOWVR_INFO("Direct3DCreate9(SDKVersion=%u) -> %p", SDKVersion, static_cast<void*>(real));
+    IDirect3D9* real = nullptr;
+
+    // Routing the client through the D3D9On12 mapping layer is what makes the
+    // zero-copy presenter possible: a plain D3D9 device cannot share any of its
+    // allocations, but on 9on12 every resource is a D3D12 resource underneath
+    // and can be lent to the compositor directly. The API surface the game sees
+    // is identical either way.
+    const bool want9On12 = wowvr::Cfg().enabled && wowvr::Cfg().vrEnabled
+                           && wowvr::Cfg().zeroCopyPresenter && wowvr::Cfg().useD3D9On12;
+    if (want9On12 && g_realDirect3DCreate9On12 != nullptr)
+    {
+        D3D9ON12_ARGS args = {};
+        args.Enable9On12 = TRUE;
+        real = g_realDirect3DCreate9On12(SDKVersion, &args, 1);
+        if (real != nullptr)
+        {
+            WOWVR_INFO("Direct3DCreate9On12(SDKVersion=%u) -> %p (client runs on D3D12).",
+                       SDKVersion, static_cast<void*>(real));
+        }
+        else
+        {
+            WOWVR_WARN("Direct3DCreate9On12 failed; falling back to the native D3D9 driver.");
+        }
+    }
+
+    if (real == nullptr)
+    {
+        real = g_realDirect3DCreate9(SDKVersion);
+        WOWVR_INFO("Direct3DCreate9(SDKVersion=%u) -> %p", SDKVersion, static_cast<void*>(real));
+    }
 
     if (real == nullptr)
     {

@@ -7,6 +7,8 @@
 #include "core/paths.h"
 #include "diag/frame_report.h"
 #include "game/camera_probe.h"
+#include "present/d3d12_present.h"
+#include "present/gl_interop.h"
 #include "present/presenter.h"
 #include "proxy/d3d9_slots.h"
 #include "proxy/vtable_hook.h"
@@ -179,6 +181,41 @@ namespace wowvr
         IDirect3DDevice9* g_device = nullptr;
         EyeTargets g_eyeTargets[EyeCount];
         Presenter g_presenter;
+
+        // Which zero-copy route frames take to the compositor, if any. Decided every
+        // time the resources are built, so a driver refusing either route just lands
+        // us back on the system-memory copy.
+        //
+        // g_d3d12Active:     the client runs on D3D9On12 and eye textures are lent
+        //                    to the compositor as D3D12 resources. The route that
+        //                    actually works on this client.
+        // g_zeroCopyActive:  D3D9 share handle opened by the D3D11 presenter.
+        //                    Needs a D3D9Ex device, so on a native-driver device it
+        //                    is only a future-proofing attempt that fails fast.
+        // g_glInteropActive: WGL_NV_DX_interop alias submitted as a GL texture.
+        //                    Fails on plain D3D9 allocations for the same reason
+        //                    share handles do (not shareable), kept for the day the
+        //                    device changes character.
+        bool g_d3d12Active = false;
+        bool g_zeroCopyActive = false;
+        bool g_glInteropActive = false;
+        D3D12Present g_d3d12Present;
+        GlInterop g_glInterop;
+        IDirect3DQuery9* g_frameSyncQuery = nullptr;
+        bool g_frameSyncQueryFailed = false;
+
+        // Pool census bookkeeping; see the census block further down for why.
+        bool g_creatingProxyResource = false;
+        enum PoolCensusKind { CensusTexture = 0, CensusVertexBuffer, CensusIndexBuffer, CensusKinds };
+        unsigned long long g_poolCounts[CensusKinds][4] = {};
+
+        void CountPool(int kind, D3DPOOL pool)
+        {
+            if (!g_creatingProxyResource && pool >= D3DPOOL_DEFAULT && pool <= D3DPOOL_SCRATCH)
+            {
+                ++g_poolCounts[kind][pool];
+            }
+        }
 
         bool g_vrInitAttempted = false;
         bool g_resourcesReady = false;
@@ -722,6 +759,14 @@ namespace wowvr
                        Vr().RenderWidth(), Vr().RenderHeight());
 
             g_timers = FrameTimers();
+            WOWVR_INFO("Pool census (default/managed/sysmem/scratch): textures %llu/%llu/%llu/%llu, "
+                       "vertex buffers %llu/%llu/%llu/%llu, index buffers %llu/%llu/%llu/%llu",
+                       g_poolCounts[CensusTexture][0], g_poolCounts[CensusTexture][1],
+                       g_poolCounts[CensusTexture][2], g_poolCounts[CensusTexture][3],
+                       g_poolCounts[CensusVertexBuffer][0], g_poolCounts[CensusVertexBuffer][1],
+                       g_poolCounts[CensusVertexBuffer][2], g_poolCounts[CensusVertexBuffer][3],
+                       g_poolCounts[CensusIndexBuffer][0], g_poolCounts[CensusIndexBuffer][1],
+                       g_poolCounts[CensusIndexBuffer][2], g_poolCounts[CensusIndexBuffer][3]);
             Projection().LogLastDecision();
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
@@ -815,12 +860,28 @@ namespace wowvr
 
         void ReleaseFrameResources()
         {
+            // The presenter's adopted textures and the GL registrations alias the
+            // D3D9 surfaces being destroyed just below, so they go first. The GL
+            // context and interop device survive; only the per-texture state dies.
+            g_presenter.ReleaseAdoptedTextures();
+            g_glInterop.UnregisterEyeTextures();
+            g_zeroCopyActive = false;
+            g_glInteropActive = false;
+            g_d3d12Active = false;
+
             for (int eye = 0; eye < EyeCount; ++eye)
             {
                 g_eyeTargets[eye].Destroy();
             }
             g_stereo.Destroy();
             g_uiPanel.Destroy();
+
+            if (g_frameSyncQuery != nullptr)
+            {
+                g_frameSyncQuery->Release();
+                g_frameSyncQuery = nullptr;
+            }
+            g_frameSyncQueryFailed = false;
 
             if (g_realBackBuffer != nullptr)
             {
@@ -831,6 +892,39 @@ namespace wowvr
             g_stereoRedirected = false;
             g_haveEyeProjections = false;
             g_resourcesReady = false;
+        }
+
+        bool CreateEyeTargets(IDirect3DDevice9* device, uint32_t width, uint32_t height,
+                              EyeTargets::Kind kind)
+        {
+            bool ready = true;
+            g_creatingProxyResource = true;
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                ready = g_eyeTargets[eye].Create(device, width, height, kind) && ready;
+            }
+            g_creatingProxyResource = false;
+            return ready;
+        }
+
+        // The GL half of the zero-copy path: interop device plus one registration
+        // per eye texture. Any failure tears the attempt down and reports false.
+        bool AttachGlInterop(IDirect3DDevice9* device)
+        {
+            if (!g_glInterop.Init(device))
+            {
+                return false;
+            }
+
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                if (!g_glInterop.RegisterEyeTexture(eye, g_eyeTargets[eye].RenderTargetTexture()))
+                {
+                    g_glInterop.UnregisterEyeTextures();
+                    return false;
+                }
+            }
+            return true;
         }
 
         // Brings up OpenVR and the per-eye resources the first time the game presents.
@@ -865,15 +959,74 @@ namespace wowvr
             const uint32_t width = Vr().RenderWidth();
             const uint32_t height = Vr().RenderHeight();
 
-            bool targetsReady = true;
-            for (int eye = 0; eye < EyeCount; ++eye)
-            {
-                targetsReady = g_eyeTargets[eye].Create(device, width, height) && targetsReady;
-            }
+            // Route choice, best first. On this client only the 9on12 route can go
+            // zero-copy: the native driver refuses share handles (D3DERR_INVALIDCALL)
+            // and refuses to register plain allocations with the GL interop
+            // (ERROR_OPEN_FAILED), both for the same underlying reason - a plain
+            // D3D9 allocation is simply not shareable. The other attempts stay
+            // because they are cheap and become viable if the device ever changes
+            // character (an Ex device, a different driver).
+            bool targetsReady = false;
+            bool d3d12Route = false;
+            bool sharedRoute = false;
+            bool glRoute = false;
 
             const bool presenterReady = g_presenter.IsReady()
                 ? (g_presenter.Width() == width && g_presenter.Height() == height)
                 : g_presenter.Init(Vr().PreferredAdapterIndex(), width, height);
+            bool copyReady = presenterReady;
+
+            if (Cfg().zeroCopyPresenter && g_d3d12Present.Init(device))
+            {
+                targetsReady = CreateEyeTargets(device, width, height, EyeTargets::KindTexture);
+                d3d12Route = targetsReady;
+            }
+
+            // The shared-handle hand-off: the D3D11 side opens the very surfaces
+            // the game's device rescales into. Rebuilt on every resource build
+            // because the D3D9 side does not survive a device reset.
+            if (!d3d12Route && Cfg().zeroCopyPresenter && presenterReady)
+            {
+                targetsReady = CreateEyeTargets(device, width, height,
+                                                EyeTargets::KindSharedHandle);
+                sharedRoute = targetsReady
+                    && g_presenter.AdoptSharedTextures(g_eyeTargets[EyeLeft].SharedHandle(),
+                                                       g_eyeTargets[EyeRight].SharedHandle());
+            }
+
+            // The GL hand-off: alias the eye textures and submit them as GL textures.
+            if (!d3d12Route && !sharedRoute && Cfg().zeroCopyPresenter)
+            {
+                targetsReady = CreateEyeTargets(device, width, height, EyeTargets::KindTexture);
+                glRoute = targetsReady && AttachGlInterop(device);
+            }
+
+            if (!d3d12Route && !sharedRoute && !glRoute)
+            {
+                if (Cfg().zeroCopyPresenter)
+                {
+                    WOWVR_WARN("No zero-copy route available; using the copy presenter instead.");
+                }
+                targetsReady = CreateEyeTargets(device, width, height, EyeTargets::KindCopy);
+                if (copyReady && !g_presenter.HasEyeTextures())
+                {
+                    copyReady = g_presenter.CreateEyeTextures();
+                }
+                targetsReady = targetsReady && copyReady;
+            }
+
+            g_d3d12Active = d3d12Route;
+            g_zeroCopyActive = sharedRoute;
+            g_glInteropActive = glRoute;
+            if (g_d3d12Active)
+            {
+                WOWVR_INFO("Zero-copy active through D3D9On12; frames stay on the GPU.");
+            }
+            else if (g_zeroCopyActive || g_glInteropActive)
+            {
+                WOWVR_INFO("Zero-copy active through %s; frames stay on the GPU.",
+                           g_zeroCopyActive ? "a shared surface" : "GL interop");
+            }
 
             // The side-by-side target the game will be redirected into, plus a
             // reference to the real back buffer so the redirect can recognise it.
@@ -1095,10 +1248,12 @@ namespace wowvr
         {
             // Managed pool so it survives a device reset without needing to be rebuilt.
             IDirect3DTexture9* texture = nullptr;
-            if (FAILED(device->CreateTexture(static_cast<UINT>(width), static_cast<UINT>(height),
-                                             1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
-                                             &texture, nullptr))
-                || texture == nullptr)
+            g_creatingProxyResource = true;
+            const HRESULT createHr = device->CreateTexture(
+                static_cast<UINT>(width), static_cast<UINT>(height),
+                1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr);
+            g_creatingProxyResource = false;
+            if (FAILED(createHr) || texture == nullptr)
             {
                 return false;
             }
@@ -1721,6 +1876,40 @@ namespace wowvr
             g_originalSetDepthStencilSurface(device, g_stereo.Depth());
         }
 
+        // The zero-copy path hands the compositor surfaces the game's device has only
+        // just written with StretchRect. Legacy shared surfaces carry no fence of
+        // their own, so those writes must be provably retired before Submit or the
+        // headset can sample a half-blitted frame.
+        void FlushGameGpuQueue(IDirect3DDevice9* device)
+        {
+            if (g_frameSyncQueryFailed)
+            {
+                return;
+            }
+
+            if (g_frameSyncQuery == nullptr)
+            {
+                const HRESULT hr = device->CreateQuery(D3DQUERYTYPE_EVENT, &g_frameSyncQuery);
+                if (FAILED(hr) || g_frameSyncQuery == nullptr)
+                {
+                    WOWVR_WARN("Event query unavailable (0x%08lx); zero-copy frames submit "
+                               "unfenced.", hr);
+                    g_frameSyncQueryFailed = true;
+                    return;
+                }
+            }
+
+            if (FAILED(g_frameSyncQuery->Issue(D3DISSUE_END)))
+            {
+                return;
+            }
+
+            while (g_frameSyncQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE)
+            {
+                YieldProcessor();
+            }
+        }
+
         void SubmitFrame(IDirect3DDevice9* device)
         {
             if (!g_resourcesReady || !Vr().IsActive())
@@ -1736,6 +1925,8 @@ namespace wowvr
             g_dumpNextFrame = false;
 
             const LARGE_INTEGER captureStart = Now();
+
+            const bool zeroCopy = g_zeroCopyActive || g_glInteropActive || g_d3d12Active;
 
             for (int eye = 0; eye < EyeCount; ++eye)
             {
@@ -1759,9 +1950,20 @@ namespace wowvr
                         return;
                     }
                 }
+
             }
 
             const LARGE_INTEGER uploadStart = Now();
+            double lockMs = 0.0;
+
+            if (g_zeroCopyActive)
+            {
+                // The frame is already in the surfaces the compositor will read;
+                // the only work left is making sure the blits have retired. (The GL
+                // route needs no fence of its own - wglDXLockObjectsNV synchronises
+                // against the pending D3D9 work when the submit block locks.)
+                FlushGameGpuQueue(device);
+            }
 
             for (int eye = 0; eye < EyeCount; ++eye)
             {
@@ -1770,12 +1972,32 @@ namespace wowvr
                     break;
                 }
 
-                if (!g_eyeTargets[eye].Lock())
+                if (zeroCopy)
+                {
+                    // Readback exists only to feed the occasional BMP dump.
+                    if (!dumpThisFrame || !g_eyeTargets[eye].ReadBack(device))
+                    {
+                        continue;
+                    }
+                }
+
+                // The lock is where the readback's real cost lands -
+                // GetRenderTargetData is asynchronous and LockRect waits for the
+                // GPU - so its time is booked under 'capture', leaving 'upload' as
+                // the pure CPU-to-D3D11 copy.
+                const LARGE_INTEGER lockStart = Now();
+                const bool locked = g_eyeTargets[eye].Lock();
+                lockMs += ElapsedMs(lockStart, Now());
+                if (!locked)
                 {
                     continue;
                 }
 
-                g_presenter.Upload(eye, g_eyeTargets[eye].LockedPixels(), g_eyeTargets[eye].LockedPitch());
+                if (!zeroCopy)
+                {
+                    g_presenter.Upload(eye, g_eyeTargets[eye].LockedPixels(),
+                                       g_eyeTargets[eye].LockedPitch());
+                }
 
                 if (dumpThisFrame && eye == EyeLeft)
                 {
@@ -1796,14 +2018,42 @@ namespace wowvr
             const LARGE_INTEGER submitStart = Now();
             // Without stereo both eyes get the left image, which is flat but at least
             // consistent; with stereo each eye gets its own render.
-            void* leftTexture = g_presenter.EyeTexture(EyeLeft);
-            Vr().SubmitEye(EyeLeft, leftTexture);
-            Vr().SubmitEye(EyeRight, stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture);
-            Vr().PostSubmit();
+            if (g_d3d12Active)
+            {
+                // Unwrap fences the StretchRects, the compositor copies on our
+                // queue, and the fence handed back guards the return.
+                if (g_d3d12Present.SubmitEyes(g_eyeTargets[EyeLeft].RenderTargetTexture(),
+                                              g_eyeTargets[EyeRight].RenderTargetTexture(),
+                                              stereo))
+                {
+                    Vr().PostSubmit();
+                }
+            }
+            else if (g_glInteropActive)
+            {
+                // The lock synchronises against the StretchRects and grants the
+                // compositor's GL view access for the span of the submit.
+                if (g_glInterop.LockEyes())
+                {
+                    const uint32_t left = g_glInterop.GlTextureName(EyeLeft);
+                    Vr().SubmitEyeGl(EyeLeft, left);
+                    Vr().SubmitEyeGl(EyeRight, stereo ? g_glInterop.GlTextureName(EyeRight)
+                                                      : left);
+                    Vr().PostSubmit();
+                    g_glInterop.UnlockEyes();
+                }
+            }
+            else
+            {
+                void* leftTexture = g_presenter.EyeTexture(EyeLeft);
+                Vr().SubmitEye(EyeLeft, leftTexture);
+                Vr().SubmitEye(EyeRight, stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture);
+                Vr().PostSubmit();
+            }
             const LARGE_INTEGER submitEnd = Now();
 
-            g_timers.captureMs += ElapsedMs(captureStart, uploadStart);
-            g_timers.uploadMs += ElapsedMs(uploadStart, submitStart);
+            g_timers.captureMs += ElapsedMs(captureStart, uploadStart) + lockMs;
+            g_timers.uploadMs += ElapsedMs(uploadStart, submitStart) - lockMs;
             g_timers.submitMs += ElapsedMs(submitStart, submitEnd);
             ++g_timers.samples;
         }
@@ -3509,6 +3759,52 @@ namespace wowvr
             }
         }
 
+        // ------------------------------------------------------------------
+        // Resource pool census
+        //
+        // Exists to answer one architectural question: could the device be
+        // silently upgraded to D3D9Ex - which would make shared surfaces legal
+        // and the zero-copy presenter possible - without breaking the client?
+        // D3DPOOL_MANAGED does not exist on an Ex device, so a non-zero managed
+        // count from the game is the veto. The proxy's own creations (cursor
+        // cache, eye targets) are excluded.
+        // ------------------------------------------------------------------
+        typedef HRESULT (WINAPI *CreateTextureFn)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD,
+                                                  D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+        typedef HRESULT (WINAPI *CreateVertexBufferFn)(IDirect3DDevice9*, UINT, DWORD, DWORD,
+                                                       D3DPOOL, IDirect3DVertexBuffer9**, HANDLE*);
+        typedef HRESULT (WINAPI *CreateIndexBufferFn)(IDirect3DDevice9*, UINT, DWORD, D3DFORMAT,
+                                                      D3DPOOL, IDirect3DIndexBuffer9**, HANDLE*);
+        CreateTextureFn g_originalCreateTexture = nullptr;
+        CreateVertexBufferFn g_originalCreateVertexBuffer = nullptr;
+        CreateIndexBufferFn g_originalCreateIndexBuffer = nullptr;
+
+        HRESULT WINAPI HookedCreateTexture(IDirect3DDevice9* device, UINT width, UINT height,
+                                           UINT levels, DWORD usage, D3DFORMAT format,
+                                           D3DPOOL pool, IDirect3DTexture9** texture,
+                                           HANDLE* sharedHandle)
+        {
+            CountPool(CensusTexture, pool);
+            return g_originalCreateTexture(device, width, height, levels, usage, format,
+                                           pool, texture, sharedHandle);
+        }
+
+        HRESULT WINAPI HookedCreateVertexBuffer(IDirect3DDevice9* device, UINT length, DWORD usage,
+                                                DWORD fvf, D3DPOOL pool,
+                                                IDirect3DVertexBuffer9** buffer, HANDLE* sharedHandle)
+        {
+            CountPool(CensusVertexBuffer, pool);
+            return g_originalCreateVertexBuffer(device, length, usage, fvf, pool, buffer, sharedHandle);
+        }
+
+        HRESULT WINAPI HookedCreateIndexBuffer(IDirect3DDevice9* device, UINT length, DWORD usage,
+                                               D3DFORMAT format, D3DPOOL pool,
+                                               IDirect3DIndexBuffer9** buffer, HANDLE* sharedHandle)
+        {
+            CountPool(CensusIndexBuffer, pool);
+            return g_originalCreateIndexBuffer(device, length, usage, format, pool, buffer, sharedHandle);
+        }
+
         typedef HRESULT (WINAPI *CreatePixelShaderFn)(IDirect3DDevice9*, const DWORD*,
                                                       IDirect3DPixelShader9**);
         typedef HRESULT (WINAPI *SetPixelShaderFn)(IDirect3DDevice9*, IDirect3DPixelShader9*);
@@ -4023,6 +4319,12 @@ namespace wowvr
                      g_originalDrawPrimitiveUP, "DrawPrimitiveUP");
             HookSlot(device, slot::device9::DrawIndexedPrimitiveUP, &HookedDrawIndexedPrimitiveUP,
                      g_originalDrawIndexedPrimitiveUP, "DrawIndexedPrimitiveUP");
+            HookSlot(device, slot::device9::CreateTexture, &HookedCreateTexture,
+                     g_originalCreateTexture, "CreateTexture");
+            HookSlot(device, slot::device9::CreateVertexBuffer, &HookedCreateVertexBuffer,
+                     g_originalCreateVertexBuffer, "CreateVertexBuffer");
+            HookSlot(device, slot::device9::CreateIndexBuffer, &HookedCreateIndexBuffer,
+                     g_originalCreateIndexBuffer, "CreateIndexBuffer");
         }
 
         void InstallDeviceHooks(IDirect3DDevice9* device)
@@ -4166,6 +4468,8 @@ namespace wowvr
             g_cursorConfined = false;
         }
 
+        g_d3d12Present.Shutdown();
+        g_glInterop.Shutdown();
         g_presenter.Shutdown();
         Vr().Shutdown();
         g_device = nullptr;

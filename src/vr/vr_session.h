@@ -4,6 +4,12 @@
 
 #include <cstdint>
 
+namespace vr
+{
+    struct Texture_t;
+    struct VRTextureBounds_t;
+}
+
 namespace wowvr
 {
     enum Eye
@@ -48,9 +54,20 @@ namespace wowvr
         // 'texture' is an ID3D11Texture2D. Returns false once and logs on failure,
         // then stays quiet so a broken frame cannot flood the log.
         bool SubmitEye(int eye, void* texture);
+
+        // Same, for an OpenGL texture name (the zero-copy interop path). The caller
+        // must have its GL context current; the compositor reads through it.
+        bool SubmitEyeGl(int eye, uint32_t glTexture);
+
+        // Same, for a D3D12 texture. 'textureData' is a vr::D3D12TextureData_t*,
+        // which only needs to live for the duration of the call.
+        bool SubmitEyeD3D12(int eye, void* textureData);
         void PostSubmit();
 
     private:
+        bool SubmitTexture(int eye, const vr::Texture_t& texture,
+                           const vr::VRTextureBounds_t* bounds);
+
         bool m_active = false;
         uint32_t m_renderWidth = 0;
         uint32_t m_renderHeight = 0;

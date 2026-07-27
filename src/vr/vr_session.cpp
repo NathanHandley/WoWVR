@@ -252,8 +252,52 @@ namespace wowvr
         // washes the whole image out.
         submission.eColorSpace = vr::ColorSpace_Gamma;
 
+        return SubmitTexture(eye, submission, nullptr);
+    }
+
+    bool VrSession::SubmitEyeGl(int eye, uint32_t glTexture)
+    {
+        if (!m_active || glTexture == 0)
+        {
+            return false;
+        }
+
+        vr::Texture_t submission = {};
+        submission.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(glTexture));
+        submission.eType = vr::TextureType_OpenGL;
+        submission.eColorSpace = vr::ColorSpace_Gamma;
+
+        // GL addresses textures bottom-up, but the D3D9 image aliased into this
+        // texture is top-down. Flipping the bounds keeps the world upright.
+        vr::VRTextureBounds_t bounds;
+        bounds.uMin = 0.0f;
+        bounds.uMax = 1.0f;
+        bounds.vMin = 1.0f;
+        bounds.vMax = 0.0f;
+
+        return SubmitTexture(eye, submission, &bounds);
+    }
+
+    bool VrSession::SubmitEyeD3D12(int eye, void* textureData)
+    {
+        if (!m_active || textureData == nullptr)
+        {
+            return false;
+        }
+
+        vr::Texture_t submission = {};
+        submission.handle = textureData;
+        submission.eType = vr::TextureType_DirectX12;
+        submission.eColorSpace = vr::ColorSpace_Gamma;
+
+        return SubmitTexture(eye, submission, nullptr);
+    }
+
+    bool VrSession::SubmitTexture(int eye, const vr::Texture_t& texture,
+                                  const vr::VRTextureBounds_t* bounds)
+    {
         const vr::EVRCompositorError error =
-            vr::VRCompositor()->Submit(ToOpenVREye(eye), &submission);
+            vr::VRCompositor()->Submit(ToOpenVREye(eye), &texture, bounds);
 
         if (static_cast<int>(error) != m_lastSubmitError)
         {

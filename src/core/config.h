@@ -34,9 +34,23 @@ namespace wowvr
         // the usual culprits.
         bool skipScreenSpaceWorldDraws = true;
         // Multiplier on the runtime's recommended per-eye size. Below 1.0 by default
-        // because the current presenter moves every frame through system memory, and
-        // SteamVR's recommendation for an Index is already heavily supersampled.
+        // because the default (copy) presenter pays a GPU readback proportional to
+        // pixel count; the zero-copy 9on12 route removes that cost but is opt-in.
         float renderScale = 0.6f;
+
+        // Hand frames to the compositor through a shared GPU surface instead of a
+        // round trip through system memory. Falls back to the copy path by itself
+        // if no sharing route works; 0 forces the copy path outright.
+        bool zeroCopyPresenter = true;
+
+        // Run the client through Windows' D3D9On12 mapping layer. A plain D3D9
+        // device cannot share its allocations at all (share handles and the GL
+        // interop both fail), but on 9on12 every D3D9 resource is a D3D12 resource
+        // underneath and can be lent to the compositor directly - a true zero-copy
+        // present. Off by default because the layer's per-draw overhead measured
+        // ~28 fps against ~75 native on this client (1100+ world draws a frame);
+        // the perfect hand-off is not worth a third of the frame rate.
+        bool useD3D9On12 = false;
         float ipdOverride = 0.0f;       // metres; 0 = whatever the headset reports
         float worldScale = 1.0f;        // >1 makes the world feel larger
 

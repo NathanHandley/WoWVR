@@ -8,7 +8,7 @@
 
 namespace wowvr
 {
-    bool EyeTargets::Create(IDirect3DDevice9* device, uint32_t width, uint32_t height)
+    bool EyeTargets::Create(IDirect3DDevice9* device, uint32_t width, uint32_t height, Kind kind)
     {
         Destroy();
 
@@ -19,18 +19,57 @@ namespace wowvr
 
         m_width = width;
         m_height = height;
+        m_kind = kind;
 
-        // Non-multisampled on purpose: StretchRect from the back buffer into this
-        // surface resolves any multisampling the game asked for, which is what makes
-        // the GetRenderTargetData readback below legal.
-        HRESULT hr = device->CreateRenderTarget(
-            width, height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0,
-            FALSE, &m_scaled, nullptr);
-        if (FAILED(hr))
+        HRESULT hr;
+        if (kind != KindCopy)
         {
-            WOWVR_ERROR("CreateRenderTarget(%ux%u) failed (0x%08lx).", width, height, hr);
-            Destroy();
-            return false;
+            // A render-target texture the frame is left in for someone else to read
+            // in place - the D3D11 presenter through a share handle, or a GL alias
+            // through WGL_NV_DX_interop. Either way the StretchRect into it is the
+            // last time the frame is touched: no readback, no upload.
+            //
+            // The share handle only exists on a D3D9Ex device; plain D3D9 rejects
+            // it with D3DERR_INVALIDCALL, which is why KindTexture exists.
+            HANDLE handle = nullptr;
+            hr = device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
+                                       D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                       &m_renderTexture,
+                                       (kind == KindSharedHandle) ? &handle : nullptr);
+            if (FAILED(hr) || m_renderTexture == nullptr
+                || (kind == KindSharedHandle && handle == nullptr))
+            {
+                WOWVR_WARN("Eye render-target texture (%ux%u%s) unavailable (0x%08lx).",
+                           width, height,
+                           (kind == KindSharedHandle) ? ", shared" : "", hr);
+                Destroy();
+                return false;
+            }
+
+            hr = m_renderTexture->GetSurfaceLevel(0, &m_scaled);
+            if (FAILED(hr) || m_scaled == nullptr)
+            {
+                WOWVR_ERROR("GetSurfaceLevel on the eye texture failed (0x%08lx).", hr);
+                Destroy();
+                return false;
+            }
+
+            m_sharedHandle = handle;
+        }
+        else
+        {
+            // Non-multisampled on purpose: StretchRect from the back buffer into this
+            // surface resolves any multisampling the game asked for, which is what makes
+            // the GetRenderTargetData readback below legal.
+            hr = device->CreateRenderTarget(
+                width, height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0,
+                FALSE, &m_scaled, nullptr);
+            if (FAILED(hr))
+            {
+                WOWVR_ERROR("CreateRenderTarget(%ux%u) failed (0x%08lx).", width, height, hr);
+                Destroy();
+                return false;
+            }
         }
 
         hr = device->CreateOffscreenPlainSurface(
@@ -42,7 +81,10 @@ namespace wowvr
             return false;
         }
 
-        WOWVR_INFO("Eye targets created at %ux%u.", width, height);
+        WOWVR_INFO("Eye targets created at %ux%u%s.", width, height,
+                   (kind == KindSharedHandle) ? " (shared handle)"
+                   : (kind == KindTexture)    ? " (texture)"
+                                              : "");
         return true;
     }
 
@@ -55,6 +97,14 @@ namespace wowvr
             m_scaled->Release();
             m_scaled = nullptr;
         }
+        if (m_renderTexture != nullptr)
+        {
+            m_renderTexture->Release();
+            m_renderTexture = nullptr;
+        }
+        // The share handle is a kernel identifier, not an NT handle; nothing to close.
+        m_sharedHandle = nullptr;
+        m_kind = KindCopy;
         if (m_staging != nullptr)
         {
             m_staging->Release();
@@ -104,6 +154,13 @@ namespace wowvr
             return false;
         }
 
+        if (m_kind != KindCopy)
+        {
+            // The consumer reads this very surface, so the frame is already where
+            // it needs to be.
+            return true;
+        }
+
         hr = device->GetRenderTargetData(m_scaled, m_staging);
         if (FAILED(hr))
         {
@@ -141,6 +198,11 @@ namespace wowvr
             return false;
         }
 
+        if (m_kind != KindCopy)
+        {
+            return true;
+        }
+
         hr = device->GetRenderTargetData(m_scaled, m_staging);
         if (FAILED(hr))
         {
@@ -153,6 +215,15 @@ namespace wowvr
         }
 
         return true;
+    }
+
+    bool EyeTargets::ReadBack(IDirect3DDevice9* device)
+    {
+        if (device == nullptr || !IsReady())
+        {
+            return false;
+        }
+        return SUCCEEDED(device->GetRenderTargetData(m_scaled, m_staging));
     }
 
     bool EyeTargets::Lock()

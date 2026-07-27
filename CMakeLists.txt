@@ -57,6 +57,10 @@ set(WOWVR_SOURCES
     src/diag/frame_report.h
     src/game/camera_probe.cpp
     src/game/camera_probe.h
+    src/present/d3d12_present.cpp
+    src/present/d3d12_present.h
+    src/present/gl_interop.cpp
+    src/present/gl_interop.h
     src/present/presenter.cpp
     src/present/presenter.h
     src/proxy/d3d9_slots.h
@@ -92,7 +96,7 @@ set_target_properties(wowvr_d3d9 PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "${WOWVR_CLIENT_DIR}")
 
 target_include_directories(wowvr_d3d9 PRIVATE src)
-target_link_libraries(wowvr_d3d9 PRIVATE openvr d3d11 dxgi delayimp)
+target_link_libraries(wowvr_d3d9 PRIVATE openvr d3d11 dxgi opengl32 delayimp)
 
 target_compile_definitions(wowvr_d3d9 PRIVATE
     WIN32_LEAN_AND_MEAN

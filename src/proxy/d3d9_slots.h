@@ -28,6 +28,9 @@ namespace wowvr
             constexpr unsigned Release = 2;
             constexpr unsigned Reset = 16;
             constexpr unsigned Present = 17;
+            constexpr unsigned CreateTexture = 23;
+            constexpr unsigned CreateVertexBuffer = 26;
+            constexpr unsigned CreateIndexBuffer = 27;
             constexpr unsigned CreateRenderTarget = 28;
             constexpr unsigned CreateDepthStencilSurface = 29;
             constexpr unsigned StretchRect = 34;
