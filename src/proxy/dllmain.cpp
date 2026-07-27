@@ -66,8 +66,6 @@ namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
-    (void)reserved;
-
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
@@ -75,7 +73,27 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         return AttachProcess(module) ? TRUE : FALSE;
 
     case DLL_PROCESS_DETACH:
-        DetachProcess();
+        // A non-null `reserved` means the process is exiting rather than the library
+        // being unloaded, and the two need opposite handling.
+        //
+        // On process exit Windows has already terminated every other thread, and this
+        // one holds the loader lock. Tearing down from here then deadlocks the moment
+        // anything waits: VR_Shutdown joins the compositor's threads, which no longer
+        // exist to be joined. That is exactly what left a client behind on every close -
+        // window destroyed, one thread remaining, no CPU being consumed, forever.
+        //
+        // There is nothing to clean up anyway: the process is going away and the kernel
+        // reclaims the device, the textures and the OpenVR session regardless. So on exit
+        // only the log is closed, which touches no other thread.
+        if (reserved != nullptr)
+        {
+            WOWVR_INFO("WoWVR proxy detaching at process exit; leaving teardown to the OS.");
+            wowvr::LogShutdown();
+        }
+        else
+        {
+            DetachProcess();
+        }
         break;
 
     default:
