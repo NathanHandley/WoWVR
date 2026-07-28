@@ -40,6 +40,21 @@ namespace wowvr
         return result;
     }
 
+    // Same convention as the Y rotation beside it: left-handed, row-vector, so that
+    // undoing the game camera's pitch composes correctly with undoing its yaw.
+    Mat4 Mat4RotationX(float radians)
+    {
+        const float c = std::cos(radians);
+        const float s = std::sin(radians);
+
+        Mat4 result = Mat4Identity();
+        result.m[1][1] = c;
+        result.m[1][2] = s;
+        result.m[2][1] = -s;
+        result.m[2][2] = c;
+        return result;
+    }
+
     Mat4 Mat4RotationY(float radians)
     {
         const float c = std::cos(radians);

@@ -92,8 +92,64 @@ namespace wowvr
 
     void ProjectionPatch::UpdateFromHeadPose(const Mat4& headToStage)
     {
+        // Settle last frame's votes before starting a new count. The camera is the
+        // position the most draws agreed on; a lone vote is one model's placement and
+        // says nothing, so a clear majority is required before it is believed.
+        int best = -1;
+        int bestCount = 0;
+        int total = 0;
+        for (int i = 0; i < m_positionVoteCount; ++i)
+        {
+            total += m_positionVotes[i].count;
+            if (m_positionVotes[i].count > bestCount)
+            {
+                bestCount = m_positionVotes[i].count;
+                best = i;
+            }
+        }
+        if (best >= 0 && bestCount >= 4 && bestCount * 2 > total)
+        {
+            m_cameraPosition = m_positionVotes[best].position;
+            m_haveCameraPosition = true;
+        }
+
+        int bestYaw = -1;
+        int bestYawCount = 0;
+        for (int i = 0; i < m_yawVoteCount; ++i)
+        {
+            if (m_yawVotes[i].count > bestYawCount)
+            {
+                bestYawCount = m_yawVotes[i].count;
+                bestYaw = i;
+            }
+        }
+        if (bestYaw >= 0 && bestYawCount >= 8)
+        {
+            m_cameraYaw = m_yawVotes[bestYaw].yaw;
+            m_cameraYawWeight = bestYawCount;
+            m_haveCameraYaw = true;
+        }
+        m_yawVoteCount = 0;
+
+        // Kept so the tally can be reported: when the winner is not the camera, what
+        // else was in the running is the thing worth seeing.
+        m_lastVoteCount = m_positionVoteCount;
+        for (int i = 0; i < m_positionVoteCount; ++i)
+        {
+            m_lastVotes[i] = m_positionVotes[i];
+        }
+        m_positionVoteCount = 0;
+
         const Mat4 headRotation = RotationOnly(headToStage);
-        const Vec3 headPosition = Mat4TranslationOf(headToStage);
+
+        // Synthetic head displacement, in metres, added to the POSE for the same reason the
+        // synthetic rotation is: so it travels the identical path a real headset's position
+        // takes - into the neutral frame, through the left-handed flip - rather than being
+        // spliced in downstream where a broken consumer would still look fine.
+        Vec3 headPosition = Mat4TranslationOf(headToStage);
+        headPosition.x += m_fakeHeadOffset.x;
+        headPosition.y += m_fakeHeadOffset.y;
+        headPosition.z += m_fakeHeadOffset.z;
 
         if (m_recenterRequested)
         {
@@ -108,14 +164,86 @@ namespace wowvr
             WOWVR_INFO("Head tracking recentred (yaw only, horizon stays level).");
         }
 
-        // Rotation of the head relative to neutral, then inverted: rotating the head
-        // one way has to rotate the world the other way.
-        const Mat4 relative = Mat4Multiply(headRotation, m_neutralInverse);
+        // Rotation of the head relative to neutral.
+        Mat4 relative = Mat4Multiply(headRotation, m_neutralInverse);
+
+        // A synthetic head turn, injected into the POSE rather than into the values derived
+        // from it.
+        //
+        // It used to be added further down, to m_headRotation and m_headYaw together. That
+        // made the two agree by construction, which is exactly the bug it needed to be able
+        // to expose: the real path extracts the scalar and builds the matrix separately, and
+        // they disagreed in sign for yaw. Every synthetic sweep passed while a real head
+        // turn steered the game camera the wrong way.
+        //
+        // It also made pitch tests vacuous. m_headPitch was assigned from the pose a few
+        // lines after the fake was added to it, so the fake was overwritten and pitch aiming
+        // never ran at all - while the captures looked like a clean result.
+        //
+        // Injected here, every value downstream comes from one source through the same code
+        // a headset goes through, so a sign error has nowhere left to hide.
+        if (m_fakeHeadYaw != 0.0f)
+        {
+            // About the stage's vertical, which is what turning on the spot does.
+            relative = Mat4Multiply(Mat4RotationY(m_fakeHeadYaw), relative);
+        }
+        if (m_fakeHeadPitch != 0.0f)
+        {
+            // About the head's own right axis, which is what nodding does.
+            relative = Mat4Multiply(Mat4RotationX(m_fakeHeadPitch), relative);
+        }
+
+        // Inverted: rotating the head one way has to rotate the world the other way.
         m_headRotation = ToLeftHanded(TransposeRotation(relative));
 
-        // Negated because the yaw is measured in OpenVR's right-handed frame and
-        // consumed in the game's left-handed one.
-        m_headYaw = -Mat4YawOf(relative);
+        // NOT negated.
+        //
+        // It was, with a note about converting from OpenVR's right-handed frame to the
+        // game's left-handed one - but that conversion is already inside the line above.
+        // ToLeftHanded negates [2][0] and TransposeRotation swaps it with [0][2], so for a
+        // pure yaw theta the matrix that gets used carries +theta, and a scalar of -theta
+        // contradicts it.
+        //
+        // The contradiction was survivable as long as nothing else read the scalar: the
+        // compensation removed -theta from a matrix holding +theta, double-rotating by
+        // +2*theta, which cancelled against a game camera turned the wrong way by -theta and
+        // displayed a correct view. Two errors making a right picture. The moment the scalar
+        // started steering the client's culling, the wrong one showed.
+        // Pitch and roll say whether the yaw being extracted means anything: a headset
+        // rotating about an axis that is not its own vertical sweeps through both as it
+        // turns, and its "yaw" then stops corresponding to the direction it is facing.
+        const float sinPitch = -relative.m[2][1] < -1.0f ? -1.0f
+                             : (-relative.m[2][1] > 1.0f ? 1.0f : -relative.m[2][1]);
+        m_headPitch = asinf(sinPitch);
+        m_headRoll = atan2f(relative.m[0][1], relative.m[1][1]);
+
+        // Yaw is held near vertical, because there it does not exist.
+        //
+        // The extraction is atan2(cosPitch * sinYaw, cosPitch * cosYaw). The cosines cancel
+        // and it returns the yaw exactly - right up until cosPitch reaches zero, where both
+        // arguments are zero and the result is whatever the noise in the pose says. Measured
+        // looking straight down: asking for yaws of 0.0, 0.5, 1.0 and 2.0 rad produced 62,
+        // 78, 76 and 67 degrees, which is not a relationship.
+        //
+        // Feeding that to the camera made the client chase a value jumping tens of degrees a
+        // frame; it smooths, so it lagged, so the compensation removed a rotation the client
+        // had not finished applying and the ground swam with the head.
+        //
+        // Looking straight down there IS no facing to speak of - turning your head there is
+        // a roll, not a turn - so holding the last well-conditioned yaw is not an
+        // approximation, it is the right answer. Hysteresis so the boundary cannot chatter.
+        const float cosPitch = sqrtf(1.0f - sinPitch * sinPitch);
+        const float kResume = 0.26f;    // |pitch| < 75 degrees: trustworthy
+        const float kFreeze = 0.17f;    // |pitch| > 80 degrees: noise
+
+        if (cosPitch > kResume) { m_yawIsStable = true; }
+        else if (cosPitch < kFreeze) { m_yawIsStable = false; }
+
+        if (m_yawIsStable || !m_haveHeldYaw)
+        {
+            m_headYaw = Mat4YawOf(relative);
+            m_haveHeldYaw = true;
+        }
 
         // Displacement since recentring, rotated out of stage space into the frame the
         // game's camera is looking along, then flipped to left-handed. This is what
@@ -127,6 +255,109 @@ namespace wowvr
         m_headOffset.x = dx * m_neutralInverse.m[0][0] + dy * m_neutralInverse.m[1][0] + dz * m_neutralInverse.m[2][0];
         m_headOffset.y = dx * m_neutralInverse.m[0][1] + dy * m_neutralInverse.m[1][1] + dz * m_neutralInverse.m[2][1];
         m_headOffset.z = -(dx * m_neutralInverse.m[0][2] + dy * m_neutralInverse.m[1][2] + dz * m_neutralInverse.m[2][2]);
+    }
+
+    // The head rotation with whatever the game's own camera has already been turned by taken
+    // back out of it.
+    //
+    // The client bakes its view transform into the vertices on the CPU, so by the time
+    // geometry reaches us the camera's rotation has already happened to it. Applying the
+    // head rotation in full on top would turn the world twice as far as the head moved.
+    //
+    // ORDER MATTERS, and only when both angles are non-zero.
+    //
+    // WoW is Z-up and builds its camera the way any first-person camera is built: yaw about
+    // the world's vertical, then pitch about the right axis that yaw produced. So the
+    // rotation baked into the geometry is R_turn = R_yaw * R_pitch, and undoing it needs
+    // R_turn^-1 = R_pitch^-1 * R_yaw^-1 - the yaw unwound first, then the pitch.
+    //
+    // This used to unwind pitch first, which computes (R_pitch * R_yaw)^-1 instead. With
+    // either angle at zero the two are identical, which is exactly why sweeping yaw and
+    // pitch separately - as every test here did - could never tell them apart. Combine them
+    // and the difference is a residual ROLL that grows with both angles: look up while
+    // turned, and the horizon tilts.
+    //
+    // It cancels because m_headRotation decomposes the same way, as R_yaw * R_pitch, so
+    // R_pitch^-1 * R_yaw^-1 * R_yaw * R_pitch is the identity.
+    // Putting the camera back where it was before it swung round the character.
+    //
+    // In third person the camera does not pivot in place - it rides a sphere of radius R
+    // centred on the character, so aiming it at the head MOVES it. The old correction handled
+    // only yaw, which is why looking up flew the camera into the sky and looking down buried
+    // it in the ground: the vertical half of the swing was never accounted for at all.
+    //
+    // Derived generally, in the view space of the turned camera. The character sits at
+    // (0, 0, R) in front of it. The camera used to sit at that centre minus R times the OLD
+    // forward direction, and the old forward expressed in the new camera's frame is
+    // R_turn^-1 applied to z. So the old eye position was R * (R_turn^-1 . z) - (0, 0, R),
+    // and the geometry has to be shifted by the negative of that to look as though the
+    // camera never left.
+    //
+    // The sign is switchable because the previous attempt was, by its own comment, derived
+    // rather than measured - and it was inverted, which doubles the swing instead of
+    // cancelling it. Measured this time.
+    void ProjectionPatch::ApplyOrbitCompensation(float& offsetX, float& offsetY,
+                                                 float& offsetZ) const
+    {
+        if (m_gameCameraOrbitRadius <= 0.0f
+            || (m_gameCameraYaw == 0.0f && m_gameCameraPitch == 0.0f))
+        {
+            return;
+        }
+
+        // Measured by the caller from the camera's own position and basis; see
+        // GameCamera::OrbitDisplacementView.
+
+        // SUBTRACTED, and in the same units it arrives in.
+        //
+        // offsetX/Y/Z say where the eye is relative to the game's camera, in world units, on
+        // the D3D view axes - right, up, forward. m_orbitDisplacement says how far the
+        // camera MOVED from where it would have been, on those same axes, already in world
+        // units because it came from a radius in yards. So the eye belongs at minus that,
+        // and there is no metres-to-yards conversion to apply and no world scale: scaling it
+        // would move the viewpoint by an amount the camera did not move by.
+        //
+        // The per-axis signs are gone. They existed because the measurement they were
+        // correcting was wrong twice over - a left vector read as a right vector, and an
+        // un-aimed direction reconstructed on the wrong side of the real one - and while the
+        // camera was also being hauled about by collision, no test could tell any of it
+        // apart. With collision off and both errors fixed the correction is a subtraction
+        // with nothing left to choose. The single overall sign stays as a field switch.
+        const float scale = m_orbitSign;
+
+        offsetX -= m_orbitDisplacement.x * scale;
+        offsetY -= m_orbitDisplacement.y * scale;
+        offsetZ -= m_orbitDisplacement.z * scale;
+    }
+
+    Mat4 ProjectionPatch::HeadCorrection() const
+    {
+        Mat4 corrected = m_headRotation;
+
+        if (m_unwindPitchFirst)
+        {
+            // The old, wrong order. Kept only so the two can be measured against each
+            // other in one session rather than across two builds.
+            if (m_gameCameraPitch != 0.0f)
+            {
+                corrected = Mat4Multiply(Mat4RotationX(-m_gameCameraPitch), corrected);
+            }
+            if (m_gameCameraYaw != 0.0f)
+            {
+                corrected = Mat4Multiply(Mat4RotationY(-m_gameCameraYaw), corrected);
+            }
+            return corrected;
+        }
+
+        if (m_gameCameraYaw != 0.0f)
+        {
+            corrected = Mat4Multiply(Mat4RotationY(-m_gameCameraYaw), corrected);
+        }
+        if (m_gameCameraPitch != 0.0f)
+        {
+            corrected = Mat4Multiply(Mat4RotationX(-m_gameCameraPitch), corrected);
+        }
+        return corrected;
     }
 
     bool ProjectionPatch::Decode(const float* uploaded, Decoded& out) const
@@ -282,9 +513,13 @@ namespace wowvr
             // stereo separation. Combined with the head displacement since recentring.
             const Vec3 eyeOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
 
-            const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
-            const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
-            const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+            float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
+            float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
+            float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+
+            // This path never had the orbit correction at all - the same one-of-two-copies
+            // gap that left the sky uncompensated.
+            ApplyOrbitCompensation(offsetX, offsetY, offsetZ);
 
             if (Cfg().eyeProjectionPassThrough)
             {
@@ -295,13 +530,26 @@ namespace wowvr
                 continue;
             }
 
+            // HeadCorrection(), never m_headRotation.
+            //
+            // This path substitutes the projection register, which is what the sky dome and
+            // the distant backdrop terrain are drawn through; the near world goes through
+            // the combined transform and BuildEyeProjection. Only that one compensated for
+            // the rotation already applied to the game's own camera, so once the camera
+            // started following the head, the two paths disagreed: the near world sat still
+            // and the sky and far terrain swung with every head movement.
+            //
+            // Sharing one helper is the point. Two copies of a correction is what let them
+            // drift apart in the first place.
+            const Mat4 headRotation = HeadCorrection();
+
             if (m_infiniteDistance)
             {
                 // Rotation only. Translating the sky is what makes it feel like a
                 // painted wall a few metres away instead of a horizon.
                 if (Cfg().headTracking)
                 {
-                    replacement = Mat4Multiply(m_headRotation, replacement);
+                    replacement = Mat4Multiply(headRotation, replacement);
                 }
             }
             else if (Cfg().headTracking)
@@ -309,7 +557,7 @@ namespace wowvr
                 // A point at P in the old view frame sits at (P - d) * R in the new
                 // one, so the correction ahead of the projection is T(-d) then R.
                 const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
-                const Mat4 correction = Mat4Multiply(translation, m_headRotation);
+                const Mat4 correction = Mat4Multiply(translation, headRotation);
                 replacement = Mat4Multiply(correction, replacement);
             }
             else
@@ -362,18 +610,25 @@ namespace wowvr
         const float unitsPerMetre = Cfg().unitsPerMetre * Cfg().worldScale;
         const Vec3 eyeOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
 
-        const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
-        const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
-        const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+        // Not const: the orbit correction is a view-space shift like these, so it folds in
+        // here rather than being applied separately. Y is no longer exempt - the vertical
+        // half of the swing is exactly what was missing.
+        float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
+        float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
+        float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
+
+        ApplyOrbitCompensation(offsetX, offsetY, offsetZ);
+
+        const Mat4 headRotation = HeadCorrection();
 
         if (m_infiniteDistance)
         {
-            return Cfg().headTracking ? Mat4Multiply(m_headRotation, replacement) : replacement;
+            return Cfg().headTracking ? Mat4Multiply(headRotation, replacement) : replacement;
         }
 
         const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
         const Mat4 correction = Cfg().headTracking
-            ? Mat4Multiply(translation, m_headRotation)
+            ? Mat4Multiply(translation, headRotation)
             : translation;
 
         return Mat4Multiply(correction, replacement);
@@ -525,6 +780,101 @@ namespace wowvr
         return ok;
     }
 
+    // A world-to-view matrix places the camera at the origin, so the camera's world
+    // position is the point the matrix sends there: undo the translation, then undo the
+    // rotation. The rotation is orthonormal for a genuine view matrix, so its transpose
+    // is its inverse and no general solve is needed.
+    void ProjectionPatch::NoteWorldView(const Mat4& worldView)
+    {
+        ++m_residualsSeen;
+
+        // Position turned out to be unrecoverable - the client hands the GPU geometry
+        // that is already camera-relative, so every residual translation is zero. The
+        // rotation survives that, though: with the translation gone, what is left for
+        // world-space geometry is exactly the world-to-view rotation, which is the
+        // camera's own orientation. Models that had a placement baked in contribute
+        // their own rotation instead, so the same agreement counting applies - the
+        // orientation the most draws share is the camera's.
+        {
+            const float yaw = Mat4YawOf(worldView);
+            bool counted = false;
+            for (int i = 0; i < m_yawVoteCount && !counted; ++i)
+            {
+                if (fabsf(WrapRadians(m_yawVotes[i].yaw - yaw)) < 0.01f)
+                {
+                    ++m_yawVotes[i].count;
+                    counted = true;
+                }
+            }
+            if (!counted && m_yawVoteCount < kPositionVotes)
+            {
+                m_yawVotes[m_yawVoteCount].yaw = yaw;
+                m_yawVotes[m_yawVoteCount].count = 1;
+                ++m_yawVoteCount;
+            }
+        }
+
+        // The camera register itself divides out to the identity, and an identity
+        // residual puts the camera at the world origin - which is what the first run of
+        // this swamped the vote with. Those uploads carry no camera information, so they
+        // are not entitled to a vote.
+        //
+        // Rigidity is deliberately NOT required. A first attempt insisted on it and
+        // rejected every one of seven million residuals, which says the matrices
+        // reaching this path carry scale - model placements rather than the plain view.
+        const float translationLength =
+            fabsf(worldView.m[3][0]) + fabsf(worldView.m[3][1]) + fabsf(worldView.m[3][2]);
+        if (translationLength < 1.0f)
+        {
+            ++m_residualsNearOrigin;
+            return;
+        }
+        if (LooksLikeRigidPlacement(worldView))
+        {
+            ++m_residualsRigid;
+        }
+
+        Vec3 position;
+        position.x = -(worldView.m[3][0] * worldView.m[0][0]
+                     + worldView.m[3][1] * worldView.m[0][1]
+                     + worldView.m[3][2] * worldView.m[0][2]);
+        position.y = -(worldView.m[3][0] * worldView.m[1][0]
+                     + worldView.m[3][1] * worldView.m[1][1]
+                     + worldView.m[3][2] * worldView.m[1][2]);
+        position.z = -(worldView.m[3][0] * worldView.m[2][0]
+                     + worldView.m[3][1] * worldView.m[2][1]
+                     + worldView.m[3][2] * worldView.m[2][2]);
+
+        for (int i = 0; i < m_positionVoteCount; ++i)
+        {
+            const Vec3& seen = m_positionVotes[i].position;
+            if (fabsf(seen.x - position.x) < 0.05f
+                && fabsf(seen.y - position.y) < 0.05f
+                && fabsf(seen.z - position.z) < 0.05f)
+            {
+                ++m_positionVotes[i].count;
+                return;
+            }
+        }
+
+        if (m_positionVoteCount < kPositionVotes)
+        {
+            m_positionVotes[m_positionVoteCount].position = position;
+            m_positionVotes[m_positionVoteCount].count = 1;
+            ++m_positionVoteCount;
+        }
+    }
+
+    bool ProjectionPatch::CameraWorldPosition(Vec3& out) const
+    {
+        if (!m_haveCameraPosition)
+        {
+            return false;
+        }
+        out = m_cameraPosition;
+        return true;
+    }
+
     bool ProjectionPatch::TryPatchCombined(const float* uploaded, float* outLeft, float* outRight)
     {
         ++m_combinedTried;
@@ -567,6 +917,7 @@ namespace wowvr
         // Everything the game baked in ahead of the projection: world, view, and any
         // per-object placement. It is kept exactly as-is.
         const Mat4 worldView = Mat4Multiply(combined, inverseScene);
+        NoteWorldView(worldView);
 
         // NOTE: rejecting an identity residual here (which is what the camera register
         // itself produces, since P * inverse(P) = I) was tried and is NOT correct as a

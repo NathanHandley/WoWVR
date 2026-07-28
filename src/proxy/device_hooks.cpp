@@ -7,6 +7,8 @@
 #include "core/paths.h"
 #include "diag/frame_report.h"
 #include "game/camera_probe.h"
+#include "game/field_watch.h"
+#include "game/game_camera.h"
 #include "present/d3d12_present.h"
 #include "present/gl_interop.h"
 #include "present/presenter.h"
@@ -580,6 +582,10 @@ namespace wowvr
         unsigned long long g_shadowCascadesWidened = 0;
         IDirect3DSurface9* g_shadowSurface = nullptr;
         bool g_dumpShadowMapNext = false;
+
+        // Numbered eye-buffer captures, so a sweep of the horizon keeps every frame.
+        bool g_dumpNumbered = false;
+        int g_dumpSeriesIndex = 0;
         int g_shadowMapDumpIndex = 0;
         unsigned long long g_shadowMapDraws = 0;
         unsigned long long g_shadowMapPrims = 0;
@@ -665,10 +671,120 @@ namespace wowvr
         // is only called when the answer actually changes.
         bool g_cursorConfined = false;
         RECT g_confinedTo = {};
+        bool g_calibrateKeyDown = false;
 
         bool GameHasFocus()
         {
             return g_gameWindow != nullptr && GetForegroundWindow() == g_gameWindow;
+        }
+
+        // Injected input has to be spread across frames, not sent in a burst.
+        //
+        // A drag sent as fifteen moves inside one Present call does nothing at all: the
+        // client's main thread is blocked in that very call, so it never sees the pointer
+        // in any intermediate position and only picks up the end state after the button
+        // has already come back up. Wheel clicks survive the same treatment because they
+        // are discrete events that queue, which is exactly why the wheel appeared to work
+        // while the drag looked like a dead camera. The calibration's own nudges were
+        // right all along - one move per frame - and this is the same thing for the
+        // command-driven diagnostics.
+        int g_injectDragFrames = 0;
+        bool g_injectDragging = false;
+        int g_injectDragDx = 8;
+        int g_injectDragDy = 0;
+        int g_injectWheelClicks = 0;
+        int g_injectWheelDelta = -120;
+
+        // A head turn stood in for, so the orbit correction can be measured on the desktop.
+        float g_fakeHeadYaw = 0.0f;
+        bool g_compensateOrbit = true;
+        bool g_aimEnabled = true;
+        // Vertical aiming, on now that the pitch field is read out of the client's own code
+        // rather than guessed at. Aspect ratio buys width and cannot buy height, so moving
+        // the client's 58.9-degree vertical band with the head is the only way there is
+        // geometry above and below where you look.
+        bool g_aimPitch = true;
+        bool g_signatureSweepDone = false;
+        bool g_cameraDumped = false;
+
+        // Defeats the client's camera collision by holding the live distance at its
+        // setting. Off permanently: measured being overwritten in the same frame.
+        bool g_pinOrbitRadius = false;
+
+        // Switches off the client's camera collision outright, in its own code. On by
+        // default: with collision in play a head pitch moves the third-person camera by
+        // fourteen yards, and nothing downstream can put that back.
+        // Runtime switch, ANDed with the config one at the point of use - reading Cfg() here
+        // would run before the ini has been loaded.
+        bool g_disableCameraCollision = true;
+
+        // 0 leaves the client's own value alone.
+        float g_cullFovOverride = 0.0f;
+        float g_cullAspectOverride = 0.0f;
+        int g_inWorldFrames = 0;
+        int g_calibrateAfterFrames = 0;
+        int g_locateAttempts = 0;
+
+        // Puts the pointer in the middle of the game window before any injected drag or
+        // wheel click.
+        //
+        // Injected mouse input goes wherever the pointer happens to be, and on a wide
+        // desktop the client's window occupies only the middle of it - so a pointer left
+        // near the left edge is outside the game entirely and every drag and wheel click
+        // lands on whatever is behind it. That failure is silent and looks exactly like
+        // the camera refusing to move, which cost two runs of chasing a stale address
+        // that was never stale.
+        void CentreCursorOnGame()
+        {
+            if (g_gameWindow == nullptr)
+            {
+                return;
+            }
+
+            RECT rect = {};
+            if (!GetClientRect(g_gameWindow, &rect))
+            {
+                return;
+            }
+
+            POINT centre;
+            centre.x = (rect.right - rect.left) / 2;
+            centre.y = (rect.bottom - rect.top) / 2;
+            if (ClientToScreen(g_gameWindow, &centre))
+            {
+                SetCursorPos(centre.x, centre.y);
+            }
+        }
+
+        // One step of whatever injection is outstanding. Called once per frame.
+        void ServiceInjectedInput()
+        {
+            if (g_injectWheelClicks > 0)
+            {
+                mouse_event(MOUSEEVENTF_WHEEL, 0, 0,
+                            static_cast<DWORD>(g_injectWheelDelta), 0);
+                --g_injectWheelClicks;
+                return;
+            }
+
+            if (g_injectDragFrames <= 0)
+            {
+                return;
+            }
+
+            if (!g_injectDragging)
+            {
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                g_injectDragging = true;
+            }
+
+            mouse_event(MOUSEEVENTF_MOVE, g_injectDragDx, g_injectDragDy, 0, 0);
+
+            if (--g_injectDragFrames <= 0)
+            {
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                g_injectDragging = false;
+            }
         }
 
         // Pre-transformed vertices carry absolute screen coordinates and ignore the
@@ -2010,6 +2126,33 @@ namespace wowvr
                                 g_eyeTargets[eye].LockedPixels(),
                                 g_eyeTargets[eye].Width(), g_eyeTargets[eye].Height(),
                                 g_eyeTargets[eye].LockedPitch());
+
+                    // A numbered copy as well, so pressing the key repeatedly builds a
+                    // series instead of overwriting the same two files. That is what
+                    // sweeping a circle to record how a loaded scene should look needs,
+                    // and the fixed names have to stay because the command-file `shot`
+                    // and every driving script read them.
+                    if (g_dumpNumbered)
+                    {
+                        wchar_t name[64];
+                        swprintf_s(name, L"WoWVR_shot_%03d_%s.bmp", g_dumpSeriesIndex,
+                                   eye == EyeLeft ? L"left" : L"right");
+                        SaveBgraBmp(ModuleFile(name).c_str(),
+                                    g_eyeTargets[eye].LockedPixels(),
+                                    g_eyeTargets[eye].Width(), g_eyeTargets[eye].Height(),
+                                    g_eyeTargets[eye].LockedPitch());
+                        if (eye == EyeRight || !stereo)
+                        {
+                            WOWVR_INFO("Shot %03d written (head yaw %.1f deg, pitch %.1f, "
+                                       "roll %.1f).",
+                                       g_dumpSeriesIndex,
+                                       Projection().HeadYaw() * 57.2957795f,
+                                       Projection().HeadPitch() * 57.2957795f,
+                                       Projection().HeadRoll() * 57.2957795f);
+                            ++g_dumpSeriesIndex;
+                            g_dumpNumbered = false;
+                        }
+                    }
                 }
 
                 g_eyeTargets[eye].Unlock();
@@ -2104,8 +2247,11 @@ namespace wowvr
                 // per-frame reset runs, so keying off it there never fires.
                 g_armSequenceNextFrame = (Cfg().dumpEveryNWorldDraws > 0);
                 g_dumpShadowMapNext = true;
-                WOWVR_INFO("F10: eye buffers will be written on the next frame%s.",
-                           g_armSequenceNextFrame ? ", with a mid-frame draw sequence" : "");
+                g_dumpNumbered = true;
+                WOWVR_INFO("Ctrl+Alt+F10: eye buffers will be written on the next frame%s, "
+                           "plus numbered copies WoWVR_shot_%03d_left/right.bmp.",
+                           g_armSequenceNextFrame ? ", with a mid-frame draw sequence" : "",
+                           g_dumpSeriesIndex);
             }
 
             if (HotkeyPressed(Hotkey::Recenter))
@@ -2163,7 +2309,16 @@ namespace wowvr
                 if (Vr().HasHeadPose())
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
-                    g_uiPanel.Update(Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
+                    // Negated, because the panel wants the opposite convention to the world.
+                    //
+                    // PanelToEye composes Mat4RotationY(m_bodyYaw) with m_headRotation and
+                    // rotations about the same axis add their yaws, so the panel points
+                    // straight ahead only when the body yaw is the NEGATIVE of the head's.
+                    // HeadYaw() used to be negated at its source, which suited the panel and
+                    // silently contradicted the head matrix everything else is built from.
+                    // Now that it agrees with the matrix, the negation belongs here - at the
+                    // one consumer that genuinely wants the other sign.
+                    g_uiPanel.Update(-Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
 
                     FindAllCameraRegisters();
                     RefreshPatchedBlocks();
@@ -2251,6 +2406,715 @@ namespace wowvr
                 && Projection().HasSceneProjection())
             {
                 Camera().WatchFovField(Projection().SceneVerticalScale());
+            }
+
+            // Ctrl+Alt+C starts the camera calibration. Edge-triggered, or holding the
+            // keys down would restart it every frame.
+            {
+                const bool combo = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
+                                && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0
+                                && (GetAsyncKeyState('C') & 0x8000) != 0;
+                if (combo && !g_calibrateKeyDown)
+                {
+                    CentreCursorOnGame();
+                    Camera().BeginCalibration();
+                }
+                g_calibrateKeyDown = combo;
+            }
+            // The calibration steers by injecting mouse input, and injected input goes to
+            // whatever window currently has focus - so if anything has taken foreground,
+            // every nudge lands somewhere else and the search quietly starves. That is not
+            // hypothetical: driven by hand right after focusing the window, 1,120 of
+            // 155,000 candidates moved on most rounds; left to fire on its own later, only
+            // 56 did, and the camera was not among them.
+            //
+            // Asserting focus from inside the game's own process works where the same call
+            // from a driving script does not, because Windows lets a process raise its own
+            // window far more readily than a foreign one.
+            if (Camera().Calibrating() && !GameHasFocus() && g_gameWindow != nullptr)
+            {
+                SetForegroundWindow(g_gameWindow);
+                CentreCursorOnGame();
+            }
+
+            Camera().UpdateCalibration();
+            ServiceInjectedInput();
+
+            // The passive search is gone from the frame path.
+            //
+            // It ran a whole-address-space sweep on the render thread every forty-five
+            // frames - `CollectLayoutCandidates` walks every committed read-write region
+            // and collects up to a million entries - which is a visible hitch several times
+            // a second in the headset. And by its own record it never converged during
+            // ordinary play, so it was paying that cost for nothing. The signature sweep
+            // below replaces it: one pass, once, when the world is up.
+            // Waiting for the WORLD, not merely for a scene.
+            //
+            // HasSceneProjection is true on the login screen too - it is a 3D scene like
+            // any other - so gating on that alone ran the whole search ten seconds in,
+            // against a client that had not loaded a world camera yet. It duly found two
+            // login-screen buffers, whose yaw copies had collapsed to 0.0 and 0.5 by the
+            // time it tried to confirm them.
+            //
+            // The far plane tells the two apart and is already decoded: the login screen
+            // uses 2778, the world 791. Measured, not assumed.
+            const bool inWorld = Projection().HasSceneProjection()
+                              && Projection().SceneFar() > 1.0f
+                              && Projection().SceneFar() < 1500.0f;
+
+            // And settled, not merely arrived: the frame counter runs from launch, so it
+            // is already long past any threshold by the time the world appears.
+            if (inWorld) { ++g_inWorldFrames; } else { g_inWorldFrames = 0; }
+
+            // Zoomed out before anything else, because the zoom level persists between
+            // sessions and the camera had been left in first person. There the orbit
+            // radius is zero, which fails verification and excludes the camera from any
+            // search keyed on the radius - and nothing in the log says "you are in first
+            // person", it just looks like the camera cannot be found. Six clicks out costs
+            // a moment and removes the whole class of confusion.
+            // What aspect ratio the client actually needs, computed rather than guessed.
+            //
+            // WoW derives horizontal field of view from the resolution's aspect and holds
+            // vertical fixed, so covering the headset is arithmetic: the aspect required is
+            // the ratio of the eye's horizontal tangent to the game's vertical one. Logged
+            // once so the gxResolution to put in Config.wtf is a measurement, not a guess.
+            if (g_frameCount == 900 && Vr().IsActive())
+            {
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(EyeLeft, tanLeft, tanRight, tanTop, tanBottom);
+                const float halfH = (fabsf(tanLeft) > fabsf(tanRight))
+                                  ? fabsf(tanLeft) : fabsf(tanRight);
+                const float halfV = (fabsf(tanTop) > fabsf(tanBottom))
+                                  ? fabsf(tanTop) : fabsf(tanBottom);
+                const float* gameHalfFov = reinterpret_cast<const float*>(0x00ABFC38u);
+                const float gameTanV = tanf(*gameHalfFov);
+
+                WOWVR_INFO("Eye frustum: %.1f deg horizontal, %.1f deg vertical. "
+                           "Game culls %.1f deg vertical.",
+                           2.0f * atanf(halfH) * 57.2957795f,
+                           2.0f * atanf(halfV) * 57.2957795f,
+                           2.0f * (*gameHalfFov) * 57.2957795f);
+                WOWVR_INFO("Aspect needed to cover one eye: %.2f (e.g. %dx1080). "
+                           "With 25%% margin: %.2f (e.g. %dx1080).",
+                           halfH / gameTanV, static_cast<int>(halfH / gameTanV * 1080.0f),
+                           halfH / gameTanV * 1.25f,
+                           static_cast<int>(halfH / gameTanV * 1.25f * 1080.0f));
+            }
+
+            // What the head says, what went into the client, and what the client holds now -
+            // on one line, so a sign that is still wrong is visible from the log alone
+            // rather than needing another round of screenshots to diagnose.
+            if ((g_frameCount % 300) == 0 && Vr().IsActive() && GameCam().Found())
+            {
+                WOWVR_INFO("Aim: head yaw %+.1f pitch %+.1f deg -> wrote yaw %+.1f pitch "
+                           "%+.1f deg (signs %+.0f/%+.0f); camera holds yaw %+.1f pitch "
+                           "%+.1f deg.",
+                           Projection().HeadYaw() * 57.2957795f,
+                           Projection().HeadPitch() * 57.2957795f,
+                           GameCam().AppliedYaw() * GameCam().YawSign() * 57.2957795f,
+                           GameCam().AppliedPitch() * GameCam().PitchSign() * 57.2957795f,
+                           GameCam().YawSign(), GameCam().PitchSign(),
+                           GameCam().FreeLookYawField() * 57.2957795f,
+                           GameCam().FreeLookPitchField() * 57.2957795f);
+
+                // What the camera is ACTUALLY pointing at, from its own basis vectors.
+                //
+                // Asked-for and achieved are different things: the client clamps pitch
+                // against a limit that is itself a field, and looking straight down is
+                // exactly where that bites. Comparing the two is the only scene-independent
+                // way to see it - a first-person view of the ground is featureless snow, and
+                // every pixel-based test simply reads zero there.
+                float facingYaw = 0.0f, facingPitch = 0.0f;
+                if (GameCam().CameraFacing(facingYaw, facingPitch))
+                {
+                    WOWVR_INFO("Camera facing: yaw %+.1f pitch %+.1f deg; base pitch %+.1f, "
+                               "pitch-limit field %+.4f; asked for pitch offset %+.1f deg.",
+                               facingYaw * 57.2957795f, facingPitch * 57.2957795f,
+                               GameCam().BasePitch() * 57.2957795f,
+                               GameCam().PitchLimitField(),
+                               GameCam().FreeLookPitchField() * 57.2957795f);
+                }
+
+                // Positional tracking, reported because "the viewpoint does not move" is
+                // otherwise indistinguishable from "the head is not moving": this says
+                // whether the displacement reaching the projection is zero or merely
+                // being ignored further along.
+                Vec3 orbitShiftForLog;
+                GameCam().OrbitDisplacementView(GameCam().AppliedYaw(), orbitShiftForLog);
+
+                WOWVR_INFO("Head displacement: (%.3f, %.3f, %.3f) m; orbit radius %.2f "
+                           "yards, camera swung (%.2f, %.2f, %.2f) yards; scene fov %.1f deg "
+                           "vertical, %.1f deg horizontal.",
+                           Projection().HeadOffsetMetres().x,
+                           Projection().HeadOffsetMetres().y,
+                           Projection().HeadOffsetMetres().z,
+                           GameCam().OrbitRadius(), orbitShiftForLog.x, orbitShiftForLog.y,
+                           orbitShiftForLog.z,
+                           2.0f * atanf(1.0f / Projection().SceneVerticalScale())
+                               * 57.2957795f,
+                           2.0f * atanf(Projection().SceneAspect()
+                                        / Projection().SceneVerticalScale())
+                               * 57.2957795f);
+            }
+
+            if ((g_frameCount % 300) == 0 && Vr().IsActive())
+            {
+                WOWVR_INFO("Head orientation: yaw %.1f deg, pitch %.1f deg, roll %.1f deg%s",
+                           Projection().HeadYaw() * 57.2957795f,
+                           Projection().HeadPitch() * 57.2957795f,
+                           Projection().HeadRoll() * 57.2957795f,
+                           (fabsf(Projection().HeadRoll()) > 0.17f
+                            || fabsf(Projection().HeadPitch()) > 0.26f)
+                               ? "  <- tilted; yaw is not a reliable facing" : "");
+            }
+
+            // Long enough for the world to appear, and no longer.
+            //
+            // This used to wait 4000 in-world frames because the page-narrowing phase
+            // discarded the camera's page while anything was still streaming. That phase is
+            // gone - the signature sweep does not care - and the wait outlived it, which
+            // made the feature unreachable for the first three minutes in the world. A user
+            // testing at 40 seconds saw no head-driven culling at all and reasonably
+            // concluded it did not work; the log showed the search had never even started.
+            //
+            // Nothing that ships should require the user to wait several minutes before it
+            // begins to function.
+            if (Cfg().autoLocateCamera && !Camera().Calibrating()
+                && !Camera().CameraLocated() && !g_signatureSweepDone
+                && !GameCam().Found()
+                && g_inWorldFrames > 600)
+            {
+                g_signatureSweepDone = true;
+
+                // Focus asserted here too, not just during the calibration. The zoom-out
+                // runs BEFORE the calibration starts, so it was never covered by the
+                // foreground check - its wheel clicks went to whatever else had focus, the
+                // camera stayed in first person with a zero orbit radius, and the search
+                // then had no radius to recognise it by.
+                if (!GameHasFocus() && g_gameWindow != nullptr)
+                {
+                    SetForegroundWindow(g_gameWindow);
+                }
+                CentreCursorOnGame();
+                g_injectWheelDelta = -120;
+                g_injectWheelClicks = 6;
+                g_calibrateAfterFrames = 150;
+                WOWVR_INFO("Zooming out to third person before locating the camera.");
+            }
+
+            if (g_calibrateAfterFrames > 0 && --g_calibrateAfterFrames == 0)
+            {
+                CentreCursorOnGame();
+                Camera().BeginCalibration();
+            }
+
+            // Retried on failure. The search depends on the camera's page surviving five
+            // rounds of scoring, which it does most of the time but not always - one run in
+            // seven ends with a candidate that verification correctly throws out. Leaving
+            // the feature silently off after that is the worst outcome, and another attempt
+            // costs half a minute.
+            if (Cfg().autoLocateCamera && Camera().LocateFailed()
+                && !Camera().Calibrating() && !GameCam().Found() && g_locateAttempts < 3)
+            {
+                ++g_locateAttempts;
+                Camera().ResetLocate();
+
+                // Zoomed out again on each retry: if the first attempt failed because the
+                // camera was still in first person, repeating the search without fixing
+                // that just fails the same way.
+                if (!GameHasFocus() && g_gameWindow != nullptr)
+                {
+                    SetForegroundWindow(g_gameWindow);
+                }
+                CentreCursorOnGame();
+                g_injectWheelDelta = -120;
+                g_injectWheelClicks = 6;
+                g_calibrateAfterFrames = 300;
+                WOWVR_INFO("Camera search failed; retrying (attempt %d of 3).",
+                           g_locateAttempts + 1);
+            }
+
+            // Turn the game's own camera to follow the head, then tell the projection how
+            // much of the head rotation has already been accounted for so it does not
+            // apply it a second time.
+            // The fake yaw exists so the orbit correction can be checked without a headset
+            // on: it drives exactly the path a real head turn drives, and the character
+            // staying put on screen versus sliding off is what says whether the correction
+            // has the right sign. "orbit" applies it, "orbitoff" leaves the radius at zero
+            // so the two can be compared in one session.
+            // One path, whether the head turn is real or synthetic: the fake yaw is folded
+            // into HeadYaw() at its source, so nothing here can tell the difference. The
+            // aiming toggle exists to provide the control case - the view turns either way,
+            // but only with aiming on does the client cull for where it now points.
+            // The camera the client itself uses, reached the way the client reaches it.
+            // Two dereferences, so this is re-run every frame rather than located once:
+            // the object is destroyed and rebuilt across every loading screen.
+            const bool haveGameCamera = GameCam().Update();
+
+            // Camera collision has to go for third person to be usable at all: aiming the
+            // camera at the head sweeps it through the ground and the client answers by
+            // hauling it in, which moves the viewpoint yards at a time. This is a one-byte
+            // patch to the client's code and costs nothing to re-assert, because SetCollision
+            // returns immediately when the byte is already what it wants.
+            // Restored whenever VR is not driving the camera, so a flat session in the same
+            // client behaves the way the client shipped.
+            GameCam().SetCollision(!(g_disableCameraCollision && Cfg().disableCameraCollision
+                                     && Vr().IsActive()));
+
+            if (haveGameCamera && Vr().IsActive() && inWorld && !g_cameraDumped)
+            {
+                g_cameraDumped = true;
+                GameCam().DumpObject(Projection().SceneNear(), Projection().SceneFar(),
+                                     *reinterpret_cast<const float*>(0x00ABFC38u));
+            }
+
+            // Margin around wherever the head points, so the one frame between aiming the
+            // camera and the client culling against it cannot show through. An explicit
+            // override from a command wins, so the two can still be compared in one session.
+            if (haveGameCamera && g_cullFovOverride <= 0.0f && Vr().IsActive())
+            {
+                GameCam().SetCullWiden(Cfg().cullWidenScale);
+            }
+
+            if (haveGameCamera
+                && (g_cullFovOverride > 0.0f || g_cullAspectOverride > 0.0f))
+            {
+                GameCam().SetCullFrustum(g_cullFovOverride, g_cullAspectOverride);
+            }
+
+            if (g_aimEnabled && Cfg().aimCameraAtHead && haveGameCamera)
+            {
+                // The client ADDS these to the heading the camera would otherwise have, so
+                // writing them turns the view and leaves the character alone. Both are
+                // absolute intent restated every frame, not deltas: the client owns the
+                // fields between our writes.
+                GameCam().SetFreeLook(Projection().HeadYaw(),
+                                      g_aimPitch ? Projection().HeadPitch() : 0.0f);
+
+                // And taken straight back out of the projection we substitute, or the head
+                // rotation lands twice and the world turns at double rate.
+                Projection().SetGameCameraYaw(GameCam().AppliedYaw());
+                Projection().SetGameCameraPitch(GameCam().AppliedPitch());
+                // Before anything reads the radius: collision is the dominant motion in
+                // third person, and pinning it is the only thing that addresses that.
+                GameCam().PinOrbitRadius(g_pinOrbitRadius);
+
+                Projection().SetGameCameraOrbitRadius(
+                    g_compensateOrbit ? GameCam().OrbitRadius() : 0.0f);
+
+                // Measured from the camera's own position and basis, not predicted from a
+                // radius: the client pulls the camera in against terrain, so the radius is
+                // not the constant the old model assumed it was.
+                Vec3 orbitShift;
+                if (g_compensateOrbit
+                    && GameCam().OrbitDisplacementView(GameCam().AppliedYaw(), orbitShift))
+                {
+                    Projection().SetOrbitDisplacement(orbitShift);
+                }
+                else
+                {
+                    Projection().SetOrbitDisplacement(Vec3());
+                }
+            }
+            else if (g_aimEnabled && Cfg().aimCameraAtHead && Camera().CameraLocated())
+            {
+                // Fallback for a client whose layout does not match the one decoded from
+                // this build. Kept because it is proven to steer, not because it is good.
+                Camera().AimAtHead(Projection().HeadYaw());
+                Projection().SetGameCameraYaw(Camera().AppliedYaw());
+                Projection().SetGameCameraOrbitRadius(
+                    g_compensateOrbit ? Camera().OrbitRadius() : 0.0f);
+
+                if (g_aimPitch)
+                {
+                    Camera().AimPitchAtHead(Projection().HeadPitch());
+                    Projection().SetGameCameraPitch(Camera().AppliedPitch());
+                }
+                else
+                {
+                    Projection().SetGameCameraPitch(0.0f);
+                }
+            }
+            else
+            {
+                if (haveGameCamera) { GameCam().ClearFreeLook(); }
+                Projection().SetGameCameraYaw(0.0f);
+                Projection().SetGameCameraOrbitRadius(0.0f);
+                Projection().SetGameCameraPitch(0.0f);
+            }
+
+            Camera().ApplyHeadingWrite();
+            Camera().ApplyFovOverride();
+
+            // A one-line file dropped next to the client drives the differential scan.
+            // The phases have to line up with the character actually turning, and a file
+            // is the one channel that cannot be swallowed by whatever currently has
+            // keyboard focus - which is exactly how the first attempt at driving this
+            // went wrong.
+            if ((g_frameCount % 15) == 0)
+            {
+                const std::wstring commandFile = ModuleFile(L"WoWVR_cmd.txt");
+                HANDLE handle = CreateFileW(commandFile.c_str(), GENERIC_READ,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (handle != INVALID_HANDLE_VALUE)
+                {
+                    char command[32] = {};
+                    DWORD read = 0;
+                    ReadFile(handle, command, sizeof(command) - 1, &read, nullptr);
+                    CloseHandle(handle);
+                    DeleteFileW(commandFile.c_str());
+
+                    // The same calibration Ctrl+Alt+C runs, but reachable without keyboard
+                    // focus - SteamVR takes focus while it starts up and silently swallows
+                    // the hotkey, which is what made the run impossible to drive from a
+                    // script. No prefix collision: "chain" is compared over five characters.
+                    if (strncmp(command, "calibrate", 9) == 0)
+                    {
+                        CentreCursorOnGame();
+                        Camera().BeginCalibration();
+                    }
+                    else if (strncmp(command, "snapshot", 8) == 0) { Camera().SnapshotDifferential(); }
+                    else if (strncmp(command, "right", 5) == 0)  { Camera().FilterDifferential(1); }
+                    else if (strncmp(command, "left", 4) == 0)   { Camera().FilterDifferential(-1); }
+                    else if (strncmp(command, "still", 5) == 0)  { Camera().FilterDifferential(0); }
+                    else if (strncmp(command, "report", 6) == 0) { Camera().ReportDifferential(); }
+                    else if (strncmp(command, "yawa", 4) == 0)   { Camera().SetHeadingWrite(1, 1.0f); }
+                    else if (strncmp(command, "yawb", 4) == 0)   { Camera().SetHeadingWrite(2, 1.0f); }
+                    else if (strncmp(command, "yawoff", 6) == 0) { Camera().SetHeadingWrite(0, 0.0f); }
+                    // The desktop window only mirrors the interface, so the world can
+                    // only be seen by capturing the eye buffer itself.
+                    else if (strncmp(command, "shot", 4) == 0)   { g_dumpNextFrame = true; }
+                    // "holdall" must be tested before "hold", or the prefix swallows it.
+                    else if (strncmp(command, "holdall", 7) == 0) { Camera().HoldSurvivors(true, 1.57f); }
+                    else if (strncmp(command, "aim", 3) == 0)    { Camera().SetHeadingWrite(1, 1.57f); }
+                    else if (strncmp(command, "unaim", 5) == 0)  { Camera().SetHeadingWrite(0, 0.0f); }
+                    else if (strncmp(command, "release", 7) == 0) { Camera().HoldHeading(false, 0.0f); }
+                    else if (strncmp(command, "pagesnap", 8) == 0) { Camera().SnapshotPages(); }
+                    else if (strncmp(command, "pagemoved", 9) == 0) { Camera().FilterPages(true); }
+                    else if (strncmp(command, "pagestill", 9) == 0) { Camera().FilterPages(false); }
+                    else if (strncmp(command, "promote", 7) == 0)  { Camera().PromotePagesToFloats(); }
+                    else if (strncmp(command, "freeall", 7) == 0)  { Camera().HoldSurvivors(false, 0.0f); }
+                    else if (strncmp(command, "chain", 5) == 0)    { Camera().FindPointerChain(); }
+                    // The stimulus is injected from here rather than from the driving
+                    // script, because input sent from outside gets swallowed - a scripted
+                    // drag left the yaw completely untouched while the calibration's own
+                    // drags, sent from this thread, move it every time. Blocking the render
+                    // thread for a second is fine for a diagnostic.
+                    // Zooming IN is the more useful stimulus: the camera starts at or near
+                    // its maximum distance, so scrolling out has almost nowhere to travel
+                    // and produces a change barely above the frame-to-frame noise, while
+                    // scrolling in runs all the way to first person.
+                    else if (strncmp(command, "wheelin", 7) == 0)
+                    {
+                        CentreCursorOnGame();
+                        g_injectWheelClicks = 8;
+                        g_injectWheelDelta = 120;
+                        WOWVR_INFO("Queued eight wheel-up clicks, one per frame.");
+                    }
+                    else if (strncmp(command, "wheelout", 8) == 0)
+                    {
+                        CentreCursorOnGame();
+                        g_injectWheelClicks = 8;
+                        g_injectWheelDelta = -120;
+                        WOWVR_INFO("Queued eight wheel-down clicks, one per frame.");
+                    }
+                    else if (strncmp(command, "nudge", 5) == 0)
+                    {
+                        CentreCursorOnGame();
+                        g_injectDragDx = 8; g_injectDragDy = 0;
+                        g_injectDragFrames = 15;
+                        WOWVR_INFO("Queued one drag nudge, one move per frame.");
+                    }
+                    // A vertical drag pitches the camera, which is what identifies the
+                    // pitch field the same way the horizontal one identified the yaw.
+                    else if (strncmp(command, "pitchnudge", 10) == 0)
+                    {
+                        CentreCursorOnGame();
+                        g_injectDragDx = 0; g_injectDragDy = 6;
+                        g_injectDragFrames = 15;
+                        WOWVR_INFO("Queued one vertical drag nudge.");
+                    }
+                    // A head turn of an arbitrary size, standing in for the headset.
+                    //
+                    // This drives the identical path a real head turn drives - the same
+                    // AimAtHead, the same yaw written into the camera, the same
+                    // compensation in the projection - so what it tests is the mechanism
+                    // itself rather than an imitation of it. Only the HMD pose plumbing is
+                    // bypassed, and that is independently known to work. It is what makes
+                    // head-driven culling testable with the headset sitting still on a desk.
+                    else if (strncmp(command, "head ", 5) == 0)
+                    {
+                        g_fakeHeadYaw = static_cast<float>(atof(command + 5));
+                        Projection().SetFakeHeadYaw(g_fakeHeadYaw);
+                        g_compensateOrbit = true;
+                        WOWVR_INFO("Fake head yaw %.3f rad (%.1f deg); aiming %s.",
+                                   g_fakeHeadYaw, g_fakeHeadYaw * 57.2957795f,
+                                   g_aimEnabled ? "on" : "off");
+                    }
+                    // Not "aimon"/"aimoff": an earlier test for "aim" over three characters
+                    // would swallow both, which is the same prefix trap that once made
+                    // "holdall" silently run the wrong experiment.
+                    else if (strncmp(command, "headpitch ", 10) == 0)
+                    {
+                        const float p = static_cast<float>(atof(command + 10));
+                        Projection().SetFakeHeadPitch(p);
+                        WOWVR_INFO("Fake head pitch %.3f rad (%.1f deg).",
+                                   p, p * 57.2957795f);
+                    }
+                    // The frustum the client culls against, now that the renderer's own copy
+                    // of it has been found inside the camera object. Reported after the
+                    // write as well as before, because the interesting question is not what
+                    // we set but whether the client leaves it set.
+                    else if (strncmp(command, "cullaspect ", 11) == 0)
+                    {
+                        g_cullAspectOverride = static_cast<float>(atof(command + 11));
+                        WOWVR_INFO("Cull aspect override %.3f (was reading %.4f).",
+                                   g_cullAspectOverride, GameCam().CullAspect());
+                    }
+                    else if (strncmp(command, "cullfov ", 8) == 0)
+                    {
+                        g_cullFovOverride = static_cast<float>(atof(command + 8));
+                        WOWVR_INFO("Cull fov override %.4f rad (was reading %.4f).",
+                                   g_cullFovOverride, GameCam().CullFov());
+                    }
+                    else if (strncmp(command, "orbitsign ", 10) == 0)
+                    {
+                        const float s = static_cast<float>(atof(command + 10));
+                        Projection().SetOrbitSign(s);
+                        WOWVR_INFO("Orbit correction sign %+.0f.", Projection().OrbitSign());
+                    }
+                    else if (strncmp(command, "unwindpitchfirst", 16) == 0)
+                    {
+                        Projection().SetUnwindPitchFirst(true);
+                        WOWVR_INFO("Unwinding PITCH first (the old order, which rolls).");
+                    }
+                    else if (strncmp(command, "unwindyawfirst", 14) == 0)
+                    {
+                        Projection().SetUnwindPitchFirst(false);
+                        WOWVR_INFO("Unwinding YAW first (correct for a yaw-then-pitch camera).");
+                    }
+                    // "headmove <x> <y> <z>" in metres: a lean or a step, without moving the
+                    // headset. x is right, y is up, z is forward.
+                    else if (strncmp(command, "headmove ", 9) == 0)
+                    {
+                        Vec3 offset;
+                        sscanf(command + 9, "%f %f %f", &offset.x, &offset.y, &offset.z);
+                        Projection().SetFakeHeadOffset(offset);
+                        WOWVR_INFO("Fake head displacement (%.2f, %.2f, %.2f) m.",
+                                   offset.x, offset.y, offset.z);
+                    }
+                    // "gcsigns <yaw> <pitch>", each +1 or -1.
+                    else if (strncmp(command, "gcsigns ", 8) == 0)
+                    {
+                        float y = 1.0f, p = -1.0f;
+                        sscanf(command + 8, "%f %f", &y, &p);
+                        GameCam().SetSigns(y, p);
+                    }
+                    else if (strncmp(command, "cullread", 8) == 0)
+                    {
+                        WOWVR_INFO("Cull frustum now reads fov %.4f rad, aspect %.4f; "
+                                   "overrides are fov %.4f, aspect %.4f.",
+                                   GameCam().CullFov(), GameCam().CullAspect(),
+                                   g_cullFovOverride, g_cullAspectOverride);
+                    }
+                    else if (strncmp(command, "pitchaimon", 10) == 0)
+                    {
+                        g_aimPitch = true;
+                        WOWVR_INFO("Pitch aiming ON.");
+                    }
+                    else if (strncmp(command, "pitchaimoff", 11) == 0)
+                    {
+                        g_aimPitch = false;
+                        WOWVR_INFO("Pitch aiming OFF.");
+                    }
+                    else if (strncmp(command, "headaimon", 9) == 0)
+                    {
+                        g_aimEnabled = true;
+                        WOWVR_INFO("Camera aiming ON: the client culls where the head looks.");
+                    }
+                    else if (strncmp(command, "headaimoff", 10) == 0)
+                    {
+                        g_aimEnabled = false;
+                        WOWVR_INFO("Camera aiming OFF: the view turns but the client does not.");
+                    }
+                    // Toggle the orbit correction and NOTHING else.
+                    //
+                    // "orbit" and "orbitnone" below also set the fake head yaw - 0.6 rad and
+                    // zero respectively - which made them useless as toggles and quietly
+                    // invalidated three rounds of measurement: every arm was captured at a
+                    // different head angle from the one the test had asked for, so the
+                    // comparison was between unrelated views and no arm could win.
+                    // "watch <hex field offset>" - trap on writes to that field of the camera
+                    // object and name the instructions responsible. "watchradius" is the
+                    // shorthand for the camera distance at +0x118.
+                    else if (strncmp(command, "watchradius", 11) == 0 ||
+                             strncmp(command, "watch ", 6) == 0)
+                    {
+                        unsigned offset = 0x118u;
+                        if (strncmp(command, "watch ", 6) == 0)
+                        {
+                            sscanf(command + 6, "%x", &offset);
+                        }
+                        if (!GameCam().Found())
+                        {
+                            WOWVR_INFO("No game camera to watch yet.");
+                        }
+                        else
+                        {
+                            const void* field = reinterpret_cast<const void*>(
+                                GameCam().Address() + offset);
+                            WOWVR_INFO("Watching camera +0x%X at 0x%p.", offset, field);
+                            Watch().Arm(field);
+                        }
+                    }
+                    else if (strncmp(command, "watchreport", 11) == 0)
+                    {
+                        Watch().Report();
+                    }
+                    else if (strncmp(command, "watchreset", 10) == 0)
+                    {
+                        Watch().Reset();
+                        WOWVR_INFO("Field watch cleared; next report covers only what follows.");
+                    }
+                    else if (strncmp(command, "watchoff", 8) == 0)
+                    {
+                        Watch().Disarm();
+                    }
+                    // Where the camera actually is, right now. Sampled with aiming on and
+                    // again with it off, the difference is the orbit displacement with no
+                    // convention involved - which is the only way to check the one that is
+                    // computed from angles.
+                    else if (strncmp(command, "campos", 6) == 0)
+                    {
+                        Vec3 p, f, u;
+                        if (GameCam().CameraPose(p, f, u))
+                        {
+                            Vec3 predicted;
+                            GameCam().OrbitDisplacementView(GameCam().AppliedYaw(), predicted);
+                            WOWVR_INFO("Camera pose: pos (%.4f, %.4f, %.4f) fwd (%.4f, %.4f, "
+                                       "%.4f) up (%.4f, %.4f, %.4f) radius %.3f; "
+                                       "predicted swing (%.3f, %.3f, %.3f).",
+                                       p.x, p.y, p.z, f.x, f.y, f.z, u.x, u.y, u.z,
+                                       GameCam().OrbitRadius(),
+                                       predicted.x, predicted.y, predicted.z);
+                        }
+                        else
+                        {
+                            WOWVR_INFO("Camera pose unavailable.");
+                        }
+                    }
+                    else if (strncmp(command, "collisionoff", 12) == 0)
+                    {
+                        g_disableCameraCollision = true;
+                        GameCam().SetCollision(false);
+                    }
+                    else if (strncmp(command, "collisionon", 11) == 0)
+                    {
+                        g_disableCameraCollision = false;
+                        GameCam().SetCollision(true);
+                    }
+                    else if (strncmp(command, "pinradiuson", 11) == 0)
+                    {
+                        g_pinOrbitRadius = true;
+                        WOWVR_INFO("Pinning the camera distance (defeating collision).");
+                    }
+                    else if (strncmp(command, "pinradiusoff", 12) == 0)
+                    {
+                        g_pinOrbitRadius = false;
+                        WOWVR_INFO("Camera distance left to the client.");
+                    }
+                    else if (strncmp(command, "orbitcompoff", 12) == 0)
+                    {
+                        g_compensateOrbit = false;
+                        WOWVR_INFO("Orbit correction OFF (head angle untouched).");
+                    }
+                    else if (strncmp(command, "orbitcompon", 11) == 0)
+                    {
+                        g_compensateOrbit = true;
+                        WOWVR_INFO("Orbit correction ON (head angle untouched).");
+                    }
+                    // "orbitoff" before "orbit", or the shorter prefix swallows it.
+                    else if (strncmp(command, "orbitoff", 8) == 0)
+                    {
+                        g_fakeHeadYaw = 0.6f;
+                        g_compensateOrbit = false;
+                        WOWVR_INFO("Fake head turn of 0.6 rad, orbit correction OFF; "
+                                   "radius reads %.3f yards.", Camera().OrbitRadius());
+                    }
+                    else if (strncmp(command, "orbitnone", 9) == 0)
+                    {
+                        g_fakeHeadYaw = 0.0f;
+                        g_compensateOrbit = true;
+                        WOWVR_INFO("Fake head turn cleared.");
+                    }
+                    else if (strncmp(command, "orbit", 5) == 0)
+                    {
+                        g_fakeHeadYaw = 0.6f;
+                        g_compensateOrbit = true;
+                        WOWVR_INFO("Fake head turn of 0.6 rad, orbit correction ON; "
+                                   "radius reads %.3f yards.", Camera().OrbitRadius());
+                    }
+                    else if (strncmp(command, "fovscan", 7) == 0)
+                    {
+                        // The value to look for comes from the global that was already
+                        // identified and verified against the projection on the wire.
+                        const float* global = reinterpret_cast<const float*>(0x00ABFC38u);
+                        Camera().ScanCameraObjectForFov(*global);
+                    }
+                    // Writing the global is the stimulus, not the fix. It is inert on
+                    // screen, but the client copies it into the active camera every frame,
+                    // so whatever moves in the camera object when this is written IS the
+                    // copy the renderer reads. Guessing at encodings found nothing; this
+                    // asks the client to point at the field itself.
+                    else if (strncmp(command, "globalfov", 9) == 0)
+                    {
+                        Camera().WidenGameFovByFactor(1.35f);
+                        WOWVR_INFO("Global field of view widened by 1.35 as a stimulus.");
+                    }
+                    else if (strncmp(command, "fovcopies", 9) == 0)
+                    {
+                        const float* global = reinterpret_cast<const float*>(0x00ABFC38u);
+                        Camera().ScanForFovCopies(*global);
+                    }
+                    else if (strncmp(command, "fovrestore", 10) == 0)
+                    {
+                        Camera().RestoreGameFov();
+                        WOWVR_INFO("Global field of view restored.");
+                    }
+                    else if (strncmp(command, "fovwiden", 8) == 0) { Camera().SetFovOverride(1.35f); }
+                    else if (strncmp(command, "fovoff", 6) == 0)   { Camera().SetFovOverride(0.0f); }
+                    else if (strncmp(command, "sig", 3) == 0)   { Camera().ScanForCameraSignature(); }
+                    else if (strncmp(command, "zoomsnap", 8) == 0) { Camera().ZoomSnapshot(); }
+                    else if (strncmp(command, "zoomidle", 8) == 0) { Camera().ZoomReport("idle"); }
+                    else if (strncmp(command, "zoomed", 6) == 0)   { Camera().ZoomReport("zoomed"); }
+                    else if (strncmp(command, "turned", 6) == 0)   { Camera().ZoomReport("turned"); }
+                    else if (strncmp(command, "verify", 6) == 0)   { Camera().VerifyCameraChain(); }
+                }
+            }
+
+            if (Cfg().watchCameraStruct)
+            {
+                Vec3 cameraPosition;
+                const bool havePosition = Projection().CameraWorldPosition(cameraPosition);
+                Camera().WatchCameraStruct(cameraPosition, havePosition);
+
+                if ((g_frameCount % 120) == 0)
+                {
+                    float gameYaw = 0.0f;
+                    const bool haveYaw = Projection().CameraYaw(gameYaw);
+                    WOWVR_INFO("Game camera yaw: %s%.4f rad (%.1f deg), agreed by %d draws; "
+                               "head yaw %.4f rad (%.1f deg)",
+                               haveYaw ? "" : "(none) ", gameYaw, gameYaw * 57.2957795f,
+                               Projection().CameraYawWeight(),
+                               Projection().HeadYaw(), Projection().HeadYaw() * 57.2957795f);
+                    for (int i = 0; i < Projection().VoteCount(); ++i)
+                    {
+                        const Vec3& position = Projection().VotePosition(i);
+                        WOWVR_INFO("    %4d draws at %10.2f %10.2f %10.2f",
+                                   Projection().VoteWeight(i), position.x, position.y, position.z);
+                    }
+                }
             }
 
             if (Cfg().scanForCamera && Projection().HasSceneProjection() && !Camera().Found())

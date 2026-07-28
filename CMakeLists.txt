@@ -57,6 +57,10 @@ set(WOWVR_SOURCES
     src/diag/frame_report.h
     src/game/camera_probe.cpp
     src/game/camera_probe.h
+    src/game/field_watch.cpp
+    src/game/field_watch.h
+    src/game/game_camera.cpp
+    src/game/game_camera.h
     src/present/d3d12_present.cpp
     src/present/d3d12_present.h
     src/present/gl_interop.cpp

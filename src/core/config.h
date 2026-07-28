@@ -84,6 +84,34 @@ namespace wowvr
         bool headTracking = true;       // HMD orientation drives the in-game view
         float cullFovScale = 1.6f;
 
+        // Multiplies the field of view the client CULLS against, inside the camera object.
+        //
+        // Distinct from CullFovScale, which multiplies the global setting at 0x00ABFC38 -
+        // that one is inert, because the client copies the setting into the active camera
+        // once a frame and reads the copy. This is the copy.
+        //
+        // Wanted because the camera is aimed at the head at the end of one frame and culled
+        // against during the next: without margin a fast head turn outruns the frustum. It
+        // also covers head roll, which is not applied to the game camera at all. 1.0
+        // disables it; the client's rendering degrades at genuinely extreme angles, so the
+        // result is capped at 2.6 rad regardless.
+        //
+        // Set to reach the client's own ceiling, because vertical coverage is the binding
+        // constraint and it is only just enough.
+        //
+        // Measured: the client builds a vertical field of view of exactly 0.6 * the value in
+        // the camera, and clamps it at 107.4 degrees. The headset needs 109.4. So there is
+        // no headroom to trade away - anything less and the ground is culled from under you
+        // as soon as the view pitches up, which at the previous 1.25 (67.5 degrees vertical)
+        // it visibly was.
+        //
+        // 1.5708 * 2.05 = 3.22, just past where the clamp takes over. The horizontal that
+        // falls out of this is 152 degrees at a 2.96 aspect, far more than the 114 an eye
+        // needs, and all of that surplus is geometry drawn and never displayed. A squarer
+        // window is the way to give that back: at 1920x1440 the same vertical comes with
+        // 122 degrees horizontal instead.
+        float cullWidenScale = 2.05f;
+
         // Widens the client's shadow cascades so their coverage reaches past what the
         // headset can see. WoW sizes them for its own ~59 degree view - the near cascade
         // spans about 13 yards - so in VR the edge of the coverage is visible as a
@@ -108,6 +136,38 @@ namespace wowvr
         // hundreds of megabytes with the render thread blocked, which the player feels
         // as the headset briefly dropping out, and it has not succeeded yet.
         bool scanForCamera = false;
+
+        // Read-only watch on the structure that holds the field of view setting, and on
+        // the camera position recovered from the matrices on the wire. Reports which of
+        // the structure's floats change as the player moves and turns, which is how the
+        // per-frame camera state is told apart from the settings around it.
+        bool watchCameraStruct = false;
+
+        // Locates the game's camera during play so its yaw can be aimed at the headset.
+        // Costs one sweep of memory shortly after entering the world, then only a cheap
+        // re-check. Nothing is written unless AimCameraAtHead is also on.
+        bool autoLocateCamera = true;
+
+        // Turns the game's own camera to follow the head, so it culls and streams for
+        // where you are looking rather than where the character faces. This is the only
+        // setting that writes to the client's memory; it does nothing until the camera
+        // has been located, and it stops the moment that object stops looking right.
+        //
+        // On by default now that the camera is reached through the same pointer chain the
+        // client's own FlipCameraYaw uses, and the two fields written are the ones that
+        // function adds to. It was off while the camera was being guessed at by searching
+        // memory, which is a different and much worse proposition.
+        bool aimCameraAtHead = true;
+
+        // Turns off the client's third-person camera collision, by removing one conditional
+        // jump in its own code. Aiming the camera at the head sweeps it through terrain, and
+        // the client's answer is to pull it in - measured going from 16 yards to 0.79 in a
+        // single head pitch, which moves the viewpoint fifteen yards and cannot be corrected
+        // for afterwards because the camera really is somewhere else.
+        //
+        // On by default, and only while VR is actually driving the camera; a flat session in
+        // the same client gets the client's own behaviour back.
+        bool disableCameraCollision = true;
 
         // Last-resort camera identification: alters candidate addresses to see which
         // one the game rebuilds its projection from. Conclusive, but it writes to

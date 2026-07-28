@@ -21,6 +21,7 @@ namespace wowvr
     Mat4 Mat4Identity();
     Mat4 Mat4Multiply(const Mat4& a, const Mat4& b);   // a then b
     Mat4 Mat4Translation(float x, float y, float z);
+    Mat4 Mat4RotationX(float radians);
     Mat4 Mat4RotationY(float radians);
 
     // Yaw of a rotation matrix about the Y axis, in radians.

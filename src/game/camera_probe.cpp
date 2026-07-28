@@ -6,6 +6,9 @@
 #include <windows.h>
 
 #include <cmath>
+#include <cstring>
+#include <cstdint>
+#include <vector>
 
 namespace wowvr
 {
@@ -618,6 +621,2483 @@ namespace wowvr
                    actual, actual * 2.0f * 57.2957795f,
                    expectedHalf, expectedHalf * 2.0f * 57.2957795f,
                    fabsf(actual - expectedHalf) < 0.002f ? "TRACKS" : "diverged");
+    }
+
+    namespace
+    {
+        // Every field is initialised here rather than at each construction site, because
+        // one of those sites forgot. CollectPage - the path the calibration actually uses -
+        // filled in the first six fields and left the three scoring fields holding whatever
+        // was on the heap, so the ranking that chooses the camera at the end was reading
+        // garbage for all 75,000 candidates and could never pick anything. The layout
+        // collector set all nine, which is why the fault only ever showed up on the page
+        // route.
+        struct DifferentialCandidate
+        {
+            float* address = nullptr;
+            float value = 0.0f;
+            int signWhenTurningRight = 0;   // 0 until a right turn has been seen
+            float referenceDelta = 0.0f;    // how far it moved on the first turn
+            int changes = 0;                // how often it moved while the camera moved
+            int stillChanges = 0;           // how often it moved when the camera did not
+            float deltaSum = 0.0f;          // calibration: how far it moved, summed
+            float deltaSqSum = 0.0f;        // and the squares, for a spread
+            int deltaCount = 0;
+        };
+
+        std::vector<DifferentialCandidate> g_differential;
+        int g_differentialPass = 0;
+
+        // Addresses that have already failed confirmation.
+        //
+        // Without this the search loops forever: collection is deterministic, so after a
+        // rejection the very next sweep offers the same false positive first, and it is
+        // rejected again. Remembering failures is what lets it move past them. Kept
+        // across sweeps deliberately - that is the whole point.
+        std::vector<const float*> g_rejected;
+
+        bool AlreadyRejected(const float* address)
+        {
+            for (size_t i = 0; i < g_rejected.size(); ++i)
+            {
+                if (g_rejected[i] == address) { return true; }
+            }
+            return false;
+        }
+
+        // The camera object repeats its yaw at these offsets. Both came out of the
+        // differential scan - two separate runs found the same spacing at completely
+        // different base addresses - so this is measured, not a published layout.
+        const uintptr_t kCameraObjectPointer = 0x00C1FA1Cu;
+        const uintptr_t kCameraYawOffset = 0xDF4u;
+        const uintptr_t kCameraYawMirrorA = 0x144u;
+        const uintptr_t kCameraYawMirrorB = 0x148u;
+
+        // The orbit radius sits 4 bytes before the yaw, with a copy here. Both offsets came
+        // out of the zoom probe: eight wheel clicks moved them together, one yard each.
+        const uintptr_t kCameraRadiusMirror = 0xCCu;
+
+        // Pitch sits immediately after the yaw, with its own copy - the layout is
+        // symmetric about the yaw. Both offsets were measured with a vertical drag.
+        const uintptr_t kCameraPitchMirror = 0x114u;
+
+        // Room for the whole candidate set. The tolerant layout test admits far more
+        // places than exact equality did, and at 400,000 the collection was hitting the
+        // cap and stopping - quite possibly before reaching the camera, which would
+        // explain both the pool never narrowing and the implausible winner. A million
+        // entries is about 36 MB, affordable even in a 32-bit process.
+        const size_t kMaxLayoutCandidates = 1000000u;
+
+        // How closely the three copies must agree. Loose enough to survive being sampled
+        // mid-update, tight enough not to swamp the search.
+        const float kLayoutTolerance = 0.01f;
+
+        // Looser than kLayoutTolerance, and deliberately so: the signature sweep samples a
+        // live object whose copies are updated one field at a time, so exact agreement is
+        // the exception rather than the rule.
+        const float kSignatureTolerance = 0.05f;
+
+        // An angle in radians, however the client chooses to wrap it. Anything outside
+        // this cannot be an orientation, which throws away the overwhelming majority of
+        // floats before any of them have to be tracked.
+        bool PlausibleAngle(float value)
+        {
+            return std::isfinite(value) && value >= -7.0f && value <= 7.0f;
+        }
+
+        // The exe's real extent, read from its own headers.
+        //
+        // This was previously assumed to be 0x00400000..0x01000000, which was never
+        // checked. The assumption produced two "static" addresses that behaved perfectly
+        // for a session and then read as zero on the next launch - because they were not
+        // static at all, but heap allocations that happened to land inside the guessed
+        // range. Anything identified under that assumption has to be treated as suspect.
+        void ImageBounds(uintptr_t& begin, uintptr_t& end)
+        {
+            begin = 0x00400000u;
+            end = 0x00400000u;
+
+            HMODULE exe = GetModuleHandleW(nullptr);
+            if (exe == nullptr)
+            {
+                return;
+            }
+
+            const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            {
+                return;
+            }
+
+            const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const uint8_t*>(exe) + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE)
+            {
+                return;
+            }
+
+            begin = reinterpret_cast<uintptr_t>(exe);
+            end = begin + nt->OptionalHeader.SizeOfImage;
+        }
+
+        // The client's own writable static data.
+        void ForEachWritableStaticPage(void (*visit)(uint8_t*, size_t))
+        {
+            uintptr_t imageBase = 0;
+            uintptr_t imageEnd = 0;
+            ImageBounds(imageBase, imageEnd);
+
+            uintptr_t address = imageBase;
+            while (address < imageEnd)
+            {
+                MEMORY_BASIC_INFORMATION info = {};
+                if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+                {
+                    break;
+                }
+
+                const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY
+                                     | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                if (info.State == MEM_COMMIT && (info.Protect & writable) != 0
+                    && (info.Protect & PAGE_GUARD) == 0)
+                {
+                    visit(static_cast<uint8_t*>(info.BaseAddress), info.RegionSize);
+                }
+
+                address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+            }
+        }
+
+        // Searching the heap as well, without exhausting a 32-bit address space.
+        //
+        // The static scan found a faithful mirror of the camera yaw, but pinning it from
+        // a dedicated thread moved nothing, so the client writes that copy and never
+        // reads it. The authoritative camera is therefore heap-allocated, and the heap is
+        // far too large to hold a 16-byte record for every float in it - that alone would
+        // run to hundreds of megabytes inside a process that only has two gigabytes.
+        //
+        // So the heap is narrowed a page at a time first. One checksum per 4 KB page is
+        // a quarter of a percent of the memory a per-float list would need, and the same
+        // change-versus-stand-still logic applies: pages that move when the camera orbits
+        // and stay put otherwise are the only ones worth examining float by float.
+        // Scored rather than filtered.
+        //
+        // Hard filtering discarded the camera's own page: that object holds per-frame
+        // state as well as the yaw, so it keeps changing during intervals when the
+        // player is not touching the camera, and a pass that demands perfect stillness
+        // throws away exactly what it is meant to preserve. Counting hits instead
+        // tolerates that - what matters is that a page changes on almost every motion
+        // interval and hardly ever otherwise.
+        struct PageRecord
+        {
+            const uint8_t* base;
+            uint32_t checksum;
+            uint16_t movedHits;
+            uint16_t stillHits;
+        };
+
+        std::vector<PageRecord> g_pages;
+
+        uint32_t ChecksumPage(const uint8_t* page)
+        {
+            // FNV-1a over the page, stepped by four bytes. Exactness does not matter;
+            // only that a changed page reliably produces a different number.
+            uint32_t hash = 2166136261u;
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(page);
+            for (int i = 0; i < 1024; ++i)
+            {
+                hash ^= words[i];
+                hash *= 16777619u;
+            }
+            return hash;
+        }
+
+        bool WorthSearching(const MEMORY_BASIC_INFORMATION& info)
+        {
+            if (info.State != MEM_COMMIT)
+            {
+                return false;
+            }
+
+            const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY
+                                 | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if ((info.Protect & writable) == 0 || (info.Protect & PAGE_GUARD) != 0)
+            {
+                return false;
+            }
+
+            // Our own module holds copies of the very values being looked for, and the
+            // calling thread's stack is full of transient camera arithmetic that matches
+            // anything and then evaporates.
+            HMODULE self = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&ChecksumPage), &self);
+            const uintptr_t base = reinterpret_cast<uintptr_t>(info.AllocationBase);
+            if (base == reinterpret_cast<uintptr_t>(self))
+            {
+                return false;
+            }
+
+            ULONG_PTR stackLow = 0;
+            ULONG_PTR stackHigh = 0;
+            GetCurrentThreadStackLimits(&stackLow, &stackHigh);
+            const uintptr_t regionStart = reinterpret_cast<uintptr_t>(info.BaseAddress);
+            const uintptr_t regionEnd = regionStart + info.RegionSize;
+            if (regionEnd > stackLow && regionStart < stackHigh)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        // Reads the three copies without asking the kernel whether the memory is valid.
+        //
+        // The obvious guard - VirtualQuery before each read - is a system call, and with
+        // a few hundred thousand candidates checked several times a second it cost half a
+        // second of stalled frames every pass. The addresses all came from committed
+        // regions; the only real risk is a region being freed underneath us, which an
+        // exception handler covers for nothing when it does not happen.
+        //
+        // No C++ objects in here: __try cannot coexist with anything needing unwinding.
+        __declspec(noinline) bool ReadTriple(const float* address, float& value,
+                                             float& copyA, float& copyB)
+        {
+            __try
+            {
+                value = address[0];
+                copyA = address[kCameraYawMirrorA / sizeof(float)];
+                copyB = address[kCameraYawMirrorB / sizeof(float)];
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+
+        // One region swept for the camera signature, behind an exception handler.
+        //
+        // A region reported as committed can still be freed by another thread between the
+        // VirtualQuery and the read, and that took the client down the first time this ran.
+        // Guarding per read with VirtualQuery would be a syscall per candidate; a handler
+        // costs nothing until it is needed, and losing the tail of one region when it does
+        // fire is of no consequence.
+        //
+        // No C++ objects in here - __try cannot coexist with anything needing unwinding -
+        // so hits go into a caller-supplied array and the vector is filled outside.
+        const size_t kSignatureHitsPerRegion = 256;
+
+        __declspec(noinline) size_t ScanRegionForSignature(uint8_t* base, size_t size,
+                                                           float** out, size_t maxOut)
+        {
+            size_t found = 0;
+            __try
+            {
+                const size_t before = sizeof(float);
+                const size_t after = kCameraYawMirrorB + sizeof(float);
+                const size_t last = size - after;
+
+                for (size_t offset = before; offset <= last && found < maxOut;
+                     offset += sizeof(float))
+                {
+                    // A real heading, not approximately nothing.
+                    //
+                    // Testing only for exact zero is not enough once the copies are
+                    // compared loosely: a region of zeroed memory satisfies every
+                    // "these fields agree" test trivially, and allowing a zero orbit
+                    // radius removed the last thing excluding it. That is how this sweep
+                    // returned 204,892 candidates beginning at 0x00010008, and how a
+                    // buffer holding -0.0056 rad came to be verified as the camera.
+                    float* yaw = reinterpret_cast<float*>(base + offset);
+                    if (!PlausibleAngle(*yaw) || fabsf(*yaw) < 0.01f)
+                    {
+                        continue;
+                    }
+
+                    // Every false positive that ever got written to was an exact binary
+                    // fraction - 1.0000, 0.7500, 0.1250. An angle arrived at by turning a
+                    // camera is essentially never an exact eighth.
+                    if (*yaw * 8.0f == floorf(*yaw * 8.0f))
+                    {
+                        continue;
+                    }
+
+                    const float* copyA =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorA);
+                    const float* copyB =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorB);
+                    if (fabsf(*copyA - *yaw) > kSignatureTolerance
+                        || fabsf(*copyB - *yaw) > kSignatureTolerance)
+                    {
+                        continue;
+                    }
+
+                    // Radius may legitimately be zero - that is first person, not a
+                    // mismatch - and the copies are compared loosely, because the client
+                    // updates them one at a time and a sample caught mid-update disagrees.
+                    // Both mistakes were made the first time this sweep was tried and
+                    // between them they excluded the camera from its own candidate set.
+                    const float* radius = reinterpret_cast<const float*>(base + offset - before);
+                    const float* radiusCopy =
+                        reinterpret_cast<const float*>(base + offset + kCameraRadiusMirror);
+                    if (!std::isfinite(*radius) || *radius < 0.0f || *radius > 60.0f
+                        || fabsf(*radiusCopy - *radius) > kSignatureTolerance)
+                    {
+                        continue;
+                    }
+
+                    // Pitch and its copy, the two fields the first attempt did not know
+                    // about. Seven constrained fields is a far narrower net than five.
+                    const float* pitch = reinterpret_cast<const float*>(base + offset + sizeof(float));
+                    const float* pitchCopy =
+                        reinterpret_cast<const float*>(base + offset + kCameraPitchMirror);
+                    if (!std::isfinite(*pitch) || *pitch < -1.6f || *pitch > 1.6f
+                        || fabsf(*pitchCopy - *pitch) > kSignatureTolerance)
+                    {
+                        continue;
+                    }
+
+                    out[found] = yaw;
+                    ++found;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+            return found;
+        }
+
+        __declspec(noinline) size_t ScanRegionForValue(uint8_t* base, size_t size,
+                                                       float wanted, float** out, size_t maxOut)
+        {
+            size_t found = 0;
+            __try
+            {
+                const size_t count = size / sizeof(float);
+                float* values = reinterpret_cast<float*>(base);
+                for (size_t i = 0; i < count && found < maxOut; ++i)
+                {
+                    if (std::isfinite(values[i]) && fabsf(values[i] - wanted) < 0.0005f)
+                    {
+                        out[found] = &values[i];
+                        ++found;
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+            return found;
+        }
+
+        void CollectPage(uint8_t* base, size_t size)
+        {
+            const size_t count = size / sizeof(float);
+            float* values = reinterpret_cast<float*>(base);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (PlausibleAngle(values[i]))
+                {
+                    DifferentialCandidate candidate;
+                    candidate.address = &values[i];
+                    candidate.value = values[i];
+                    candidate.signWhenTurningRight = 0;
+                    candidate.referenceDelta = 0.0f;
+                    candidate.changes = 0;
+                    candidate.stillChanges = 0;
+                    g_differential.push_back(candidate);
+                }
+            }
+        }
+    }
+
+    // Collects every place in memory that carries the camera object's layout.
+    //
+    // This inverts the order the search was built in, and that was the mistake. Narrowing
+    // by pages first kept discarding the camera's own page: the object holds per-frame
+    // state as well as the yaw, so it is never quiet, and every version of the "stood
+    // still" test threw it away.
+    //
+    // The layout is the better opening move precisely because it is cheap. Three equal
+    // plausible angles at +0x144 and +0x148 matches a couple of hundred thousand places -
+    // far too many to identify anything, but only a few megabytes to hold, and the camera
+    // is guaranteed to be among them. Behaviour then picks it out of that set, which is
+    // what behaviour is actually good at.
+    void CameraProbe::CollectLayoutCandidates()
+    {
+        g_differential.clear();
+        g_differentialPass = 0;
+
+        uintptr_t address = 0x00010000u;
+        const uintptr_t limit = 0x7FFF0000u;
+        while (address < limit && g_differential.size() < kMaxLayoutCandidates)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            if (WorthSearching(info) && info.RegionSize > kCameraYawMirrorB + sizeof(float))
+            {
+                uint8_t* base = static_cast<uint8_t*>(info.BaseAddress);
+                const size_t last = info.RegionSize - kCameraYawMirrorB - sizeof(float);
+                for (size_t offset = 0; offset <= last; offset += sizeof(float))
+                {
+                    float* first = reinterpret_cast<float*>(base + offset);
+                    if (!PlausibleAngle(*first) || *first == 0.0f)
+                    {
+                        continue;
+                    }
+
+                    // Compared with a tolerance, not exactly. The client updates the three
+                    // copies one at a time, so a sample taken mid-update finds them
+                    // briefly disagreeing - and demanding exact equality here excludes the
+                    // real camera from the candidate set before the search even begins,
+                    // which is what left it converging on coincidences.
+                    const float* copyA =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorA);
+                    const float* copyB =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorB);
+                    if (fabsf(*copyA - *first) > kLayoutTolerance || fabsf(*copyB - *first) > kLayoutTolerance)
+                    {
+                        continue;
+                    }
+
+                    DifferentialCandidate candidate;
+                    candidate.address = first;
+                    candidate.value = *first;
+                    candidate.signWhenTurningRight = 0;
+                    candidate.referenceDelta = 0.0f;
+                    candidate.changes = 0;
+                    candidate.stillChanges = 0;
+                    candidate.deltaSum = 0.0f;
+                    candidate.deltaSqSum = 0.0f;
+                    candidate.deltaCount = 0;
+                    g_differential.push_back(candidate);
+
+                    if (g_differential.size() >= kMaxLayoutCandidates) { break; }
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        WOWVR_INFO("Camera layout candidates: %zu places carry three equal angles at "
+                   "+0x144 and +0x148.", g_differential.size());
+    }
+
+    // The camera object identified by its whole measured layout at once.
+    //
+    // The old sweep looked only for three equal angles at +0, +0x144 and +0x148, which
+    // matched around 280,000 places - so weak that every version of the search needed a
+    // long behavioural phase afterwards to pick the real one out, and that phase is what
+    // never converged during ordinary play and cost a whole-address-space walk on the
+    // render thread every three quarters of a second.
+    //
+    // The zoom probe added two more fields to test: an orbit radius at -0x4 with a copy at
+    // +0xCC. Five constrained fields together is a far more specific signature than three,
+    // and it costs the same single pass. Whether that is specific enough to identify the
+    // object outright is exactly what the logged count answers - so it is measured here
+    // rather than assumed, before anything is built on top of it.
+    //
+    // Note the object must be in third person to be found: in first person the radius is
+    // zero, and zero is far too common in memory to carry any signal, so it is excluded.
+    void CameraProbe::ScanForCameraSignature()
+    {
+        g_differential.clear();
+        g_differentialPass = 0;
+
+        // The span touched around a candidate: 4 bytes before it for the radius, and
+        // 0x148 plus a float after it for the second yaw copy.
+        const size_t kBefore = sizeof(float);
+        const size_t kAfter = kCameraYawMirrorB + sizeof(float);
+
+        int regionsSearched = 0;
+        uintptr_t address = 0x00010000u;
+        const uintptr_t limit = 0x7FFF0000u;
+        while (address < limit && g_differential.size() < kMaxLayoutCandidates)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            if (WorthSearching(info) && info.RegionSize > kBefore + kAfter)
+            {
+                ++regionsSearched;
+                float* hits[kSignatureHitsPerRegion];
+                const size_t found = ScanRegionForSignature(
+                    static_cast<uint8_t*>(info.BaseAddress), info.RegionSize,
+                    hits, kSignatureHitsPerRegion);
+
+                for (size_t i = 0; i < found; ++i)
+                {
+                    DifferentialCandidate candidate;
+                    candidate.address = hits[i];
+                    candidate.value = *hits[i];
+                    g_differential.push_back(candidate);
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        WOWVR_INFO("Camera signature sweep over %d regions: %zu places carry a non-zero "
+                   "heading at +0/+0x144/+0x148, a radius at -0x4/+0xCC and a pitch at "
+                   "+0x4/+0x114.",
+                   regionsSearched, g_differential.size());
+
+        for (size_t i = 0; i < g_differential.size() && i < 12; ++i)
+        {
+            const float* at = g_differential[i].address;
+            WOWVR_INFO("  candidate 0x%08X: yaw %.4f rad (%.1f deg), radius %.3f yards.",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(at)),
+                       *at, *at * 57.2957795f, *(at - 1));
+        }
+    }
+
+    void CameraProbe::SnapshotPages()
+    {
+        g_pages.clear();
+        g_differential.clear();
+        g_differentialPass = 0;
+
+        uintptr_t address = 0x00010000u;
+        const uintptr_t limit = 0x7FFF0000u;
+        while (address < limit)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            if (WorthSearching(info))
+            {
+                const uint8_t* start = static_cast<const uint8_t*>(info.BaseAddress);
+                const size_t pages = info.RegionSize / 4096u;
+                for (size_t i = 0; i < pages; ++i)
+                {
+                    PageRecord record;
+                    record.base = start + i * 4096u;
+                    record.checksum = ChecksumPage(record.base);
+                    record.movedHits = 0;
+                    record.stillHits = 0;
+                    g_pages.push_back(record);
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        WOWVR_INFO("Page scan: %zu pages (%zu MB) under watch.", g_pages.size(),
+                   (g_pages.size() * 4096u) / (1024u * 1024u));
+    }
+
+    void CameraProbe::FilterPages(bool expectedToChange)
+    {
+        ++g_differentialPass;
+
+        size_t kept = 0;
+        for (size_t i = 0; i < g_pages.size(); ++i)
+        {
+            PageRecord& record = g_pages[i];
+            if (!Readable(record.base, 4096))
+            {
+                continue;
+            }
+
+            const uint32_t now = ChecksumPage(record.base);
+            if (now != record.checksum)
+            {
+                if (expectedToChange) { ++record.movedHits; }
+                else                  { ++record.stillHits; }
+            }
+            record.checksum = now;
+
+            g_pages[kept] = record;
+            ++kept;
+        }
+        g_pages.resize(kept);
+    }
+
+    // Keeps pages that moved with the camera nearly every time and were otherwise quiet.
+    void CameraProbe::SelectScoredPages(int motionRounds)
+    {
+        const int wanted = (motionRounds >= 4) ? (motionRounds - 1) : motionRounds;
+
+        size_t kept = 0;
+        for (size_t i = 0; i < g_pages.size(); ++i)
+        {
+            if (g_pages[i].movedHits < wanted || g_pages[i].stillHits > 1)
+            {
+                continue;
+            }
+            g_pages[kept] = g_pages[i];
+            ++kept;
+        }
+        g_pages.resize(kept);
+
+        WOWVR_INFO("Page scoring over %d motion rounds: %zu pages moved with the camera "
+                   "at least %d times and were quiet otherwise.",
+                   motionRounds, g_pages.size(), wanted);
+    }
+
+    void CameraProbe::PromotePagesToFloats()
+    {
+        g_differential.clear();
+        for (size_t i = 0; i < g_pages.size(); ++i)
+        {
+            CollectPage(const_cast<uint8_t*>(g_pages[i].base), 4096);
+        }
+        g_differentialPass = 0;
+        WOWVR_INFO("Promoted %zu surviving pages to %zu angle-shaped floats.",
+                   g_pages.size(), g_differential.size());
+    }
+
+    void CameraProbe::SnapshotDifferential()
+    {
+        g_differential.clear();
+        g_differential.reserve(1u << 20);
+        g_differentialPass = 0;
+        ForEachWritableStaticPage(&CollectPage);
+        WOWVR_INFO("Differential scan: %zu angle-shaped floats to start from.",
+                   g_differential.size());
+    }
+
+    void CameraProbe::FilterDifferential(int direction)
+    {
+        ++g_differentialPass;
+
+        const bool expectedToChange = (direction != 0);
+
+        size_t kept = 0;
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            DifferentialCandidate& candidate = g_differential[i];
+            if (!Readable(candidate.address, sizeof(float)))
+            {
+                continue;
+            }
+
+            const float now = *candidate.address;
+            if (!PlausibleAngle(now))
+            {
+                continue;
+            }
+
+            // An angle wraps, and a wrap looks like an enormous jump the other way.
+            // Correcting for it here is what lets a genuine heading survive turning
+            // past its own discontinuity.
+            float delta = now - candidate.value;
+            const float twoPi = 6.28318530718f;
+            if (delta > 3.14159265f)       { delta -= twoPi; }
+            else if (delta < -3.14159265f) { delta += twoPi; }
+
+            const bool changed = fabsf(delta) > 0.004f;
+            if (changed != expectedToChange)
+            {
+                continue;
+            }
+
+            if (expectedToChange)
+            {
+                // The discriminator that matters. A heading moves one way for a right
+                // turn and the other way for a left turn, always. Anything DERIVED from
+                // it - a sine, a cosine, a matrix element - changes sign depending on
+                // where the angle currently is, not on which way the player turned, so
+                // this is what separates the angle itself from its consequences.
+                const int sign = (delta > 0.0f) ? 1 : -1;
+                const int signIfRight = (direction > 0) ? sign : -sign;
+
+                if (candidate.signWhenTurningRight == 0)
+                {
+                    candidate.signWhenTurningRight = signIfRight;
+                }
+                else if (candidate.signWhenTurningRight != signIfRight)
+                {
+                    continue;
+                }
+
+                // The discriminator that actually separates an angle from its own sine
+                // and cosine. The client turns at a fixed rate, so equal-length turns
+                // move a heading by equal amounts no matter which way it was already
+                // facing. A sine or cosine does not: how far it moves depends on where
+                // the angle currently is, because that is its derivative. Repeating the
+                // same turn from different orientations therefore keeps headings and
+                // discards everything computed from them.
+                const float magnitude = fabsf(delta);
+                if (candidate.referenceDelta == 0.0f)
+                {
+                    candidate.referenceDelta = magnitude;
+                }
+                // Loose on purpose. A synthesised drag does not deliver exactly the same
+                // movement every time - the client samples the mouse on its own schedule
+                // - and too tight a band throws away the real answer as noise. It did
+                // exactly that once: the set reached a single candidate and then lost it
+                // two passes later.
+                else if (magnitude < candidate.referenceDelta * 0.55f
+                      || magnitude > candidate.referenceDelta * 1.80f)
+                {
+                    continue;
+                }
+            }
+
+            candidate.value = now;
+            g_differential[kept] = candidate;
+            ++kept;
+        }
+        g_differential.resize(kept);
+
+        const char* what = (direction == 0) ? "stood still"
+                         : (direction > 0)  ? "turned right" : "turned left";
+        WOWVR_INFO("Differential pass %d (%s): %zu candidates remain.", g_differentialPass,
+                   what, g_differential.size());
+
+        // Report as soon as the set is small, rather than only at the end. A later pass
+        // can eliminate the right answer on noise, and losing it unseen wastes the whole
+        // run - the addresses are worth having even if nothing survives to the finish.
+        if (!g_differential.empty() && g_differential.size() <= 10u)
+        {
+            for (size_t i = 0; i < g_differential.size(); ++i)
+            {
+                WOWVR_INFO("  surviving at pass %d: 0x%08X = %.5f rad (%.2f deg)",
+                           g_differentialPass,
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_differential[i].address)),
+                           g_differential[i].value,
+                           g_differential[i].value * 57.2957795f);
+            }
+        }
+    }
+
+    int CameraProbe::DifferentialCandidates() const
+    {
+        return static_cast<int>(g_differential.size());
+    }
+
+    // The two headings the differential scan converged on. Written every frame while a
+    // test is active, because the client recomputes its camera from its own input each
+    // frame and would otherwise simply undo a one-off write.
+    namespace
+    {
+        float* g_headingWriteTarget = nullptr;
+        float g_headingWriteOffset = 0.0f;
+        bool g_headingWriteActive = false;
+    }
+
+    // Holding the camera yaw at a constant from a thread of its own.
+    //
+    // Writing it once a frame at Present changed nothing, but that proves only that the
+    // client rewrites it somewhere between there and the next frame's culling - not that
+    // culling ignores it. Our earliest hook in a frame is already after culling has run,
+    // so from the render thread that window is unreachable by construction. A separate
+    // thread writing continuously does not care about frame boundaries: if any of its
+    // writes land after the client's camera update and before it culls, the view will
+    // visibly swing. That distinguishes "we cannot write at the right moment" from
+    // "this value is not what the renderer reads", which are the two possibilities the
+    // one-off test could not tell apart.
+    namespace
+    {
+        HANDLE g_holdThread = nullptr;
+        volatile LONG g_holdRunning = 0;
+        volatile float g_holdValue = 0.0f;
+        float* g_holdTarget = nullptr;
+
+        // When the survivors are being held instead of a single fixed address. Heap
+        // addresses differ from run to run, so a candidate found this session can only
+        // be tested this session - there is nothing to hard-code.
+        std::vector<DifferentialCandidate> g_held;
+
+        DWORD WINAPI HoldHeadingThread(LPVOID)
+        {
+            while (InterlockedCompareExchange(&g_holdRunning, 1, 1) == 1)
+            {
+                if (g_holdTarget != nullptr)
+                {
+                    *g_holdTarget = g_holdValue;
+                }
+                for (size_t i = 0; i < g_held.size(); ++i)
+                {
+                    *g_held[i].address = g_held[i].value;
+                }
+                // Deliberately tight. This is a diagnostic that runs for a few seconds,
+                // and the whole point is to hit a window inside the client's frame.
+                YieldProcessor();
+            }
+            return 0;
+        }
+    }
+
+    void CameraProbe::HoldSurvivors(bool on, float offsetRadians)
+    {
+        if (!on)
+        {
+            g_held.clear();
+            HoldHeading(false, 0.0f);
+            return;
+        }
+
+        g_held.clear();
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            if (!Readable(g_differential[i].address, sizeof(float)))
+            {
+                continue;
+            }
+
+            DifferentialCandidate held = g_differential[i];
+            held.value = *held.address + offsetRadians;
+            g_held.push_back(held);
+            WOWVR_INFO("Holding 0x%08X at %.4f rad (was %.4f).",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(held.address)),
+                       held.value, *held.address);
+        }
+
+        if (g_held.empty())
+        {
+            WOWVR_WARN("No surviving candidates to hold.");
+            return;
+        }
+
+        if (g_holdThread == nullptr)
+        {
+            InterlockedExchange(&g_holdRunning, 1);
+            g_holdThread = CreateThread(nullptr, 0, &HoldHeadingThread, nullptr, 0, nullptr);
+        }
+    }
+
+    void CameraProbe::HoldHeading(bool on, float offsetRadians)
+    {
+        if (!on)
+        {
+            if (g_holdThread != nullptr)
+            {
+                InterlockedExchange(&g_holdRunning, 0);
+                WaitForSingleObject(g_holdThread, 2000);
+                CloseHandle(g_holdThread);
+                g_holdThread = nullptr;
+                g_holdTarget = nullptr;
+            }
+            WOWVR_INFO("Heading hold released.");
+            return;
+        }
+
+        if (g_holdThread != nullptr)
+        {
+            return;
+        }
+
+        // Whatever the locator settled on this session. There is no fixed address to
+        // fall back to - the object is allocated afresh every launch.
+        float* target = m_cameraYawField;
+        if (target == nullptr || !Readable(target, sizeof(float)) || !PlausibleAngle(*target))
+        {
+            WOWVR_WARN("Camera not located yet; nothing to hold.");
+            return;
+        }
+
+        float wanted = *target + offsetRadians;
+        const float twoPi = 6.28318530718f;
+        while (wanted > 3.14159265f)  { wanted -= twoPi; }
+        while (wanted < -3.14159265f) { wanted += twoPi; }
+
+        g_holdTarget = target;
+        g_holdValue = wanted;
+        InterlockedExchange(&g_holdRunning, 1);
+        g_holdThread = CreateThread(nullptr, 0, &HoldHeadingThread, nullptr, 0, nullptr);
+
+        WOWVR_INFO("Holding camera yaw at %.4f rad (%.1f deg), was %.4f. If culling reads "
+                   "this, the view will swing.", wanted, wanted * 57.2957795f, *target);
+    }
+
+    // Points the game's own camera wherever the head is looking, so that everything it
+    // decides on the CPU - culling, tile streaming, level of detail - is decided for what
+    // the headset actually shows rather than for where the mouse last pointed.
+    //
+    // The awkward part is not the write but the bookkeeping. The client may or may not
+    // recompute this field from its own input before we next see it, and the two cases
+    // need opposite handling: if our value survived, the offset we added is already in
+    // there and must come off before a new one goes on, or it accumulates and the camera
+    // spins. Rather than assume either way, compare against what we last wrote.
+    void CameraProbe::AimAtHead(float headYawRadians)
+    {
+        if (m_cameraYawField == nullptr)
+        {
+            return;
+        }
+
+        float* copyA = m_cameraYawField + (kCameraYawMirrorA / sizeof(float));
+        float* copyB = m_cameraYawField + (kCameraYawMirrorB / sizeof(float));
+        if (!Readable(m_cameraYawField, sizeof(float)) || !Readable(copyB, sizeof(float)))
+        {
+            return;
+        }
+
+        const float current = *m_cameraYawField;
+        if (!PlausibleAngle(current))
+        {
+            return;
+        }
+
+        const bool oursSurvived = m_haveAimed
+            && fabsf(WrapRadians(current - m_lastAimWritten)) < 0.002f;
+        const float base = oursSurvived ? (current - m_appliedYaw) : current;
+
+        float wanted = base + headYawRadians;
+        const float twoPi = 6.28318530718f;
+        while (wanted >= twoPi) { wanted -= twoPi; }
+        while (wanted < 0.0f)   { wanted += twoPi; }
+
+        // All three copies, or the layout re-check sees them disagree next frame and
+        // decides the object has been reallocated.
+        *m_cameraYawField = wanted;
+        *copyA = wanted;
+        *copyB = wanted;
+
+        m_lastAimWritten = wanted;
+        m_appliedYaw = headYawRadians;
+        m_haveAimed = true;
+    }
+
+    float CameraProbe::AppliedYaw() const
+    {
+        return m_haveAimed ? m_appliedYaw : 0.0f;
+    }
+
+    void CameraProbe::SetHeadingWrite(int which, float offsetRadians)
+    {
+        g_headingWriteActive = false;
+        g_headingWriteTarget = nullptr;
+
+        if (which == 0)
+        {
+            WOWVR_INFO("Heading write disabled.");
+            return;
+        }
+
+        // Once per frame from the render thread, not from a spinning thread of its own.
+        // The spinning version was only ever a diagnostic to rule out frame timing, and
+        // hammering a live object from another thread took the client down with it.
+        float* target = m_cameraYawField;
+        if (target == nullptr || !Readable(target, sizeof(float)) || !PlausibleAngle(*target))
+        {
+            WOWVR_WARN("Camera not located yet; nothing to aim.");
+            return;
+        }
+
+        g_headingWriteTarget = target;
+        g_headingWriteOffset = offsetRadians;
+        g_headingWriteActive = true;
+        WOWVR_INFO("Aiming the camera: 0x%08X offset by %.3f rad (%.1f deg).",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(target)),
+                   offsetRadians, offsetRadians * 57.2957795f);
+    }
+
+    void CameraProbe::ApplyHeadingWrite()
+    {
+        if (!g_headingWriteActive || g_headingWriteTarget == nullptr)
+        {
+            return;
+        }
+
+        // Re-check the object still looks like the camera before every write. If it has
+        // been freed and something else now occupies the memory, writing an angle into it
+        // is exactly how the client gets taken down.
+        const float current = *g_headingWriteTarget;
+        const float* copyA = g_headingWriteTarget + (kCameraYawMirrorA / sizeof(float));
+        const float* copyB = g_headingWriteTarget + (kCameraYawMirrorB / sizeof(float));
+        if (!PlausibleAngle(current) || !Readable(copyB, sizeof(float))
+            || *copyA != current || *copyB != current)
+        {
+            return;
+        }
+
+        // Offset from whatever the client just computed, rather than an absolute value,
+        // so the test shows displacement from the game's own heading and cannot wander.
+        float wanted = current + g_headingWriteOffset;
+        const float twoPi = 6.28318530718f;
+        while (wanted > 3.14159265f)  { wanted -= twoPi; }
+        while (wanted < -3.14159265f) { wanted += twoPi; }
+        *g_headingWriteTarget = wanted;
+    }
+
+    // Working back from a heap address to something stable enough to use at startup.
+    //
+    // The camera object is allocated afresh every launch, so the addresses the scan finds
+    // are worthless on their own. What does not move is the exe's static data, and
+    // somewhere in it there has to be a pointer that reaches this object - that is how
+    // the client itself finds it. So: look for any static word holding an address that
+    // lands inside the object, and record how far into it that lands. A pointer plus a
+    // fixed offset survives relaunching; an address does not.
+    // The camera object, reached the way the client reaches it.
+    //
+    // A static slot holds the pointer, and the yaw sits at a fixed offset inside. Both
+    // numbers came from the differential scan plus a pointer trace, so nothing here is a
+    // published offset taken on trust - and every step is checked for readability, since
+    // a stale or null pointer during a loading screen is normal rather than exceptional.
+
+    // Finding the camera by the SHAPE of the object rather than by a pointer to it.
+    //
+    // The pointer trace was a false lead: it found a single static word holding an address
+    // that happened to land in the right 4 KB, and following it on a later run reached a
+    // field that sat at zero and never moved. One coincidental hit in a window that size
+    // is not evidence.
+    //
+    // What is distinctive is the object's own layout. The camera keeps its yaw in three
+    // places at fixed spacing - +0, +0x144 and +0x148 - and all three hold the same angle.
+    // Three identical plausible angles at exactly that spacing is a strong signature, it
+    // needs no chain to survive relaunching, and it checks itself: if the match is wrong,
+    // the value will not track the camera.
+    float* CameraProbe::FindCameraByShape()
+    {
+        // Shape alone is nowhere near specific enough - three equal plausible angles at
+        // that spacing matched 214,087 places, because any run of repeated small floats
+        // satisfies it. What makes it unique is matching the VALUE as well.
+        //
+        // The static mirror is the way in. It is useless to write, but it is a perfectly
+        // reliable *reading* of the camera's yaw, so it says what number the real camera
+        // object must be holding right now. Shape plus that value is a specific enough
+        // signature to identify the object outright, and it re-checks itself every time
+        // it is used because the value moves as the camera does.
+        const float* mirror = reinterpret_cast<const float*>(0x00D38B3Cu);
+        if (!Readable(mirror, sizeof(float)) || !PlausibleAngle(*mirror))
+        {
+            WOWVR_WARN("Camera mirror unreadable; cannot identify the camera object yet.");
+            return nullptr;
+        }
+
+        // The mirror runs -pi..pi and the object runs 0..2pi, so compare wrapped.
+        const float twoPi = 6.28318530718f;
+        float wanted = *mirror;
+        if (wanted < 0.0f) { wanted += twoPi; }
+
+        float* best = nullptr;
+        int matches = 0;
+
+        uintptr_t address = 0x00010000u;
+        const uintptr_t limit = 0x7FFF0000u;
+        while (address < limit)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            if (WorthSearching(info) && info.RegionSize > kCameraYawMirrorB)
+            {
+                uint8_t* base = static_cast<uint8_t*>(info.BaseAddress);
+                const size_t last = info.RegionSize - kCameraYawMirrorB - sizeof(float);
+                for (size_t offset = 0; offset <= last; offset += sizeof(float))
+                {
+                    const float* first = reinterpret_cast<const float*>(base + offset);
+                    if (!PlausibleAngle(*first) || fabsf(*first - wanted) > 0.002f)
+                    {
+                        continue;
+                    }
+
+                    const float* mirrorA =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorA);
+                    const float* mirrorB =
+                        reinterpret_cast<const float*>(base + offset + kCameraYawMirrorB);
+                    if (*mirrorA != *first || *mirrorB != *first)
+                    {
+                        continue;
+                    }
+
+                    ++matches;
+                    if (best == nullptr)
+                    {
+                        best = const_cast<float*>(first);
+                    }
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        WOWVR_INFO("Camera search for yaw %.5f: %d match%s%s.", wanted, matches,
+                   (matches == 1) ? "" : "es",
+                   (best != nullptr) ? "" : " - camera not located");
+        return best;
+    }
+
+    float* CameraProbe::ResolveCameraYaw()
+    {
+        const uintptr_t* slot = reinterpret_cast<const uintptr_t*>(kCameraObjectPointer);
+        if (!Readable(slot, sizeof(uintptr_t)))
+        {
+            return nullptr;
+        }
+
+        const uintptr_t object = *slot;
+        if (object < 0x10000u)
+        {
+            return nullptr;
+        }
+
+        float* yaw = reinterpret_cast<float*>(object + kCameraYawOffset);
+        if (!Readable(yaw, sizeof(float)) || !PlausibleAngle(*yaw))
+        {
+            return nullptr;
+        }
+        return yaw;
+    }
+
+    void CameraProbe::VerifyCameraChain()
+    {
+        float* yaw = FindCameraByShape();
+        if (yaw == nullptr)
+        {
+            return;
+        }
+
+        WOWVR_INFO("Camera by shape: 0x%08X holding %.5f rad (%.2f deg).",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(yaw)),
+                   *yaw, *yaw * 57.2957795f);
+    }
+
+    // Reading the camera's yaw without trusting any address.
+    //
+    // The mirror is useless to write but perfectly reliable to read, so it says what the
+    // real camera object must be holding at this instant. Returns false before the world
+    // exists, which is normal rather than an error.
+    // Whether the player is moving the camera right now, decided from the input devices
+    // rather than from anything in the game's memory.
+    //
+    // The previous version read a "mirror" address for this, which was a mistake twice
+    // over: the address was not actually static, and using game memory to find game
+    // memory is circular anyway. The mouse and keyboard are outside the process, cost
+    // nothing to read, and cannot go stale.
+    bool CameraProbe::CameraIsMoving() const
+    {
+        // Either mouse button held is how the camera is turned in this client, and the
+        // keyboard turn keys do it too.
+        const bool dragging = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
+                           || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        const bool turning = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0
+                          || (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0
+                          || (GetAsyncKeyState('A') & 0x8000) != 0
+                          || (GetAsyncKeyState('D') & 0x8000) != 0
+                          || (GetAsyncKeyState('Q') & 0x8000) != 0
+                          || (GetAsyncKeyState('E') & 0x8000) != 0;
+        return dragging || turning;
+    }
+
+    // Keeps only candidates that still agree with the mirror.
+    //
+    // This replaces the change-detection used for the offline scan, and is far stronger.
+    // Change-detection only knows that something moved; matching the mirror's value knows
+    // *what it moved to*, and repeating that across samples taken at different camera
+    // angles leaves nothing but the camera itself. It also needs no synthesised input and
+    // no assumption about turn rate, so it works off ordinary play.
+    // Keeps candidates that moved exactly when the camera did, AND that still carry the
+    // camera object's layout: the same angle repeated at +0x144 and +0x148.
+    //
+    // Neither test is enough alone. The layout matched 214,087 places on its own, and
+    // change-detection alone leaves every value derived from the camera. Together they
+    // are specific, and neither needs a known address to start from.
+    void CameraProbe::FilterByBehaviour(bool expectedToChange)
+    {
+        size_t kept = 0;
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            DifferentialCandidate& candidate = g_differential[i];
+
+            float now = 0.0f;
+            float copyA = 0.0f;
+            float copyB = 0.0f;
+            if (!ReadTriple(candidate.address, now, copyA, copyB))
+            {
+                continue;
+            }
+
+            if (!PlausibleAngle(now))
+            {
+                continue;
+            }
+
+            float delta = now - candidate.value;
+            const float twoPi = 6.28318530718f;
+            if (delta > 3.14159265f)       { delta -= twoPi; }
+            else if (delta < -3.14159265f) { delta += twoPi; }
+
+            // Scored, for the same reason the pages are: one stray sample must not be
+            // able to discard the answer.
+            const bool changed = fabsf(delta) > 0.004f;
+            if (changed)
+            {
+                if (expectedToChange) { ++candidate.changes; }
+                else                  { ++candidate.stillChanges; }
+            }
+
+            candidate.value = now;
+            g_differential[kept] = candidate;
+            ++kept;
+        }
+        g_differential.resize(kept);
+    }
+
+    void CameraProbe::UpdateAutoLocate()
+    {
+        if (m_locateState == LocateState::Locked)
+        {
+            // Keep checking the layout still holds. If the object is freed or reallocated
+            // the three copies stop agreeing, and writing on regardless would be writing
+            // into whatever now occupies that memory.
+            if (++m_locateTick < 240) { return; }
+            m_locateTick = 0;
+
+            const float* copyA = m_cameraYawField + (kCameraYawMirrorA / sizeof(float));
+            const float* copyB = m_cameraYawField + (kCameraYawMirrorB / sizeof(float));
+            if (m_cameraYawField == nullptr || !Readable(m_cameraYawField, sizeof(float))
+                || !Readable(copyB, sizeof(float))
+                || !PlausibleAngle(*m_cameraYawField)
+                || *copyA != *m_cameraYawField || *copyB != *m_cameraYawField)
+            {
+                WOWVR_WARN("Camera object no longer has the expected layout; searching again.");
+                m_cameraYawField = nullptr;
+                m_locateState = LocateState::WaitingForMotion;
+                m_locatePasses = 0;
+            }
+            return;
+        }
+
+        if (m_locateState == LocateState::Failed)
+        {
+            return;
+        }
+
+        // Sampled rather than every frame: the camera has to have actually moved between
+        // one sample and the next for the classification to mean anything.
+        if (++m_locateTick < 45)
+        {
+            return;
+        }
+        m_locateTick = 0;
+
+        // Sampled twice: the camera has to have been moving for the WHOLE interval for
+        // the classification to be honest, so both ends of the interval are checked.
+        const bool movingNow = CameraIsMoving();
+        const bool moved = movingNow && m_wasMoving;
+        const bool still = !movingNow && !m_wasMoving;
+        m_wasMoving = movingNow;
+
+        // An interval that started moving and ended still, or the reverse, says nothing
+        // reliable about what changed during it.
+        if (!moved && !still)
+        {
+            return;
+        }
+
+        if (m_locateState == LocateState::Confirming)
+        {
+            float value = 0.0f;
+            float copyA = 0.0f;
+            float copyB = 0.0f;
+            const bool readable = ReadTriple(m_cameraYawField, value, copyA, copyB);
+            const bool changed = readable
+                && fabsf(WrapRadians(value - m_confirmLastValue)) > 0.004f;
+            m_confirmLastValue = readable ? value : m_confirmLastValue;
+
+            // It must move when the camera moves and hold when it does not. Either
+            // failure is disqualifying: a value that drifts on its own is not a heading,
+            // and one that ignores the camera is not this camera's.
+            if (!readable || copyA != value || copyB != value
+                || (moved && !changed) || (still && changed))
+            {
+                ++m_confirmFailures;
+            }
+            else if (moved)
+            {
+                ++m_confirmMoves;
+            }
+
+            if (m_confirmFailures > 0)
+            {
+                WOWVR_WARN("Candidate at 0x%08X failed confirmation; discarding it and "
+                           "continuing the search. Nothing was written.",
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)));
+                if (g_rejected.size() < 64u)
+                {
+                    g_rejected.push_back(m_cameraYawField);
+                }
+                DiscardCandidate(m_cameraYawField);
+                m_cameraYawField = nullptr;
+                m_locateState = LocateState::NarrowingFloats;
+                m_motionRounds = 0;
+            }
+            else if (m_confirmMoves >= 3)
+            {
+                m_locateState = LocateState::Locked;
+                m_locateTick = 0;
+                WOWVR_INFO("Camera confirmed at 0x%08X, holding %.4f rad (%.1f deg). "
+                           "Yaw is now under our control.",
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)),
+                           value, value * 57.2957795f);
+            }
+            return;
+        }
+
+        switch (m_locateState)
+        {
+        case LocateState::WaitingForMotion:
+            // Nothing can be classified until the camera is alive and moving.
+            if (moved)
+            {
+                CollectLayoutCandidates();
+                m_locateState = LocateState::NarrowingFloats;
+                m_locatePasses = 0;
+                m_motionRounds = 0;
+            }
+            break;
+
+        case LocateState::NarrowingFloats:
+            FilterByBehaviour(moved);
+            ++m_locatePasses;
+            if (moved) { ++m_motionRounds; }
+            if (DifferentialCandidates() == 0)
+            {
+                WOWVR_WARN("Camera search lost every candidate; starting again.");
+                m_locateState = LocateState::WaitingForMotion;
+                m_locatePasses = 0;
+                m_motionRounds = 0;
+            }
+            else if (m_motionRounds >= 4)
+            {
+                // Every candidate already had the layout when it was collected; this
+                // re-checks it now, so anything whose copies have since diverged - a
+                // coincidence rather than the camera - is dropped.
+                m_cameraYawField = FindLayoutMatch(true);
+                if (m_cameraYawField != nullptr)
+                {
+                    // Nothing is written yet. A candidate that has passed every test so
+                    // far can still be wrong, and writing to the wrong object corrupts
+                    // whatever really owns it - that is exactly what happened when this
+                    // settled on a buffer holding 1.0 and started writing head yaw into
+                    // it. So it now has to prove itself while still read-only.
+                    m_locateState = LocateState::Confirming;
+                    m_locateTick = 0;
+                    m_confirmMoves = 0;
+                    m_confirmFailures = 0;
+                    m_confirmLastValue = *m_cameraYawField;
+                    WOWVR_INFO("Camera candidate at 0x%08X holding %.4f rad (%.1f deg); "
+                               "confirming before anything is written.",
+                               static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)),
+                               *m_cameraYawField, *m_cameraYawField * 57.2957795f);
+                }
+                else if (m_motionRounds >= 8)
+                {
+                    WOWVR_WARN("Narrowed to %d candidates over %d motion rounds but none "
+                               "has the camera layout; starting again.",
+                               DifferentialCandidates(), m_motionRounds);
+                    m_locateState = LocateState::WaitingForMotion;
+                    m_locatePasses = 0;
+                    m_motionRounds = 0;
+                }
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    int CameraProbe::PageCount() const
+    {
+        return static_cast<int>(g_pages.size());
+    }
+
+    // Watching the neighbourhood of the confirmed yaw field.
+    //
+    // The zoom distance almost certainly lives in the same object, so there is no need to
+    // search memory again - only to see which nearby float moves when the wheel is turned
+    // and stays put otherwise. A window either side of the yaw is a few kilobytes, which
+    // is nothing to snapshot every time.
+    // Comparing everything against one stale snapshot cannot work here: the object holds
+    // per-frame state, so by the time the wheel has been turned half the window has moved
+    // for reasons of its own. So the same differential the camera search itself uses, at a
+    // much smaller scale - intervals in which nothing is done to the camera mark the fields
+    // that move anyway, and the answer is what moved on the wheel and never moved then.
+    namespace
+    {
+        const int kZoomWindowFloats = 1024;                  // 4 KB either side
+        float g_zoomBefore[kZoomWindowFloats * 2] = {};
+        bool g_zoomExcluded[kZoomWindowFloats * 2] = {};
+        bool g_zoomPrimed = false;
+
+        // A third-person camera distance in WoW's yards. Anything outside this is some
+        // other quantity that happens to move with the wheel.
+        bool PlausibleOrbitRadius(float value)
+        {
+            return std::isfinite(value) && value > 0.2f && value < 60.0f;
+        }
+
+        // One float, not three. ReadTriple also touches +0x144 and +0x148, which is right
+        // when testing the camera's own layout and wrong here: a slot near the end of the
+        // window fails only because those two lie past the allocation, and the perfectly
+        // readable field in front of them gets dropped.
+        __declspec(noinline) bool ReadFloatSafe(const float* address, float& value)
+        {
+            __try
+            {
+                value = *address;
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+    }
+
+    void CameraProbe::ZoomSnapshot()
+    {
+        if (m_cameraYawField == nullptr)
+        {
+            WOWVR_WARN("Camera not confirmed yet; nothing to snapshot around.");
+            return;
+        }
+
+        const float* window = m_cameraYawField - kZoomWindowFloats;
+        for (int i = 0; i < kZoomWindowFloats * 2; ++i)
+        {
+            float value = 0.0f;
+            const bool readable = ReadFloatSafe(window + i, value);
+            g_zoomBefore[i] = readable ? value : 0.0f;
+
+            // A slot that could not be read at priming is excluded outright rather than
+            // recorded as zero. Recording zero manufactures an enormous delta the moment
+            // it does become readable, and those fake deltas were the whole of the first
+            // report.
+            g_zoomExcluded[i] = !readable;
+        }
+        g_zoomPrimed = true;
+        WOWVR_INFO("Zoom watch primed around 0x%08X; exclusions cleared.",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)));
+    }
+
+    // The camera's pitch, found the same way the radius was: a vertical drag moved this
+    // field by 0.199 rad while the quiet intervals either side left it alone, and a copy at
+    // +0x114 moved with it. The object's layout is symmetric about the yaw - radius at -0x4,
+    // pitch at +0x4 - which is a good sign that all three are one record.
+    float CameraProbe::CameraPitch() const
+    {
+        if (m_cameraYawField == nullptr)
+        {
+            return 0.0f;
+        }
+
+        float value = 0.0f;
+        float mirrored = 0.0f;
+        if (!ReadFloatSafe(m_cameraYawField + 1, value)
+            || !ReadFloatSafe(m_cameraYawField + (kCameraPitchMirror / sizeof(float)), mirrored))
+        {
+            return 0.0f;
+        }
+
+        // A camera pitch, not an arbitrary angle: the client clamps it well short of
+        // straight up or down, so anything outside that is some other quantity.
+        if (!std::isfinite(value) || value < -1.6f || value > 1.6f
+            || fabsf(value - mirrored) > 0.05f)
+        {
+            return 0.0f;
+        }
+
+        return value;
+    }
+
+    // Pitch follows the head for the same reason yaw does: the client culls a band only
+    // 58.9 degrees tall, and if that band stays level while the head looks up, everything
+    // above the band is geometry the client never submitted.
+    void CameraProbe::AimPitchAtHead(float headPitchRadians)
+    {
+        if (m_cameraYawField == nullptr)
+        {
+            return;
+        }
+
+        float* pitch = m_cameraYawField + 1;
+        float* copy = m_cameraYawField + (kCameraPitchMirror / sizeof(float));
+
+        float current = 0.0f;
+        float mirrored = 0.0f;
+        if (!ReadFloatSafe(pitch, current) || !ReadFloatSafe(copy, mirrored)
+            || !std::isfinite(current) || fabsf(current - mirrored) > 0.05f)
+        {
+            return;
+        }
+
+        const bool oursSurvived = m_havePitched
+            && fabsf(current - m_lastPitchWritten) < 0.002f;
+        const float base = oursSurvived ? (current - m_appliedPitch) : current;
+
+        // Clamped to what the client itself allows. Writing past its own limits is asking
+        // for the kind of arithmetic the renderer was never built to survive.
+        float wanted = base + headPitchRadians;
+        if (wanted > 1.4f)  { wanted = 1.4f; }
+        if (wanted < -1.4f) { wanted = -1.4f; }
+
+        *pitch = wanted;
+        *copy = wanted;
+
+        m_lastPitchWritten = wanted;
+        m_appliedPitch = wanted - base;
+        m_havePitched = true;
+    }
+
+    float CameraProbe::AppliedPitch() const
+    {
+        return m_havePitched ? m_appliedPitch : 0.0f;
+    }
+
+    // Both copies are required to agree before the value is believed. A single field that
+    // happens to hold something in range is not evidence; the pair at that exact spacing
+    // is, and it is also how a freed or reallocated object gets noticed.
+    float CameraProbe::OrbitRadius() const
+    {
+        if (m_cameraYawField == nullptr)
+        {
+            return 0.0f;
+        }
+
+        const float* radius = m_cameraYawField - 1;                     // -0x4
+        const float* copy = m_cameraYawField + (0xCCu / sizeof(float)); // +0xCC
+
+        float value = 0.0f;
+        float mirrored = 0.0f;
+        if (!ReadFloatSafe(radius, value) || !ReadFloatSafe(copy, mirrored))
+        {
+            return 0.0f;
+        }
+
+        if (!std::isfinite(value) || value < 0.0f || value > 60.0f
+            || fabsf(value - mirrored) > 0.05f)
+        {
+            return 0.0f;
+        }
+
+        return value;
+    }
+
+    namespace
+    {
+        // Fields inside the camera object holding the field of view, and the factor to
+        // apply to them. Several, because the client keeps more than one copy of most
+        // things in there and it is not yet known which one the culler reads.
+        const int kMaxFovFields = 16;
+        float* g_fovFields[kMaxFovFields] = {};
+        float g_fovOriginal[kMaxFovFields] = {};
+        int g_fovFieldCount = 0;
+        float g_fovFactor = 0.0f;
+    }
+
+    void CameraProbe::ScanCameraObjectForFov(float expectedHalfFov)
+    {
+        g_fovFieldCount = 0;
+        if (m_cameraYawField == nullptr)
+        {
+            WOWVR_WARN("Camera not located; nothing to search for a field of view.");
+            return;
+        }
+
+        // Both the half-angle and the whole angle, since it is not known which convention
+        // the per-camera copy uses - the global holds the half.
+        const float wanted[2] = { expectedHalfFov, expectedHalfFov * 2.0f };
+
+        float* window = m_cameraYawField - kZoomWindowFloats;
+        for (int i = 0; i < kZoomWindowFloats * 2 && g_fovFieldCount < kMaxFovFields; ++i)
+        {
+            float value = 0.0f;
+            if (!ReadFloatSafe(window + i, value) || !std::isfinite(value))
+            {
+                continue;
+            }
+
+            for (int w = 0; w < 2; ++w)
+            {
+                if (fabsf(value - wanted[w]) > 0.004f)
+                {
+                    continue;
+                }
+
+                const int offset = (i - kZoomWindowFloats) * static_cast<int>(sizeof(float));
+                WOWVR_INFO("  field of view candidate at yaw%+d: %.5f rad (%.2f deg), "
+                           "matches the %s angle.",
+                           offset, value, value * 57.2957795f,
+                           (w == 0) ? "half" : "whole");
+                g_fovFields[g_fovFieldCount] = window + i;
+                g_fovOriginal[g_fovFieldCount] = value;
+                ++g_fovFieldCount;
+                break;
+            }
+        }
+
+        WOWVR_INFO("Field-of-view sweep of the camera object: %d candidate(s) near %.5f rad.",
+                   g_fovFieldCount, expectedHalfFov);
+    }
+
+    // Every copy of the widened field of view, anywhere in the process.
+    //
+    // Searching beside the camera found nothing, and guessing at encodings found nothing.
+    // But once the global has been written to an unusual value, that value is its own
+    // marker: anything holding it either is the global or was copied from it, and a copy
+    // is exactly what the renderer is believed to read. This says whether such a copy
+    // exists at all.
+    void CameraProbe::ScanForFovCopies(float wanted)
+    {
+        int found = 0;
+        uintptr_t address = 0x00010000u;
+        const uintptr_t limit = 0x7FFF0000u;
+
+        while (address < limit && found < 40)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            if (WorthSearching(info) && info.RegionSize >= sizeof(float))
+            {
+                float* hits[32];
+                const size_t n = ScanRegionForValue(static_cast<uint8_t*>(info.BaseAddress),
+                                                    info.RegionSize, wanted, hits, 32);
+                for (size_t i = 0; i < n && found < 40; ++i)
+                {
+                    const uintptr_t at = reinterpret_cast<uintptr_t>(hits[i]);
+                    WOWVR_INFO("  copy of the widened field of view at 0x%08X%s",
+                               static_cast<unsigned>(at),
+                               (at == 0x00ABFC38u) ? "  <- the global itself" : "");
+                    ++found;
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        WOWVR_INFO("Sweep for %.5f rad: %d location(s) hold it.", wanted, found);
+    }
+
+    void CameraProbe::SetFovOverride(float factor)
+    {
+        g_fovFactor = factor;
+        WOWVR_INFO("Field-of-view override %s (%d field(s), factor %.2f).",
+                   (factor > 0.0f) ? "ON" : "off", g_fovFieldCount, factor);
+    }
+
+    // Written every frame, because the client refreshes the copy from its own setting each
+    // time round - which is exactly why writing the setting alone did nothing.
+    void CameraProbe::ApplyFovOverride()
+    {
+        if (g_fovFactor <= 0.0f || g_fovFieldCount == 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < g_fovFieldCount; ++i)
+        {
+            float current = 0.0f;
+            if (!ReadFloatSafe(g_fovFields[i], current) || !std::isfinite(current))
+            {
+                continue;
+            }
+
+            // Against the recorded original rather than the live value, or multiplying a
+            // value we already multiplied runs away within a few frames.
+            const float wanted = g_fovOriginal[i] * g_fovFactor;
+            if (wanted > 0.05f && wanted < 1.5f)
+            {
+                *g_fovFields[i] = wanted;
+            }
+        }
+    }
+
+    // "idle" and "turned" only rule fields out; "zoomed" is what answers the question.
+    //
+    // Ruling out on a turn matters as much as ruling out on an idle interval: the whole
+    // object swings when the camera does, so without it every orientation field in the
+    // window would look like a zoom distance.
+    void CameraProbe::ZoomReport(const char* label)
+    {
+        if (m_cameraYawField == nullptr || !g_zoomPrimed)
+        {
+            WOWVR_WARN("Zoom watch not primed; nothing to report.");
+            return;
+        }
+
+        const bool excluding = (strcmp(label, "zoomed") != 0);
+
+        float* window = m_cameraYawField - kZoomWindowFloats;
+        int moved = 0;
+        int reported = 0;
+        for (int i = 0; i < kZoomWindowFloats * 2; ++i)
+        {
+            float now = 0.0f;
+            if (!ReadFloatSafe(window + i, now))
+            {
+                continue;
+            }
+
+            const float was = g_zoomBefore[i];
+            const bool changed = std::isfinite(now) && std::isfinite(was)
+                              && fabsf(now - was) > 0.0005f;
+
+            if (changed)
+            {
+                ++moved;
+            }
+
+            if (excluding)
+            {
+                // Re-primed as it goes, so each interval is measured against the one
+                // before it rather than against the beginning of the run.
+                if (changed)
+                {
+                    g_zoomExcluded[i] = true;
+                }
+                g_zoomBefore[i] = now;
+                continue;
+            }
+
+            if (!changed || g_zoomExcluded[i] || reported >= 40)
+            {
+                continue;
+            }
+
+            const int offset = (i - kZoomWindowFloats) * static_cast<int>(sizeof(float));
+            WOWVR_INFO("  zoomed: yaw%+d = %.4f (was %.4f, delta %+.4f)%s",
+                       offset, now, was, now - was,
+                       PlausibleOrbitRadius(now) ? "  <- plausible orbit radius" : "");
+            ++reported;
+        }
+
+        // The yaw itself is printed every interval, because "nothing changed" is otherwise
+        // ambiguous: it means either that the interval was genuinely quiet or that the
+        // stimulus never reached the client at all. A turn that leaves the yaw untouched
+        // is the second case, and that is worth knowing immediately rather than after the
+        // measurement has been built on top of it.
+        if (excluding)
+        {
+            WOWVR_INFO("  %s: %d of %d fields moved and are now excluded; yaw now %.4f rad.",
+                       label, moved, kZoomWindowFloats * 2, *m_cameraYawField);
+        }
+        else if (reported == 0)
+        {
+            WOWVR_INFO("  zoomed: %d fields moved but every one was already excluded; "
+                       "yaw now %.4f rad.", moved, *m_cameraYawField);
+        }
+    }
+
+    // Calibration: the search generates its own camera movement instead of waiting for
+    // the player's.
+    //
+    // Watching ordinary play does not converge. The offline version of this search worked
+    // because every turn was the SAME length, which makes a heading move by the same
+    // amount each time while its sine and cosine do not - by far the sharpest test
+    // available. Real drags vary in length, so that test has to be dropped, and what
+    // remains is too blunt: twenty-four rounds of play produced one rejection and thirteen
+    // restarts.
+    //
+    // So the stimulus is synthesised. A few identical nudges, injected here, restore the
+    // filter that actually works. The cost is that the camera visibly swings for a few
+    // seconds, which is why this is on a hotkey rather than automatic.
+    // One calibration round: keep whatever moved in the same direction as every other
+    // round, and record HOW FAR it moved rather than judging it.
+    //
+    // The earlier version filtered on proportionality with a fixed band, and that band
+    // kept eliminating the real camera - runs ended with zero candidates, or with one
+    // whose neighbouring field held 374.0 and so was never the camera at all. A threshold
+    // can throw away the right answer; a ranking cannot. So consistency is now measured
+    // here and used to choose at the end.
+    void CameraProbe::FilterCalibrationRound()
+    {
+        // Nothing is removed here any more. Requiring a candidate to move on EVERY round
+        // meant one injected nudge failing to register killed the real camera along with
+        // everything else - the count fell 52, 13, 9, 5, 3, 3, 1, 0 and ended with nothing.
+        // Rounds now only accumulate evidence, and the choice is made at the end.
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            DifferentialCandidate& candidate = g_differential[i];
+
+            float now = 0.0f;
+            float copyA = 0.0f;
+            float copyB = 0.0f;
+            if (!ReadTriple(candidate.address, now, copyA, copyB) || !PlausibleAngle(now))
+            {
+                continue;
+            }
+
+            float delta = now - candidate.value;
+            const float twoPi = 6.28318530718f;
+            if (delta > 3.14159265f)       { delta -= twoPi; }
+            else if (delta < -3.14159265f) { delta += twoPi; }
+
+            candidate.value = now;
+
+            if (fabsf(delta) <= 0.004f)
+            {
+                continue;               // did not move this round; simply no evidence
+            }
+
+            // Every nudge goes the same way, so a heading moves the same way each time.
+            // A round that disagrees is counted against the candidate rather than
+            // disqualifying it outright.
+            const int sign = (delta > 0.0f) ? 1 : -1;
+            if (candidate.signWhenTurningRight == 0)
+            {
+                candidate.signWhenTurningRight = sign;
+            }
+            else if (candidate.signWhenTurningRight != sign)
+            {
+                ++candidate.stillChanges;   // reused here as "rounds that disagreed"
+                continue;
+            }
+
+            const float magnitude = fabsf(delta);
+            candidate.deltaSum += magnitude;
+            candidate.deltaSqSum += magnitude * magnitude;
+            ++candidate.deltaCount;
+        }
+    }
+
+    // The candidate whose movement was most consistent across identical nudges. A heading
+    // turns by the same amount every time; anything derived from it does not.
+    float* CameraProbe::MostConsistentCandidate(int rounds) const
+    {
+        float* best = nullptr;
+        float bestSpread = 0.0f;
+        int reported = 0;
+
+        // Counted separately, because when this returns nothing there is no way to tell
+        // which of its conditions did the rejecting - and guessing at exactly that
+        // question has already cost several build-and-run cycles. Each count is over the
+        // whole set, independent of the others, so a zero names the culprit outright.
+        int movedAtAll = 0;
+        int passedMovement = 0;
+        int passedDirection = 0;
+        int passedBothMotion = 0;
+        int passedLayout = 0;
+        int passedRadius = 0;
+        int passedEverything = 0;
+
+        struct Contender
+        {
+            float* address = nullptr;
+            float value = 0.0f;
+            float spread = 0.0f;
+            int moved = 0;
+        };
+        static const int kTopContenders = 6;
+        Contender top[kTopContenders];
+
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            const DifferentialCandidate& candidate = g_differential[i];
+
+            float value = 0.0f;
+            float copyA = 0.0f;
+            float copyB = 0.0f;
+            const bool readable = ReadTriple(candidate.address, value, copyA, copyB);
+            const bool layoutHolds = readable
+                                  && fabsf(copyA - value) <= 0.05f
+                                  && fabsf(copyB - value) <= 0.05f;
+
+            const bool movement = (candidate.deltaCount * 3 >= rounds * 2);
+            const bool direction = (candidate.stillChanges <= 1);
+
+            // The whole record, not just the yaw copies - but nothing that depends on the
+            // zoom level.
+            //
+            // Requiring a non-zero orbit radius looked right and was wrong: it assumes the
+            // zoom-out landed, and when that silently fails the camera is in first person
+            // with radius zero and the filter excludes the very thing it is looking for.
+            // Zero is therefore allowed; only disagreement between the copies is not.
+            //
+            // The zoom-independent discriminator is the yaw itself. The client stores a
+            // heading in [0, 2pi) and the real camera reads 4.08, while every false winner
+            // so far held roughly nothing - 0.0363, -0.0212, -0.0000 - three runs running,
+            // at 25-33% spread against the real camera's 0.4%. A negative value is not how
+            // the client stores this at all.
+            float radius = 0.0f;
+            float radiusCopy = 0.0f;
+            const bool radiusHolds =
+                ReadFloatSafe(candidate.address - 1, radius)
+                && ReadFloatSafe(candidate.address + (kCameraRadiusMirror / sizeof(float)),
+                                 radiusCopy)
+                && std::isfinite(radius) && radius >= 0.0f && radius < 60.0f
+                && fabsf(radius - radiusCopy) <= 0.05f;
+
+            const bool headingShaped = (value > 0.05f && value < 6.23f);
+
+            if (candidate.deltaCount > 0)   { ++movedAtAll; }
+            if (movement)                   { ++passedMovement; }
+            if (direction)                  { ++passedDirection; }
+            if (movement && direction)      { ++passedBothMotion; }
+            if (layoutHolds)                { ++passedLayout; }
+            if (radiusHolds && headingShaped) { ++passedRadius; }
+            if (movement && direction && layoutHolds && radiusHolds && headingShaped)
+            {
+                ++passedEverything;
+            }
+
+            // Finiteness first, explicitly.
+            //
+            // NaN defeats every "reject if outside tolerance" test in this function,
+            // because all comparisons against NaN are false - so a field full of garbage
+            // passes the layout check, passes the spread check, and wins with a spread of
+            // 0.0%. Four of the top six contenders in one run held -nan. This is the one
+            // guard that cannot be left implicit.
+            if (!std::isfinite(value) || !PlausibleAngle(value))
+            {
+                continue;
+            }
+
+            // Layout only, as hard gates.
+            //
+            // The radius and heading tests above are kept for the record they print, not as
+            // filters: they were added during a failing streak and never once turned a
+            // failure into a success, and a filter that has not earned its place is just
+            // another way to discard the answer. This is the configuration that located the
+            // camera six times running earlier.
+            if (!movement || !direction || !layoutHolds)
+            {
+                continue;
+            }
+
+            const float mean = candidate.deltaSum / candidate.deltaCount;
+            if (mean <= 0.0001f)
+            {
+                continue;
+            }
+            const float variance =
+                (candidate.deltaSqSum / candidate.deltaCount) - (mean * mean);
+            const float spread = (variance > 0.0f) ? (sqrtf(variance) / mean) : 0.0f;
+
+            if (best == nullptr || spread < bestSpread)
+            {
+                best = candidate.address;
+                bestSpread = spread;
+            }
+
+            // The runners-up are what say whether the winner stands out or is simply the
+            // least bad of a uniformly poor field - so they are kept by rank rather than
+            // by passing a threshold. The previous version only printed candidates under
+            // 5% spread, which meant that on the run where the winner came in at 29% it
+            // printed nothing at all, exactly when the comparison was most needed.
+            if (reported < kTopContenders || spread < top[kTopContenders - 1].spread)
+            {
+                int slot = (reported < kTopContenders) ? reported : (kTopContenders - 1);
+                while (slot > 0 && spread < top[slot - 1].spread)
+                {
+                    top[slot] = top[slot - 1];
+                    --slot;
+                }
+                top[slot].address = candidate.address;
+                top[slot].value = value;
+                top[slot].spread = spread;
+                top[slot].moved = candidate.deltaCount;
+                if (reported < kTopContenders)
+                {
+                    ++reported;
+                }
+            }
+        }
+
+        for (int i = 0; i < reported; ++i)
+        {
+            WOWVR_INFO("  contender %d: 0x%08X, %.4f rad, moved %d/%d rounds, spread %.1f%%",
+                       i + 1,
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(top[i].address)),
+                       top[i].value, top[i].moved, rounds, top[i].spread * 100.0f);
+        }
+
+        WOWVR_INFO("Selection over %zu candidates and %d rounds: %d moved at all, "
+                   "%d moved on >=2/3 of rounds, %d disagreed on direction at most once, "
+                   "%d passed both, %d carry the three-copy layout, %d carry an orbit "
+                   "radius, %d passed everything.",
+                   g_differential.size(), rounds, movedAtAll, passedMovement,
+                   passedDirection, passedBothMotion, passedLayout, passedRadius,
+                   passedEverything);
+
+        if (best != nullptr)
+        {
+            WOWVR_INFO("Most consistent candidate 0x%08X varies by %.1f%% across nudges.",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(best)),
+                       bestSpread * 100.0f);
+        }
+        return best;
+    }
+
+    void CameraProbe::BeginCalibration()
+    {
+        if (m_calState != CalibrationState::Idle)
+        {
+            WOWVR_INFO("Calibration already running.");
+            return;
+        }
+
+        // Seeded from the signature sweep, with the page phase dropped.
+        //
+        // Page narrowing is the fragile part: it keeps only pages that changed on every
+        // nudge and were quiet between, and the camera's page does not reliably satisfy
+        // that - it worked six runs in a row and then failed every run afterwards with the
+        // drags still demonstrably turning the camera (verified by screenshot, MAD 6.99).
+        //
+        // The first attempt at seeding from the signature failed for reasons now
+        // understood and fixed: it demanded the copies agree exactly at the instant of the
+        // sweep, and it required a non-zero orbit radius, which excludes a first-person
+        // camera outright. With loose comparisons, radius zero allowed, and pitch and its
+        // copy added - seven constrained fields instead of five - the camera is in the set.
+        ScanForCameraSignature();
+        m_calPhase = 1;
+        WOWVR_INFO("Calibration starting: game window %s focus.",
+                   (GetForegroundWindow() == GetActiveWindow()) ? "appears to have" : "may not have");
+        m_calState = CalibrationState::Nudging;
+        m_calFrame = 0;
+        m_calRound = 0;
+        m_calNudged = 0;
+        m_calRestoring = false;
+        WOWVR_INFO("Camera calibration started: narrowing pages first, then floats. The "
+                   "view will swing and then be put back.");
+    }
+
+    // The settled check that authorises writing. Runs after the calibration has finished,
+    // which is why it sits ahead of the idle test rather than inside the state machine.
+    void CameraProbe::UpdateVerification()
+    {
+        if (m_locateState != LocateState::Verifying || m_cameraYawField == nullptr)
+        {
+            return;
+        }
+
+        if (--m_verifyDelay > 0)
+        {
+            return;
+        }
+
+        float value = 0.0f;
+        float copyA = 0.0f;
+        float copyB = 0.0f;
+        const bool yawOk = ReadTriple(m_cameraYawField, value, copyA, copyB)
+                        && PlausibleAngle(value)
+                        && fabsf(copyA - value) <= 0.05f
+                        && fabsf(copyB - value) <= 0.05f;
+
+        const float radius = OrbitRadius();
+
+        // The same guard at the gate that authorises writing. A heading of nearly zero
+        // beside a radius of nearly zero is zeroed memory, not a camera, and this is the
+        // last check before head yaw starts being written into it.
+        const bool headingShaped = fabsf(value) > 0.01f;
+
+        if (!yawOk || !headingShaped || radius <= 0.0f)
+        {
+            WOWVR_WARN("Camera candidate 0x%08X failed verification once settled "
+                       "(yaw %.4f, +0x144 %.4f, +0x148 %.4f, radius %.3f). "
+                       "Nothing has been written.",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)),
+                       value, copyA, copyB, radius);
+            m_cameraYawField = nullptr;
+            m_locateState = LocateState::Failed;
+            return;
+        }
+
+        m_locateState = LocateState::Locked;
+        m_locateTick = 0;
+        WOWVR_INFO("Camera VERIFIED at 0x%08X: yaw %.4f rad (%.1f deg), radius %.3f yards. "
+                   "Head aiming is now live.",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(m_cameraYawField)),
+                   value, value * 57.2957795f, radius);
+    }
+
+    void CameraProbe::UpdateCalibration()
+    {
+        UpdateVerification();
+
+        if (m_calState == CalibrationState::Idle)
+        {
+            return;
+        }
+
+        const int step = 8;                 // pixels of drag per frame
+        const int nudgeFrames = 15;         // 120 px per nudge
+        const int settleFrames = 20;
+
+        switch (m_calState)
+        {
+        case CalibrationState::Nudging:
+            if (m_calFrame == 0)
+            {
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            }
+            mouse_event(MOUSEEVENTF_MOVE, m_calRestoring ? -step : step, 0, 0, 0);
+            if (++m_calFrame >= nudgeFrames)
+            {
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                m_calFrame = 0;
+                m_calState = CalibrationState::Settling;
+            }
+            break;
+
+        case CalibrationState::Settling:
+            if (++m_calFrame < settleFrames)
+            {
+                break;
+            }
+            m_calFrame = 0;
+
+            if (m_calRestoring)
+            {
+                // The view has been put back; nothing left to measure.
+                if (++m_calNudged >= kCalibrationRounds)
+                {
+                    FinishCalibration();
+                }
+                else
+                {
+                    m_calState = CalibrationState::Nudging;
+                }
+                break;
+            }
+
+            if (m_calPhase == 0)
+            {
+                // The camera just moved, so its page must have changed.
+                FilterPages(true);
+                m_calState = CalibrationState::Pausing;
+            }
+            else
+            {
+                // Scored, never eliminated.
+                //
+                // Hard filtering was tried here and died exactly as it has every previous
+                // time: 4841 candidates went to 36 on the first round and to 0 on the
+                // second, because one injected nudge that fails to register discards the
+                // right answer along with everything else. Rounds only accumulate
+                // evidence; the choice happens once, at the end, by lowest spread.
+                FilterCalibrationRound();
+                ++m_calRound;
+                WOWVR_INFO("Calibration float round %d over %d candidates.", m_calRound,
+                           DifferentialCandidates());
+                if (m_calRound >= kCalibrationRounds || DifferentialCandidates() == 0)
+                {
+                    m_calRestoring = true;
+                    m_calNudged = 0;
+                }
+                m_calState = CalibrationState::Nudging;
+            }
+            break;
+
+        case CalibrationState::Pausing:
+            // Nothing is being done to the camera during this interval, which is what
+            // makes it worth anything: a page that changes anyway is not the camera's.
+            if (++m_calFrame < settleFrames)
+            {
+                break;
+            }
+            m_calFrame = 0;
+            FilterPages(false);
+            ++m_calRound;
+            WOWVR_INFO("Calibration page round %d: %d pages.", m_calRound, PageCount());
+
+            if (m_calRound >= kCalibrationPageRounds)
+            {
+                SelectScoredPages(m_calRound);
+                PromotePagesToFloats();
+                m_calPhase = 1;
+                m_calRound = 0;
+            }
+            m_calState = CalibrationState::Nudging;
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    void CameraProbe::FinishCalibration()
+    {
+        m_calState = CalibrationState::Idle;
+        m_calRestoring = false;
+
+        float* found = MostConsistentCandidate(m_calRound);
+        if (found == nullptr)
+        {
+            WOWVR_WARN("Calibration finished with %d candidates but none carries the "
+                       "camera layout. Nothing has been written.", DifferentialCandidates());
+            for (int i = 0; i < DifferentialCandidates() && i < 5; ++i)
+            {
+                float* address = CandidateAt(i);
+                float value = 0.0f;
+                float copyA = 0.0f;
+                float copyB = 0.0f;
+                const bool ok = ReadTriple(address, value, copyA, copyB);
+                WOWVR_INFO("  survivor 0x%08X: read %s, value %.5f, +0x144 %.5f, +0x148 %.5f, "
+                           "roundish %s, rejected %s",
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(address)),
+                           ok ? "ok" : "FAILED", value, copyA, copyB,
+                           (value * 8.0f == floorf(value * 8.0f)) ? "yes" : "no",
+                           AlreadyRejected(address) ? "yes" : "no");
+            }
+            return;
+        }
+
+        // Held read-only until the camera has stopped moving and the full layout - both
+        // yaw copies and both radius copies - agrees. Nothing may be written before that:
+        // locking onto a wrong buffer and writing head yaw into it is what corrupted the
+        // client before, and CameraLocated() stays false throughout this phase.
+        m_cameraYawField = found;
+        m_locateState = LocateState::Verifying;
+        m_verifyDelay = 120;
+        WOWVR_INFO("Calibration proposes the camera at 0x%08X holding %.4f rad (%.1f deg); "
+                   "verifying the layout once it settles.",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(found)), *found,
+                   *found * 57.2957795f);
+    }
+
+    bool CameraProbe::CameraLocated() const
+    {
+        return m_cameraYawField != nullptr && m_locateState == LocateState::Locked;
+    }
+
+    bool CameraProbe::LocateFailed() const
+    {
+        return m_locateState == LocateState::Failed;
+    }
+
+    void CameraProbe::ResetLocate()
+    {
+        m_cameraYawField = nullptr;
+        m_locateState = LocateState::WaitingForMotion;
+        m_locatePasses = 0;
+        m_motionRounds = 0;
+        m_haveAimed = false;
+        m_havePitched = false;
+    }
+
+    void CameraProbe::DiscardCandidate(const float* address)
+    {
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            if (g_differential[i].address == address)
+            {
+                g_differential.erase(g_differential.begin() + i);
+                return;
+            }
+        }
+    }
+
+    float* CameraProbe::FirstCandidate() const
+    {
+        return g_differential.empty() ? nullptr : g_differential[0].address;
+    }
+
+    float* CameraProbe::CandidateAt(int index) const
+    {
+        return (index >= 0 && index < static_cast<int>(g_differential.size()))
+            ? g_differential[index].address : nullptr;
+    }
+
+    // The camera object repeats its yaw at +0x144 and +0x148. Over a set already narrowed
+    // by behaviour, that layout is what picks the camera out of the values derived from it.
+    float* CameraProbe::FindLayoutMatch(bool requireBehaviourScore) const
+    {
+        for (size_t i = 0; i < g_differential.size(); ++i)
+        {
+            // The behaviour counters are only filled in by the passive search. Calibration
+            // establishes the same thing far more strongly - identical nudges, and a
+            // proportionality test the passive path cannot use - so demanding them there
+            // rejected a candidate that the calibration had already narrowed to one.
+            if (requireBehaviourScore
+                && (g_differential[i].changes < 3 || g_differential[i].stillChanges > 1))
+            {
+                continue;
+            }
+
+            if (AlreadyRejected(g_differential[i].address))
+            {
+                continue;
+            }
+
+            // Reject round constants. Every false positive so far has been an exact
+            // binary fraction - 1.0000, 0.7500, 0.1250 - sitting in a buffer that happens
+            // to repeat it at the right spacing. A heading arrived at by turning a camera
+            // is essentially never an exact eighth.
+            const float scaled = g_differential[i].value * 8.0f;
+            if (scaled == floorf(scaled))
+            {
+                continue;
+            }
+
+            float* candidate = g_differential[i].address;
+            float value = 0.0f;
+            float copyA = 0.0f;
+            float copyB = 0.0f;
+            if (!ReadTriple(candidate, value, copyA, copyB))
+            {
+                continue;
+            }
+            if (fabsf(copyA - value) <= 0.05f && fabsf(copyB - value) <= 0.05f
+                && PlausibleAngle(value))
+            {
+                return candidate;
+            }
+        }
+        return nullptr;
+    }
+
+    void CameraProbe::FindPointerChain()
+    {
+        if (g_differential.empty())
+        {
+            WOWVR_WARN("No camera field to trace a pointer chain from.");
+            return;
+        }
+
+        const uintptr_t field = reinterpret_cast<uintptr_t>(g_differential[0].address);
+        // A pointer to the object will land at or before the field, within about a page.
+        const uintptr_t lowest = field - 0x1000u;
+        const uintptr_t highest = field + 0x10u;
+
+        WOWVR_INFO("Tracing pointers that land inside the camera object (field 0x%08X):",
+                   static_cast<unsigned>(field));
+
+        int found = 0;
+        uintptr_t address = 0x00400000u;
+        const uintptr_t imageEnd = 0x01000000u;
+        while (address < imageEnd && found < 40)
+        {
+            MEMORY_BASIC_INFORMATION info = {};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0)
+            {
+                break;
+            }
+
+            const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY
+                                 | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if (info.State == MEM_COMMIT && (info.Protect & writable) != 0
+                && (info.Protect & PAGE_GUARD) == 0)
+            {
+                const uintptr_t* words = static_cast<const uintptr_t*>(info.BaseAddress);
+                const size_t count = info.RegionSize / sizeof(uintptr_t);
+                for (size_t i = 0; i < count && found < 40; ++i)
+                {
+                    const uintptr_t value = words[i];
+                    if (value >= lowest && value <= highest)
+                    {
+                        const uintptr_t holder =
+                            reinterpret_cast<uintptr_t>(info.BaseAddress) + i * sizeof(uintptr_t);
+                        WOWVR_INFO("  static 0x%08X -> 0x%08X, field at +0x%X",
+                                   static_cast<unsigned>(holder), static_cast<unsigned>(value),
+                                   static_cast<unsigned>(field - value));
+                        ++found;
+                    }
+                }
+            }
+
+            address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+
+        if (found == 0)
+        {
+            WOWVR_INFO("  none - no static word points into the object, so the chain has "
+                       "at least one heap hop and needs a second level.");
+        }
+    }
+
+    void CameraProbe::ReportDifferential()
+    {
+        WOWVR_INFO("Differential scan finished with %zu candidates:", g_differential.size());
+        const size_t show = (g_differential.size() < 40u) ? g_differential.size() : 40u;
+        for (size_t i = 0; i < show; ++i)
+        {
+            WOWVR_INFO("    0x%08X = %.5f rad (%.2f deg)",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_differential[i].address)),
+                       g_differential[i].value,
+                       g_differential[i].value * 57.2957795f);
+        }
+    }
+
+    void CameraProbe::WatchCameraStruct(const Vec3& cameraPosition, bool havePosition)
+    {
+        // The struct that owns the field of view. The setting lives at +0xC4 of it, so
+        // the object starts here; the window is walked as raw floats rather than as any
+        // assumed layout, because the layout is exactly what is not known.
+        const uintptr_t kFovField = 0x00ABFC38u;
+        const uintptr_t kStructBase = kFovField - 0xC4u;
+        const int kFloats = 192;                 // 768 bytes either side of the setting
+
+        const float* fields = reinterpret_cast<const float*>(kStructBase);
+        if (!Readable(fields, kFloats * sizeof(float)))
+        {
+            return;
+        }
+
+        static float previous[kFloats] = {};
+        static bool primed = false;
+        static int frame = 0;
+        ++frame;
+
+        if (!primed)
+        {
+            primed = true;
+            for (int i = 0; i < kFloats; ++i) { previous[i] = fields[i]; }
+            WOWVR_INFO("Watching the camera struct at 0x%08X (%d floats). Move and turn: "
+                       "fields that change are per-frame camera state, fields that do not "
+                       "are settings.",
+                       static_cast<unsigned>(kStructBase), kFloats);
+            return;
+        }
+
+        // Only every so often: the point is to see what moves as the player does, not
+        // to record every frame.
+        if ((frame % 60) != 0)
+        {
+            return;
+        }
+
+        if (havePosition)
+        {
+            WOWVR_INFO("Camera position off the wire: %.3f %.3f %.3f",
+                       cameraPosition.x, cameraPosition.y, cameraPosition.z);
+        }
+
+        for (int i = 0; i < kFloats; ++i)
+        {
+            const float now = fields[i];
+            const float was = previous[i];
+            if (!std::isfinite(now) || !std::isfinite(was))
+            {
+                previous[i] = now;
+                continue;
+            }
+
+            const float change = fabsf(now - was);
+            if (change <= 1e-4f)
+            {
+                continue;
+            }
+            previous[i] = now;
+
+            // Flag anything that looks like it could be one of the coordinates we
+            // decoded, so a match jumps out of the log rather than having to be
+            // spotted by eye.
+            const char* note = "";
+            if (havePosition)
+            {
+                if (fabsf(now - cameraPosition.x) < 0.5f) { note = "  <- matches camera X"; }
+                else if (fabsf(now - cameraPosition.y) < 0.5f) { note = "  <- matches camera Y"; }
+                else if (fabsf(now - cameraPosition.z) < 0.5f) { note = "  <- matches camera Z"; }
+            }
+
+            WOWVR_INFO("  +0x%03X = %12.4f (was %12.4f)%s",
+                       static_cast<unsigned>(i * sizeof(float)), now, was, note);
+        }
     }
 
     bool CameraProbe::WidenGameFov(float desiredHalfAngleRadians)

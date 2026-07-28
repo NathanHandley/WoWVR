@@ -188,6 +188,8 @@ namespace wowvr
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);
+        config.cullWidenScale =
+            ReadFloat(path, L"Camera", L"CullWidenScale", config.cullWidenScale);
         config.shadowDepthBias =
             ReadFloat(path, L"Camera", L"ShadowDepthBias", config.shadowDepthBias);
         config.shadowCoverageScale =
@@ -195,6 +197,14 @@ namespace wowvr
         config.scanForCamera = ReadBool(path, L"Camera", L"ScanForCamera", config.scanForCamera);
         config.probeCameraByWriting =
             ReadBool(path, L"Camera", L"ProbeCameraByWriting", config.probeCameraByWriting);
+        config.watchCameraStruct =
+            ReadBool(path, L"Camera", L"WatchCameraStruct", config.watchCameraStruct);
+        config.autoLocateCamera =
+            ReadBool(path, L"Camera", L"AutoLocateCamera", config.autoLocateCamera);
+        config.aimCameraAtHead =
+            ReadBool(path, L"Camera", L"AimCameraAtHead", config.aimCameraAtHead);
+        config.disableCameraCollision =
+            ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
 
         config.panelDistance = ReadFloat(path, L"Panel", L"Distance", config.panelDistance);
         config.panelWidth = ReadFloat(path, L"Panel", L"Width", config.panelWidth);
@@ -241,6 +251,8 @@ namespace wowvr
         if (config.worldScale > 10.0f)  { config.worldScale = 10.0f; }
         if (config.cullFovScale < 1.0f) { config.cullFovScale = 1.0f; }
         if (config.cullFovScale > 4.0f) { config.cullFovScale = 4.0f; }
+        if (config.cullWidenScale < 1.0f) { config.cullWidenScale = 1.0f; }
+        if (config.cullWidenScale > 3.0f) { config.cullWidenScale = 3.0f; }
         if (config.panelDistance < 0.3f) { config.panelDistance = 0.3f; }
         if (config.panelOpacity < 0.05f) { config.panelOpacity = 0.05f; }
         if (config.panelOpacity > 1.0f)  { config.panelOpacity = 1.0f; }

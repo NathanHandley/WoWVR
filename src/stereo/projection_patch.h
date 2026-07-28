@@ -28,6 +28,48 @@ namespace wowvr
         // Treats the next head orientation as looking straight ahead.
         void Recenter();
 
+        // How much of the head's yaw the game's own camera has already been turned by.
+        //
+        // Once the game's camera follows the head, the world arrives already rotated -
+        // the client bakes its view transform into the vertices on the CPU. Adding the
+        // same rotation again here would turn the world twice as far as the head moved,
+        // which is both wrong and unpleasant to wear. So this is subtracted back out, and
+        // what remains for the projection to apply is the part the game has not done:
+        // pitch, roll, and any yaw still catching up.
+        void SetGameCameraYaw(float radians) { m_gameCameraYaw = radians; }
+
+        // The distance the game's camera orbits the character at.
+        //
+        // Undoing the rotation above is not enough on its own, because the camera is a
+        // third-person ORBIT camera: turning its yaw does not pivot it in place, it swings
+        // it around the character on a circle of this radius. Cancel only the rotation and
+        // the leftover translation reads as the whole view sliding sideways with no change
+        // of facing. Zero disables the correction, which is also correct in first person.
+        void SetGameCameraOrbitRadius(float yards) { m_gameCameraOrbitRadius = yards; }
+
+        // The measured view-space displacement aiming the camera caused, in yards.
+        void SetOrbitDisplacement(const Vec3& yards) { m_orbitDisplacement = yards; }
+        void SetGameCameraPitch(float radians) { m_gameCameraPitch = radians; }
+
+        // A synthetic head pitch, for the same reason as the synthetic yaw: looking up and
+        // down has to be testable with the headset lying still on a desk.
+        void SetFakeHeadPitch(float radians) { m_fakeHeadPitch = radians; }
+
+        // Stands in for leaning or stepping, in metres, so positional tracking can be
+        // exercised with the headset sitting still on a desk.
+        // Diagnostic: the order the game camera's two rotations are unwound in. Only has
+        // any effect when yaw and pitch are both non-zero, which is exactly the case that
+        // went untested and shipped a residual roll.
+        void SetUnwindPitchFirst(bool on) { m_unwindPitchFirst = on; }
+
+        // +1 or -1 on the third-person orbit correction, so the direction can be measured
+        // rather than argued about.
+        void SetOrbitSign(float sign) { m_orbitSign = sign >= 0.0f ? 1.0f : -1.0f; }
+        float OrbitSign() const { return m_orbitSign; }
+
+        void SetFakeHeadOffset(const Vec3& metres) { m_fakeHeadOffset = metres; }
+        const Vec3& FakeHeadOffset() const { return m_fakeHeadOffset; }
+
         // Refreshes the head rotation from the current HMD pose. Called once a frame.
         void UpdateFromHeadPose(const Mat4& headToStage);
 
@@ -68,9 +110,28 @@ namespace wowvr
 
         bool HasSceneMatrix() const { return m_haveSceneMatrix; }
 
+        // Where the game's camera sits in world coordinates, recovered from the
+        // matrices on the wire.
+        //
+        // The residual left after dividing out the projection is world-to-view for
+        // anything drawn in world coordinates - terrain and buildings - and
+        // object-to-view for a model that had its placement baked in. The two cannot be
+        // told apart one at a time, but they can in bulk: every world-space draw yields
+        // the same camera position, while each model yields its own. So the position
+        // the most draws agree on is the camera's, and models scatter harmlessly.
+        bool CameraWorldPosition(Vec3& out) const;
+
         // Head yaw relative to the recentred origin, in radians, in the game's
         // left-handed convention. Drives the body-locked panel.
         float HeadYaw() const { return m_headYaw; }
+
+        // Stands in for the headset having turned. Everything downstream treats it as a
+        // real head turn, which is the point: it exercises the mechanism rather than an
+        // imitation of it.
+        void SetFakeHeadYaw(float radians) { m_fakeHeadYaw = radians; }
+        float FakeHeadYaw() const { return m_fakeHeadYaw; }
+        float HeadPitch() const { return m_headPitch; }
+        float HeadRoll() const { return m_headRoll; }
 
         // The scene camera's own parameters, as decoded from the matrix the game
         // uploads. These are what the camera in memory must also be holding, which is
@@ -109,6 +170,10 @@ namespace wowvr
         // The per-eye replacement for a projection, in row-vector form: the headset's
         // frustum, the eye offset and the head correction, with the original depth
         // terms carried over so depth behaves exactly as the client expects.
+        // Shared by every path that corrects geometry. See the definitions.
+        Mat4 HeadCorrection() const;
+        void ApplyOrbitCompensation(float& offsetX, float& offsetY, float& offsetZ) const;
+
         Mat4 BuildEyeProjection(int eye, float nearPlane, float farPlane,
                                 const Mat4& original) const;
 
@@ -118,6 +183,19 @@ namespace wowvr
         Vec3 m_neutralPosition;
         Vec3 m_headOffset;              // metres, relative to the recentred origin
         float m_headYaw = 0.0f;
+        float m_fakeHeadYaw = 0.0f;
+        float m_fakeHeadPitch = 0.0f;
+        Vec3 m_fakeHeadOffset;
+        bool m_unwindPitchFirst = false;
+        float m_orbitSign = 1.0f;
+        Vec3 m_orbitDisplacement;
+        bool m_yawIsStable = true;
+        bool m_haveHeldYaw = false;
+        float m_gameCameraPitch = 0.0f;
+        float m_headPitch = 0.0f;
+        float m_headRoll = 0.0f;
+        float m_gameCameraYaw = 0.0f;
+        float m_gameCameraOrbitRadius = 0.0f;
         bool m_recenterRequested = true;
 
         // Perspective matrices that were recognised but not treated as the scene
@@ -156,6 +234,55 @@ namespace wowvr
         float m_lastAspect = 0.0f;
         float m_lastNear = 0.0f;
         float m_lastFar = 0.0f;
+
+        // Agreement counting for the camera position, reset every frame.
+        void NoteWorldView(const Mat4& worldView);
+        struct PositionVote
+        {
+            Vec3 position;
+            int count = 0;
+        };
+        static constexpr int kPositionVotes = 8;
+        PositionVote m_positionVotes[kPositionVotes];
+        int m_positionVoteCount = 0;
+        PositionVote m_lastVotes[kPositionVotes];
+        int m_lastVoteCount = 0;
+        Vec3 m_cameraPosition;
+        bool m_haveCameraPosition = false;
+        struct YawVote
+        {
+            float yaw = 0.0f;
+            int count = 0;
+        };
+        YawVote m_yawVotes[kPositionVotes];
+        int m_yawVoteCount = 0;
+        float m_cameraYaw = 0.0f;
+        int m_cameraYawWeight = 0;
+        bool m_haveCameraYaw = false;
+        unsigned long long m_residualsSeen = 0;
+        unsigned long long m_residualsNearOrigin = 0;
+        unsigned long long m_residualsRigid = 0;
+
+    public:
+        // WoW's own camera orientation, recovered from the wire. This is both the anchor
+        // for finding the camera in memory and the value that would have to be written
+        // to aim its culling somewhere else.
+        bool CameraYaw(float& out) const
+        {
+            if (!m_haveCameraYaw) { return false; }
+            out = m_cameraYaw;
+            return true;
+        }
+        int CameraYawWeight() const { return m_cameraYawWeight; }
+
+        unsigned long long ResidualsSeen() const { return m_residualsSeen; }
+        unsigned long long ResidualsNearOrigin() const { return m_residualsNearOrigin; }
+        unsigned long long ResidualsRigid() const { return m_residualsRigid; }
+        // The whole tally from the frame just finished. When the winner turns out not
+        // to be the camera, what else was in the running is the informative part.
+        int VoteCount() const { return m_lastVoteCount; }
+        const Vec3& VotePosition(int index) const { return m_lastVotes[index].position; }
+        int VoteWeight(int index) const { return m_lastVotes[index].count; }
     };
 
     ProjectionPatch& Projection();
