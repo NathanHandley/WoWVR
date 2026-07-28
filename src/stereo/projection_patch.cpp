@@ -245,16 +245,27 @@ namespace wowvr
             m_haveHeldYaw = true;
         }
 
-        // Displacement since recentring, rotated out of stage space into the frame the
-        // game's camera is looking along, then flipped to left-handed. This is what
-        // makes leaning and stepping sideways actually move the viewpoint.
+        // Displacement since recentring, expressed in the HEAD'S OWN frame - not the
+        // neutral frame, and not the game camera's.
+        //
+        // The corrected view ends up oriented exactly like the head, so a translation
+        // applied after the head rotation needs the displacement's components along
+        // the head's current right, up and forward. Expressing them in the neutral
+        // frame and applying them in the camera's frame - which is what this used to
+        // do - agrees with that only while the two frames agree, i.e. while the
+        // camera is level. The moment the camera pitched at the ground, the player's
+        // real vertical motion was spent along the camera's tilted up axis: standing
+        // up barely changed height, and the loss leaked into a forward slide that
+        // moved the ground with the head. That is the head-height lock, and this
+        // frame change is its fix.
         const float dx = headPosition.x - m_neutralPosition.x;
         const float dy = headPosition.y - m_neutralPosition.y;
         const float dz = headPosition.z - m_neutralPosition.z;
 
-        m_headOffset.x = dx * m_neutralInverse.m[0][0] + dy * m_neutralInverse.m[1][0] + dz * m_neutralInverse.m[2][0];
-        m_headOffset.y = dx * m_neutralInverse.m[0][1] + dy * m_neutralInverse.m[1][1] + dz * m_neutralInverse.m[2][1];
-        m_headOffset.z = -(dx * m_neutralInverse.m[0][2] + dy * m_neutralInverse.m[1][2] + dz * m_neutralInverse.m[2][2]);
+        const Mat4 headInverse = TransposeRotation(headRotation);
+        m_headOffset.x = dx * headInverse.m[0][0] + dy * headInverse.m[1][0] + dz * headInverse.m[2][0];
+        m_headOffset.y = dx * headInverse.m[0][1] + dy * headInverse.m[1][1] + dz * headInverse.m[2][1];
+        m_headOffset.z = -(dx * headInverse.m[0][2] + dy * headInverse.m[1][2] + dz * headInverse.m[2][2]);
     }
 
     // The head rotation with whatever the game's own camera has already been turned by taken
@@ -296,38 +307,38 @@ namespace wowvr
     // The sign is switchable because the previous attempt was, by its own comment, derived
     // rather than measured - and it was inverted, which doubles the swing instead of
     // cancelling it. Measured this time.
-    void ProjectionPatch::ApplyOrbitCompensation(float& offsetX, float& offsetY,
-                                                 float& offsetZ) const
+    // The complete view-space correction: the client's orbit swing undone in the
+    // CAMERA's frame, then the residual head rotation, then the head displacement and
+    // eye offset undone in the HEAD's frame.
+    //
+    // Each translation lives in the frame it was measured in. m_orbitDisplacement says
+    // where the client moved its camera, on that camera's own axes and in world units
+    // (see GameCamera::OrbitDisplacementView), so it is undone before the rotation -
+    // subtracted, with no metres-to-yards conversion and no world scale, because
+    // scaling it would move the viewpoint by an amount the camera did not move by.
+    // The head displacement and the eye offset are what the player does with their
+    // body, so they are undone after the rotation - in the frame the corrected view
+    // actually points along, which is the head's own. Folding them into one
+    // pre-rotation translation is what pinned the head's vertical motion to the
+    // camera's tilted axes.
+    Mat4 ProjectionPatch::ViewCorrection(float offsetX, float offsetY, float offsetZ) const
     {
-        if (m_gameCameraOrbitRadius <= 0.0f
-            || (m_gameCameraYaw == 0.0f && m_gameCameraPitch == 0.0f))
+        Mat4 correction = Mat4Multiply(HeadCorrection(),
+                                       Mat4Translation(-offsetX, -offsetY, -offsetZ));
+
+        if (m_gameCameraOrbitRadius > 0.0f
+            && (m_gameCameraYaw != 0.0f || m_gameCameraPitch != 0.0f))
         {
-            return;
+            // The single overall sign stays as a field switch; the per-axis signs are
+            // gone for good - see the history in git if they ever look tempting.
+            const float scale = m_orbitSign;
+            const Mat4 orbit = Mat4Translation(m_orbitDisplacement.x * scale,
+                                               m_orbitDisplacement.y * scale,
+                                               m_orbitDisplacement.z * scale);
+            correction = Mat4Multiply(orbit, correction);
         }
 
-        // Measured by the caller from the camera's own position and basis; see
-        // GameCamera::OrbitDisplacementView.
-
-        // SUBTRACTED, and in the same units it arrives in.
-        //
-        // offsetX/Y/Z say where the eye is relative to the game's camera, in world units, on
-        // the D3D view axes - right, up, forward. m_orbitDisplacement says how far the
-        // camera MOVED from where it would have been, on those same axes, already in world
-        // units because it came from a radius in yards. So the eye belongs at minus that,
-        // and there is no metres-to-yards conversion to apply and no world scale: scaling it
-        // would move the viewpoint by an amount the camera did not move by.
-        //
-        // The per-axis signs are gone. They existed because the measurement they were
-        // correcting was wrong twice over - a left vector read as a right vector, and an
-        // un-aimed direction reconstructed on the wrong side of the real one - and while the
-        // camera was also being hauled about by collision, no test could tell any of it
-        // apart. With collision off and both errors fixed the correction is a subtraction
-        // with nothing left to choose. The single overall sign stays as a field switch.
-        const float scale = m_orbitSign;
-
-        offsetX -= m_orbitDisplacement.x * scale;
-        offsetY -= m_orbitDisplacement.y * scale;
-        offsetZ -= m_orbitDisplacement.z * scale;
+        return correction;
     }
 
     Mat4 ProjectionPatch::HeadCorrection() const
@@ -513,13 +524,9 @@ namespace wowvr
             // stereo separation. Combined with the head displacement since recentring.
             const Vec3 eyeOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
 
-            float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
-            float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
-            float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
-
-            // This path never had the orbit correction at all - the same one-of-two-copies
-            // gap that left the sky uncompensated.
-            ApplyOrbitCompensation(offsetX, offsetY, offsetZ);
+            const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
+            const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
+            const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
 
             if (Cfg().eyeProjectionPassThrough)
             {
@@ -554,11 +561,10 @@ namespace wowvr
             }
             else if (Cfg().headTracking)
             {
-                // A point at P in the old view frame sits at (P - d) * R in the new
-                // one, so the correction ahead of the projection is T(-d) then R.
-                const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
-                const Mat4 correction = Mat4Multiply(translation, headRotation);
-                replacement = Mat4Multiply(correction, replacement);
+                // Orbit undone in the camera's frame, rotation, then the head's own
+                // motion undone in the head's frame; see ViewCorrection.
+                replacement = Mat4Multiply(ViewCorrection(offsetX, offsetY, offsetZ),
+                                           replacement);
             }
             else
             {
@@ -610,26 +616,19 @@ namespace wowvr
         const float unitsPerMetre = Cfg().unitsPerMetre * Cfg().worldScale;
         const Vec3 eyeOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
 
-        // Not const: the orbit correction is a view-space shift like these, so it folds in
-        // here rather than being applied separately. Y is no longer exempt - the vertical
-        // half of the swing is exactly what was missing.
-        float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
-        float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
-        float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
-
-        ApplyOrbitCompensation(offsetX, offsetY, offsetZ);
-
-        const Mat4 headRotation = HeadCorrection();
+        const float offsetX = (m_headOffset.x + eyeOffset.x) * unitsPerMetre;
+        const float offsetY = (m_headOffset.y + eyeOffset.y) * unitsPerMetre;
+        const float offsetZ = (m_headOffset.z - eyeOffset.z) * unitsPerMetre;
 
         if (m_infiniteDistance)
         {
-            return Cfg().headTracking ? Mat4Multiply(headRotation, replacement) : replacement;
+            return Cfg().headTracking ? Mat4Multiply(HeadCorrection(), replacement)
+                                      : replacement;
         }
 
-        const Mat4 translation = Mat4Translation(-offsetX, -offsetY, -offsetZ);
         const Mat4 correction = Cfg().headTracking
-            ? Mat4Multiply(translation, headRotation)
-            : translation;
+            ? ViewCorrection(offsetX, offsetY, offsetZ)
+            : Mat4Translation(-offsetX, -offsetY, -offsetZ);
 
         return Mat4Multiply(correction, replacement);
     }

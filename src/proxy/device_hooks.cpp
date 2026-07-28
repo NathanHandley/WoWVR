@@ -37,6 +37,7 @@ namespace wowvr
         typedef HRESULT (WINAPI *PresentFn)(IDirect3DDevice9*, const RECT*, const RECT*,
                                             HWND, const RGNDATA*);
         typedef HRESULT (WINAPI *ResetFn)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+        typedef HRESULT (WINAPI *BeginSceneFn)(IDirect3DDevice9*);
         typedef HRESULT (WINAPI *SetTransformFn)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
         typedef HRESULT (WINAPI *SetVertexShaderConstantFFn)(IDirect3DDevice9*, UINT, const float*, UINT);
         typedef HRESULT (WINAPI *CreateVertexShaderFn)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
@@ -58,6 +59,7 @@ namespace wowvr
         CreateDeviceFn g_originalCreateDevice = nullptr;
         PresentFn g_originalPresent = nullptr;
         ResetFn g_originalReset = nullptr;
+        BeginSceneFn g_originalBeginScene = nullptr;
         SetTransformFn g_originalSetTransform = nullptr;
         SetVertexShaderConstantFFn g_originalSetVertexShaderConstantF = nullptr;
         CreateVertexShaderFn g_originalCreateVertexShader = nullptr;
@@ -2267,6 +2269,53 @@ namespace wowvr
                 LogSetLevel(Cfg().logLevel);
                 WOWVR_INFO("F12: WoWVR.ini reloaded.");
             }
+        }
+
+        // Re-measures the orbit compensation from the camera the client has JUST
+        // updated for the frame it is about to build.
+        //
+        // The measurement in the Present hook is a frame old by the time it is used:
+        // the camera is written at the end of frame N, the client moves it during its
+        // update, and frame N+1 is rendered against wherever it actually ended up.
+        // While the camera is still - the common case - stale equals fresh and nothing
+        // shows. While it is in motion the error is (camera movement per frame), which
+        // during a third-person zoom is the radius change every single frame: the
+        // world bounced against the head at exactly the zoom rate. BeginScene runs
+        // after the client's update and before any draw, on the same thread, so a
+        // measurement here is exact for the frame being built.
+        void RefreshOrbitCompensation()
+        {
+            if (!g_aimEnabled || !Cfg().aimCameraAtHead || !Vr().IsActive())
+            {
+                return;
+            }
+
+            // Re-resolved rather than trusted: the camera object dies across every
+            // loading screen, and BeginScene is called during them too.
+            if (!GameCam().Update())
+            {
+                return;
+            }
+
+            Projection().SetGameCameraOrbitRadius(
+                g_compensateOrbit ? GameCam().OrbitRadius() : 0.0f);
+
+            Vec3 orbitShift;
+            if (g_compensateOrbit
+                && GameCam().OrbitDisplacementView(GameCam().AppliedYaw(), orbitShift))
+            {
+                Projection().SetOrbitDisplacement(orbitShift);
+            }
+            else
+            {
+                Projection().SetOrbitDisplacement(Vec3());
+            }
+        }
+
+        HRESULT WINAPI HookedBeginScene(IDirect3DDevice9* device)
+        {
+            RefreshOrbitCompensation();
+            return g_originalBeginScene(device);
         }
 
         HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
@@ -5210,11 +5259,19 @@ namespace wowvr
                 g_originalReset = reinterpret_cast<ResetFn>(original);
             }
 
+            original = nullptr;
+            if (HookVTableSlot(device, slot::device9::BeginScene, &HookedBeginScene, &original)
+                && original != nullptr)
+            {
+                g_originalBeginScene = reinterpret_cast<BeginSceneFn>(original);
+            }
+
             InstallDiagnosticHooks(device);
 
-            WOWVR_INFO("Device hooks installed (Present=%s, Reset=%s).",
+            WOWVR_INFO("Device hooks installed (Present=%s, Reset=%s, BeginScene=%s).",
                        g_originalPresent != nullptr ? "ok" : "FAILED",
-                       g_originalReset != nullptr ? "ok" : "FAILED");
+                       g_originalReset != nullptr ? "ok" : "FAILED",
+                       g_originalBeginScene != nullptr ? "ok" : "FAILED");
 
             if (Cfg().frameReportNumber > 0)
             {

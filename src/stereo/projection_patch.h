@@ -172,7 +172,7 @@ namespace wowvr
         // terms carried over so depth behaves exactly as the client expects.
         // Shared by every path that corrects geometry. See the definitions.
         Mat4 HeadCorrection() const;
-        void ApplyOrbitCompensation(float& offsetX, float& offsetY, float& offsetZ) const;
+        Mat4 ViewCorrection(float offsetX, float offsetY, float offsetZ) const;
 
         Mat4 BuildEyeProjection(int eye, float nearPlane, float farPlane,
                                 const Mat4& original) const;
