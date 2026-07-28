@@ -701,6 +701,39 @@ namespace wowvr
         float g_fakeHeadYaw = 0.0f;
         bool g_compensateOrbit = true;
         bool g_aimEnabled = true;
+        bool g_pitchTrace = false;
+
+        // Stepped pitch aiming. The camera is a culling device, not the view - the
+        // view takes its pitch from the head matrix regardless of what the camera
+        // holds. So the camera only needs to be WITHIN the widened frustum's vertical
+        // margin of the head, not equal to it, and re-aiming it every frame just
+        // churns the client's camera update against the compensation - the
+        // 'correction loop' a nod exposes. Held at a 30-degree band centre instead,
+        // and moved only when the head pitch leaves the band by a margin: ordinary
+        // nodding then writes nothing at all, and the client's camera sits perfectly
+        // still while the head does the moving.
+        bool g_pitchStepEnabled = true;
+        float g_pitchAimHeld = 0.0f;
+
+        float SteppedAimPitch(float headPitch)
+        {
+            if (!g_pitchStepEnabled)
+            {
+                return headPitch;
+            }
+
+            const float kBand = 0.5236f;   // 30 degrees between band centres
+            const float kSlack = 0.105f;   // 6 degrees past the edge before re-aiming
+
+            if (fabsf(headPitch - g_pitchAimHeld) > kBand * 0.5f + kSlack)
+            {
+                const float previous = g_pitchAimHeld;
+                g_pitchAimHeld = kBand * floorf(headPitch / kBand + 0.5f);
+                WOWVR_INFO("Pitch band re-aim: %+.4f -> %+.4f (head %+.4f).",
+                           previous, g_pitchAimHeld, headPitch);
+            }
+            return g_pitchAimHeld;
+        }
         // Vertical aiming, on now that the pitch field is read out of the client's own code
         // rather than guessed at. Aspect ratio buys width and cannot buy height, so moving
         // the client's 58.9-degree vertical band with the head is the only way there is
@@ -2356,6 +2389,13 @@ namespace wowvr
             }
             g_compensationFresh = true;
             RefreshCameraCompensation();
+
+            // The persisted camera blocks are rebuilt here too, and only here: they
+            // feed the early terrain draws of this very frame, so they must use the
+            // same fresh measurement as everything re-uploaded later, or the two
+            // halves of the world disagree by exactly the camera's per-frame motion.
+            FindAllCameraRegisters();
+            RefreshPatchedBlocks();
         }
 
         HRESULT WINAPI HookedBeginScene(IDirect3DDevice9* device)
@@ -2370,9 +2410,6 @@ namespace wowvr
         HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                      HWND windowOverride, const RGNDATA* dirtyRegion)
         {
-            // The next frame's first constant upload re-measures the compensation.
-            g_compensationFresh = false;
-
             // Closes the observation window on the frame the game has just finished.
             Report().EndFrame();
 
@@ -2421,10 +2458,32 @@ namespace wowvr
                     // one consumer that genuinely wants the other sign.
                     g_uiPanel.Update(-Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
 
-                    FindAllCameraRegisters();
-                    RefreshPatchedBlocks();
-
+                    // The persisted camera blocks are deliberately NOT refreshed here.
+                    // At this point the client has not updated its camera for the
+                    // frame this pose belongs to, so blocks rebuilt now would carry a
+                    // one-update-stale compensation - and they feed the early terrain
+                    // draws that happen before the client re-uploads the register.
+                    // During a nod that put the near terrain and the rest of the world
+                    // a per-frame pitch delta apart, shaking the whole scene. They are
+                    // rebuilt in EnsureFreshCameraCompensation instead, at the first
+                    // constant upload of the new frame, when the camera is final.
                 }
+            }
+
+            // One line per frame while armed. Reading across a row: 'head' and 'wrote'
+            // belong to the frame about to be built; 'facingNow', 'comp' and 'baked'
+            // describe the frame just finished. A shake is attributed by whichever
+            // column disagrees with 'baked' on the frames the head was moving.
+            if (g_pitchTrace)
+            {
+                float facingYaw = 0.0f;
+                float facingPitch = 0.0f;
+                GameCam().CameraFacing(facingYaw, facingPitch);
+                WOWVR_INFO("pitchtrace f%llu: head %+.4f wrote %+.4f facingNow %+.4f "
+                           "comp %+.4f baked %+.4f",
+                           g_frameCount, Projection().HeadPitch(), GameCam().AppliedPitch(),
+                           facingPitch, Projection().CompensationPitchUsed(),
+                           Projection().LastBakedPitch());
             }
 
             ++g_frameCount;
@@ -2788,15 +2847,19 @@ namespace wowvr
                 // The client ADDS these to the heading the camera would otherwise have, so
                 // writing them turns the view and leaves the character alone. Both are
                 // absolute intent restated every frame, not deltas: the client owns the
-                // fields between our writes.
+                // fields between our writes. Pitch is stepped, not tracked; see
+                // SteppedAimPitch.
                 GameCam().SetFreeLook(Projection().HeadYaw(),
-                                      g_aimPitch ? Projection().HeadPitch() : 0.0f);
+                                      g_aimPitch ? SteppedAimPitch(Projection().HeadPitch())
+                                                 : 0.0f);
 
                 // And taken straight back out of the projection we substitute, or the head
-                // rotation lands twice and the world turns at double rate. Pitch is the
-                // measured value, not the intent; see CompensationPitch.
+                // rotation lands twice and the world turns at double rate. Only the yaw
+                // intent is set here; the pitch is measured fresh per frame in
+                // RefreshCameraCompensation, and measuring it HERE - with the client's
+                // camera not yet updated for the frame this pose belongs to - is stale
+                // by construction and once masked the very trace built to catch it.
                 Projection().SetGameCameraYaw(GameCam().AppliedYaw());
-                Projection().SetGameCameraPitch(CompensationPitch());
                 // Before anything reads the radius: collision is the dominant motion in
                 // third person, and pinning it is the only thing that addresses that.
                 GameCam().PinOrbitRadius(g_pinOrbitRadius);
@@ -2963,6 +3026,18 @@ namespace wowvr
                         Projection().SetFakeHeadPitch(p);
                         WOWVR_INFO("Fake head pitch %.3f rad (%.1f deg).",
                                    p, p * 57.2957795f);
+                    }
+                    else if (strncmp(command, "pitchtrace", 10) == 0)
+                    {
+                        g_pitchTrace = !g_pitchTrace;
+                        WOWVR_INFO("Pitch trace %s.", g_pitchTrace ? "ON" : "OFF");
+                    }
+                    else if (strncmp(command, "pitchstep", 9) == 0)
+                    {
+                        g_pitchStepEnabled = !g_pitchStepEnabled;
+                        WOWVR_INFO("Stepped pitch aiming %s.",
+                                   g_pitchStepEnabled ? "ON (camera holds a band centre)"
+                                                      : "OFF (camera tracks the head)");
                     }
                     // The frustum the client culls against, now that the renderer's own copy
                     // of it has been found inside the camera object. Reported after the
@@ -3244,6 +3319,15 @@ namespace wowvr
 
             g_depthRangeCount = 0;
             Report().BeginFrame(g_frameCount);
+
+            // Armed at the END of the hook, after every piece of our own device work.
+            // Armed at the top, the panel compositing and mirror blits inside this very
+            // hook re-entered the constant/transform hooks, consumed the once-per-frame
+            // refresh with the client's camera still un-updated, and the whole next
+            // frame then drew against a one-frame-stale measurement. Invisible while
+            // the camera was still; a full band-width turn for one frame at a pitch
+            // re-aim, and the per-frame delta whenever the camera was tracking.
+            g_compensationFresh = false;
             return hr;
         }
 

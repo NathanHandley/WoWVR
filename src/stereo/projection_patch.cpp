@@ -841,6 +841,25 @@ namespace wowvr
         if (LooksLikeRigidPlacement(worldView))
         {
             ++m_residualsRigid;
+
+            // A rigid residual is the world-to-view transform with at most an
+            // unrotated placement composed in - terrain, mostly - so its rotation IS
+            // the camera exactly as baked into this draw's geometry. Its pitch is the
+            // ground truth every compensation wants to agree with: the world is Z-up,
+            // so the forward component of the world z axis is sin(pitch), normalised
+            // in case the placement carried a uniform scale. Recording it per frame
+            // is what lets a trace compare "what we compensated" against "what the
+            // geometry actually carried".
+            const float rowLength = sqrtf(worldView.m[2][0] * worldView.m[2][0]
+                                        + worldView.m[2][1] * worldView.m[2][1]
+                                        + worldView.m[2][2] * worldView.m[2][2]);
+            if (rowLength > 0.5f)
+            {
+                float sinPitch = worldView.m[2][2] / rowLength;
+                if (sinPitch > 1.0f) { sinPitch = 1.0f; }
+                if (sinPitch < -1.0f) { sinPitch = -1.0f; }
+                m_lastBakedPitch = asinf(sinPitch);
+            }
         }
 
         Vec3 position;

@@ -153,6 +153,13 @@ namespace wowvr
         const Mat4& HeadRotation() const { return m_headRotation; }
         const Vec3& HeadOffsetMetres() const { return m_headOffsetNeutral; }
 
+        // Trace taps for the pitch pipeline: the camera pitch actually baked into this
+        // frame's geometry (from the combined-transform residual) and the compensation
+        // pitch this frame was corrected with. Comparing the two per frame is how a
+        // shake gets attributed instead of theorised about.
+        float LastBakedPitch() const { return m_lastBakedPitch; }
+        float CompensationPitchUsed() const { return m_gameCameraPitch; }
+
         // Diagnostics for the log.
         unsigned long long PatchedCount() const { return m_patched; }
         unsigned long long RejectedCount() const { return m_rejected; }
@@ -198,6 +205,7 @@ namespace wowvr
         bool m_yawIsStable = true;
         bool m_haveHeldYaw = false;
         float m_gameCameraPitch = 0.0f;
+        float m_lastBakedPitch = 0.0f;
         float m_headPitch = 0.0f;
         float m_headRoll = 0.0f;
         float m_gameCameraYaw = 0.0f;
