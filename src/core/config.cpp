@@ -232,6 +232,17 @@ namespace wowvr
         config.cullRotateMaxOffAxisDegrees =
             ReadFloat(path, L"Camera", L"CullRotateMaxOffAxisDegrees",
                       config.cullRotateMaxOffAxisDegrees);
+        config.cullTerrainAllAround =
+            ReadBool(path, L"Camera", L"CullTerrainAllAround", config.cullTerrainAllAround);
+        config.cullRotateMasterCorners =
+            ReadBool(path, L"Camera", L"CullRotateMasterCorners",
+                     config.cullRotateMasterCorners);
+        config.wmoGroupsAlwaysVisible =
+            ReadBool(path, L"Camera", L"WmoGroupsAlwaysVisible",
+                     config.wmoGroupsAlwaysVisible);
+        config.cullMasterShadowFeeds = static_cast<unsigned>(
+            ReadInt(path, L"Camera", L"CullMasterShadowFeeds",
+                    static_cast<int>(config.cullMasterShadowFeeds)));
         config.disableCameraCollision =
             ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
 

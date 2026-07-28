@@ -163,6 +163,121 @@ namespace wowvr
         // the width covers the one case symmetry does not, an opening dead ahead.
         void SetShapeGate(float minSpanDegrees, float maxOffAxisDegrees);
 
+        // Lets terrain be drawn all the way around the camera while the head drives
+        // culling. Rotating the clip volumes never touched ADT terrain, because terrain
+        // does not test against those planes at all: its directional gate is a view-cone
+        // angle test against cos(cullFov * 0.5), recomputed every frame into 0x00CD877C
+        // by the world update (CLIENT_INTERNALS.md sections 8.1 and 8.2). With the cull
+        // FoV already clamped at the client's ceiling that cone reaches about +/-90
+        // degrees of the CHARACTER's heading - so a head turned further than that stands
+        // over a void: buildings and doodads follow the head (they cull via the rotated
+        // planes), the ground under them does not. Creatures survive because they are
+        // not scene-graph culled, which is exactly the split observed in Goldshire.
+        //
+        // Writing -1.0 over the cosine makes every chunk pass the angle test, and only
+        // that test: horizon occlusion (the 384-bucket azimuth array, which is
+        // direction-independent), the 50-unit rule and the chunk index box all keep
+        // working. The client recomputes the value every frame, so switching this off -
+        // or crashing out - restores stock behaviour by itself within a frame.
+        void SetOpenTerrainCone(bool on);
+
+        // Diagnostic fallback for the cone, command-only. Clears CWorld's terrain-culling
+        // bit (0x20 in the flags dword at 0x00CD774C) every frame while on, which skips
+        // every terrain visibility test - the view-cone AND the horizon-occlusion
+        // buckets. If a terrain void survives the opened cone, one command flip of this
+        // separates "the cone was not the gate that failed" from "the azimuth buckets
+        // are only built for the heading's sector". Asserted per frame because the
+        // client re-ors the bit on every world load; turning it off restores the bit at
+        // once rather than waiting for the next load.
+        void SetDisableTerrainCulling(bool on);
+
+        // Experiment, command-only: stomps the world's own plane set (the six planes
+        // at 0x00CDB108, extracted from view x projection - the one directional
+        // terrain gate left after the cone and the bit-0x20 tests were eliminated)
+        // with all-pass planes, normal zero and the given d. Positive d passes
+        // everything under the ClipVolume convention (inside when dot(n,p) + d >= 0);
+        // if this set uses the opposite sign, positive d culls everything instead,
+        // which is why the sign arrives as an argument rather than an assumption.
+        // Idempotent by construction, so it is re-asserted on every plane rebuild
+        // without any once-per-frame bookkeeping. Logs the planes it found the first
+        // time after each toggle-on, which is the measurement of what this set held.
+        void SetOpenWorldPlanes(bool on, float passDistance);
+
+        // The missing half of head-driven culling, found by elimination in Goldshire.
+        //
+        // 0x00CDB108 holds the MASTER frustum corners - eight world-space points CWorld
+        // rebuilds every frame from the camera's own (character-heading) view. Every
+        // volume the per-copy rotation steers is DERIVED from them via SetCorners, but
+        // terrain consumes the master directly (fifteen .text references), so terrain
+        // kept culling to the character no matter what the copies did: with every clip
+        // volume rotated, the view-cone cosine at -1 and every bit-0x20 test skipped,
+        // the ground still vanished beyond the widen margin while doodads followed the
+        // head. Corrupting the master removed the entire world, which is the proof of
+        // where everything starts.
+        //
+        // Rotating the master must happen exactly once per client refresh (a rotation
+        // is not idempotent, and OnPlanesBuilt fires ~17 times a frame). The guard is a
+        // snapshot of our own rotated output: the client's rewrite is always an
+        // unrotated set, so "differs from the snapshot" is precisely "the client has
+        // refreshed since we last rotated". Copies made after the rotation arrive
+        // pre-rotated and the shape gate skips them (their corners no longer average
+        // onto the camera's forward axis); copies made before it still measure centred
+        // and take the per-copy rotation. Each volume carries the turn exactly once.
+        void SetRotateMasterCorners(bool on);
+
+        // Chooses, per consumer, WHICH master the client reads: the live array (which
+        // the rotation above turns to the head) or an unrotated shadow copy this module
+        // keeps fresh.
+        //
+        // Why both exist: rotating the master in place fixed terrain, and broke WMO
+        // interiors at head angles as small as 17 degrees - measured in the Lion's
+        // Pride Inn, the kitchen beyond one doorway blanked with the master rotated
+        // and returned with it left alone, pitch contribution zeroed, nothing else
+        // changed. The client derives its portal-clipped volumes by combining the
+        // portal's SCREEN rectangle (projected with the real, unturned camera) with
+        // the master corners; feed that derivation a rotated master and every volume
+        // past the first doorway points away from the room it was cut to. Terrain has
+        // no such screen-space half and wants the rotated set. Same array, two
+        // consumers with opposite needs - so the read sites get separated.
+        //
+        // The four candidate sites are the byte-verified fixed-address readers found
+        // by scanning .text for the array's address (the builder's own read-modify-
+        // write references and the zero-initialiser are excluded on purpose, and the
+        // eax-indexed reader at 0x00790B9C is excluded because its base address can
+        // legally index OTHER volumes than the master):
+        //
+        //   0  0x0078FAED  mov esi, master; rep movsd   - copies the master out whole
+        //   1  0x0079A8B1  push master                  - SetCorners source, view array
+        //   2  0x007AC466  push master                  - consumer, function unknown
+        //   3  0x007B3A35  push master                  - consumer beside the WMO family
+        //
+        // Each is a one-dword displacement patch, verified against both accepted
+        // values before writing, reversible per site at runtime - because which sites
+        // are terrain and which are portal derivation is settled by live bisection,
+        // not by argument.
+        static const int kMasterFeedSiteCount = 4;
+        bool SetMasterFeed(int site, bool shadow);
+        void SetMasterFeedMask(unsigned shadowMask);
+
+        // Answers "fully inside" for the map-object family of the shared AABB test -
+        // the thirteen call sites in 0x007BB000-0x007BDFFF that decide which GROUPS of
+        // an already-visible WMO draw. Those tests run against volumes carried inside
+        // the WMO structures, whose derivation does not survive the culling volume
+        // being pointed away from the character: at the Goldshire smithy a 61-degree
+        // total culling turn emptied the breezeway in every rotation regime. Until
+        // that derivation is understood, interiors of accepted WMOs simply always
+        // draw. Terrain, the scene-node walk and the stack-local family still cull.
+        // Identified by RETURN ADDRESS in a detour on 0x009839E0, because caller
+        // address is the one fact that separates the families (section 8.10).
+        void SetWmoGroupsAlwaysVisible(bool on);
+
+        // Narrows which return addresses the bypass answers for, in published-image
+        // (0x00400000-based) terms. The twelve map-object sites cluster into three
+        // groups (0x007BBBDD; nine in 0x007BC55F..0x007BCE7D; 0x007BD052/0x007BD16E),
+        // and the blanket bypass tripled the world-pass draw count, so the useful set
+        // is found by live bisection rather than taken whole.
+        void SetWmoBypassRange(uintptr_t loPublished, uintptr_t hiPublished);
+
         // Logs the filtered view's eight corner points and six planes, as the client built
         // them, against the camera's own position and forward axis - once, on the next
         // build.
@@ -193,9 +308,20 @@ namespace wowvr
         // private member.
         void OnPlanesBuilt(void* view, uintptr_t caller);
 
+        // Called by the cull-setup detour at the entry of CWorld's per-frame cull
+        // setup - after the world update has rewritten the master corners and before
+        // the first SetCorners copy of them. Rotating the master here is what lets the
+        // portal cuts inherit the turn; the build-event path provably ran one copy too
+        // late. Public for the same naked-stub reason as OnPlanesBuilt.
+        void OnWorldCullSetup();
+
     private:
         bool ApplyPatch(bool on);
         bool BuildTrampoline();
+        bool InstallWmoGroupBypass();
+        bool InstallCullSetupHook();
+        bool InstallMasterFillHook();
+        bool MaybeRotateMaster(const float position[3], const float forward[3]);
         void DumpVolume(const void* view, uintptr_t caller, int index) const;
 
         bool m_patched = false;
@@ -209,6 +335,18 @@ namespace wowvr
         float m_forcedYaw = 0.0f;
         uintptr_t m_skipCaller = 0;
         bool m_worldSpaceOnly = true;
+        bool m_openTerrainCone = false;
+        bool m_disableTerrainCulling = false;
+        bool m_openWorldPlanes = false;
+        bool m_worldPlanesDumped = false;
+        float m_worldPlanePassD = 1.0e9f;
+        bool m_rotateMaster = false;
+        bool m_haveMasterSnapshot = false;
+        float m_masterSnapshot[24] = {};
+        bool m_feedShadow[kMasterFeedSiteCount] = {};
+        uint64_t m_masterRotations = 0;
+        uint64_t m_masterRotationsAtSetup = 0;
+        uint64_t m_coneWrites = 0;
         float m_minSpan = 40.0f * 0.0174532925f;
         float m_maxOffAxis = 5.0f * 0.0174532925f;
         const uint8_t* m_camera = nullptr;

@@ -196,6 +196,60 @@ namespace wowvr
         float cullRotateMinSpanDegrees = 40.0f;
         float cullRotateMaxOffAxisDegrees = 5.0f;
 
+        // Draws terrain all the way around the camera while the head drives culling.
+        //
+        // The rotated clip volumes steer doodads, WMOs and game objects, but ADT
+        // terrain never tests against those planes: its directional gate is a view-cone
+        // angle test against cos(cullFov/2), recomputed each frame at 0x00CD877C from
+        // the character's heading. With the cull FoV at the client's ceiling that cone
+        // covers about +/-90 degrees, so a head turned further stands over bare void
+        // while the buildings and trees on it render - the Goldshire bug. This writes
+        // -1 over the cosine so the angle test always passes; horizon occlusion, the
+        // 50-unit rule and the chunk index box are untouched, and the client's per-frame
+        // recompute means turning it off restores stock terrain culling by itself.
+        bool cullTerrainAllAround = true;
+
+        // Rotates the master frustum corner array (0x00CDB108) to the head, once per
+        // client refresh. This is what makes TERRAIN cull where the head looks: the
+        // per-volume rotation only ever steers copies derived from this array, and
+        // terrain reads the original. Found by elimination - with every copy rotated
+        // and every bit-gated terrain test disabled, the ground still vanished beyond
+        // the widen margin while the buildings and doodads on it followed the head.
+        bool cullRotateMasterCorners = true;
+
+        // Which of the master corner array's fixed-address READ sites are patched to
+        // consume the UNROTATED shadow copy instead of the live, head-rotated array
+        // (bit i = site i; the sites are listed in cull_frustum.h). This is the
+        // portal-vs-terrain split of the master's consumers: the client derives its
+        // portal-clipped interior volumes by combining the portal's screen rectangle
+        // - projected with the real, unturned camera - with the master corners, so a
+        // rotated master swings every volume past the first doorway off the room it
+        // was cut to. Measured in the Lion's Pride Inn: the room beyond one doorway
+        // blanked at 17 degrees of head yaw with the master rotated, and returned
+        // with it left alone. Terrain has no screen-space half and needs the rotated
+        // set, so the read sites are separated rather than choosing one behaviour
+        // for both. Bisected live with cullfeed/cullfeedmask.
+        //
+        // 4 = site 2 (the push at 0x007AC466) alone, which the bisection settled: at
+        // a forced 20-degree turn, shadow-feeding site 2 restored the room beyond
+        // the doorway to pixel-parity with the unrotated control while sites 0, 1
+        // and 3 each changed nothing; the interior then held at forced 45, 60 and
+        // 90; and the forced-150 outdoor terrain void was identical with site 2 on
+        // either feed, so it is not a terrain reader.
+        unsigned cullMasterShadowFeeds = 4;
+
+        // Draws every group of a WMO the walk already accepted, by answering "inside"
+        // for the map-object family of the shared bounds test.
+        //
+        // Off by default because it was measured NOT to fix the fault it was built
+        // for: WMO walls and floors still vanish once the culling volume is turned
+        // past roughly 45 degrees, with this bypass covering the full family - so the
+        // failing test is somewhere else entirely - while the bypass itself inflated
+        // shadow caster draws badly (973k per report period against 2.4k stock).
+        // Kept because the detour, the family range command (cullwmorange) and the
+        // toggle (cullwmoall) are the instruments the next investigation needs.
+        bool wmoGroupsAlwaysVisible = false;
+
         // [Sound]
         // Puts FMOD's listener on the headset instead of the client's camera: the ears
         // turn with the head, so a sound to the left of the headset is heard on the left,

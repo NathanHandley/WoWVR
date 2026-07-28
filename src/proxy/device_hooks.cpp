@@ -711,6 +711,31 @@ namespace wowvr
         // "on" a silent no-op the last time culling was being tested, and both arms of
         // that A/B were the same state.
         bool g_cullRotateEnabled = true;
+
+        // The runtime half of Cfg().cullTerrainAllAround, so the terrain cone can be
+        // A/B'd from the command file without a rebuild, same as the rotation itself.
+        bool g_cullTerrainOpen = true;
+
+        // Command-only diagnostic: whether the CWorld terrain-culling bit is being held
+        // clear (the "cullterrainbit" toggle). Never persisted to config on purpose.
+        bool g_terrainCullBitCleared = false;
+
+        // Command-only experiment: whether the master corner array at 0x00CDB108 is
+        // being stomped (the "cullworldplanes" toggle - kept as the repro that found it).
+        bool g_worldPlanesOpen = false;
+
+        // The runtime half of Cfg().cullRotateMasterCorners, so the master rotation can
+        // be A/B'd from the command file without a rebuild.
+        bool g_cullMasterRotate = true;
+
+        // One-shot latch for Cfg().cullMasterShadowFeeds: the displacement patches are
+        // applied once when the frustum hook is up, then owned by the cullfeed
+        // commands. Re-applying the config mask every frame would fight the bisection
+        // levers the mask exists to persist.
+        bool g_masterFeedsApplied = false;
+
+        // The runtime half of Cfg().wmoGroupsAlwaysVisible (the "cullwmoall" toggle).
+        bool g_wmoGroupsAllVisible = true;
         // Pushed once rather than every frame so that a command can change the threshold
         // mid-session and not be overwritten by the config on the very next frame.
         bool g_cullSpanConfigured = false;
@@ -2910,7 +2935,20 @@ namespace wowvr
                     haveGameCamera ? reinterpret_cast<const void*>(GameCam().Address())
                                    : nullptr);
                 CullView().SetHeadRotation(Projection().HeadYaw(), Projection().HeadPitch());
+                CullView().SetOpenTerrainCone(g_cullTerrainOpen
+                                              && Cfg().cullTerrainAllAround);
+                CullView().SetRotateMasterCorners(g_cullMasterRotate
+                                                  && Cfg().cullRotateMasterCorners
+                                                  && wantFrustum);
+                if (!g_masterFeedsApplied && CullView().Enabled()
+                    && Cfg().cullMasterShadowFeeds != 0)
+                {
+                    g_masterFeedsApplied = true;
+                    CullView().SetMasterFeedMask(Cfg().cullMasterShadowFeeds);
+                }
                 const bool active = wantFrustum && Vr().IsActive() && haveGameCamera;
+                CullView().SetWmoGroupsAlwaysVisible(active && g_wmoGroupsAllVisible
+                                                     && Cfg().wmoGroupsAlwaysVisible);
                 CullView().SetActive(active);
                 CullView().FrameBoundary();
             }
@@ -3214,6 +3252,113 @@ namespace wowvr
                         g_cullRotateEnabled = false;
                         WOWVR_INFO("Head-driven cull frustum disabled; the client culls "
                                    "against its own heading.");
+                    }
+                    // The terrain half of head-driven culling. "cullterrainoff" before
+                    // "cullterrainon" out of the same prefix caution as the rest of this
+                    // chain, though these two do not actually collide.
+                    else if (strncmp(command, "cullterrainoff", 14) == 0)
+                    {
+                        g_cullTerrainOpen = false;
+                        WOWVR_INFO("Terrain view-cone back to the client's own; terrain "
+                                   "vanishes beyond ~90 deg of the character's heading.");
+                    }
+                    else if (strncmp(command, "cullterrainon", 13) == 0)
+                    {
+                        g_cullTerrainOpen = true;
+                        WOWVR_INFO("Terrain view-cone opened all the way round.");
+                    }
+                    // Toggles the wholesale terrain-culling bit as a fallback
+                    // discriminator: if a terrain void survives cullterrainon, this
+                    // tells "the cone was not the failing gate" apart from "the horizon
+                    // buckets only cover the heading's sector". The setter logs.
+                    else if (strncmp(command, "cullterrainbit", 14) == 0)
+                    {
+                        g_terrainCullBitCleared = !g_terrainCullBitCleared;
+                        CullView().SetDisableTerrainCulling(g_terrainCullBitCleared);
+                    }
+                    // "cullworldplanes" toggles the stomp; a trailing '-' selects the
+                    // negative pass distance for the case where the set's inside test
+                    // runs the other way (then positive d culls everything, which is
+                    // itself the answer to which way the test runs).
+                    else if (strncmp(command, "cullworldplanes", 15) == 0)
+                    {
+                        g_worldPlanesOpen = !g_worldPlanesOpen;
+                        CullView().SetOpenWorldPlanes(
+                            g_worldPlanesOpen,
+                            command[15] == '-' ? -1.0e9f : 1.0e9f);
+                    }
+                    // "cullmasteroff" before "cullmasteron": "cullmasteron" is not a
+                    // prefix of it, but the reverse order reads wrong at a glance and
+                    // this chain has been bitten by exactly that before.
+                    else if (strncmp(command, "cullmasteroff", 13) == 0)
+                    {
+                        g_cullMasterRotate = false;
+                        WOWVR_INFO("Master corner rotation disabled; terrain culls to "
+                                   "the character's heading again.");
+                    }
+                    else if (strncmp(command, "cullmasteron", 12) == 0)
+                    {
+                        g_cullMasterRotate = true;
+                        WOWVR_INFO("Master corner rotation enabled.");
+                    }
+                    // "cullwmorange <loHex> <hiHex>", published-image addresses, e.g.
+                    // "cullwmorange 7BC500 7BCF00". Longest prefix first: "cullwmoall"
+                    // would never match these, but "cullwmorange" must precede any
+                    // shorter "cullwmo" test ever added.
+                    else if (strncmp(command, "cullwmorange ", 13) == 0)
+                    {
+                        unsigned lo = 0;
+                        unsigned hi = 0;
+                        if (sscanf(command + 13, "%x %x", &lo, &hi) == 2 && hi > lo)
+                        {
+                            CullView().SetWmoBypassRange(
+                                (lo < 0x00400000u) ? lo + 0x00400000u : lo,
+                                (hi < 0x00400000u) ? hi + 0x00400000u : hi);
+                        }
+                        else
+                        {
+                            WOWVR_WARN("cullwmorange wants two hex addresses, low then "
+                                       "high.");
+                        }
+                    }
+                    // "cullfeedmask <n>": bit i set sends master read site i to the
+                    // UNROTATED shadow, clear returns it to the live (head-rotated)
+                    // master. "cullfeed <site> s|l" flips one site. These are the
+                    // bisection levers for the portal-vs-terrain split of the master
+                    // corner consumers; the setter logs each swap.
+                    else if (strncmp(command, "cullfeedmask ", 13) == 0)
+                    {
+                        unsigned mask = 0;
+                        if (sscanf(command + 13, "%u", &mask) == 1)
+                        {
+                            CullView().SetMasterFeedMask(mask);
+                        }
+                        else
+                        {
+                            WOWVR_WARN("cullfeedmask wants a number (bit=shadow).");
+                        }
+                    }
+                    else if (strncmp(command, "cullfeed ", 9) == 0)
+                    {
+                        int site = -1;
+                        char mode = 0;
+                        if (sscanf(command + 9, "%d %c", &site, &mode) == 2
+                            && (mode == 's' || mode == 'l'))
+                        {
+                            CullView().SetMasterFeed(site, mode == 's');
+                        }
+                        else
+                        {
+                            WOWVR_WARN("cullfeed wants '<site> s' (shadow) or "
+                                       "'<site> l' (live).");
+                        }
+                    }
+                    // Toggles the map-object family bypass; the setter logs both ways.
+                    else if (strncmp(command, "cullwmoall", 10) == 0)
+                    {
+                        g_wmoGroupsAllVisible = !g_wmoGroupsAllVisible;
+                        WOWVR_INFO("WMO group bypass toggle -> %s (applies next frame).",
+                                   g_wmoGroupsAllVisible ? "on" : "off");
                     }
                     // The head-driven sound listener. Ordered longest-prefix-first, like
                     // the block above and for the same reason: "sndon" tested before
