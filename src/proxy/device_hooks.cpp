@@ -7,6 +7,8 @@
 #include "core/paths.h"
 #include "diag/frame_report.h"
 #include "game/camera_probe.h"
+#include "game/cull_frustum.h"
+#include "game/sound_listener.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
 #include "present/d3d12_present.h"
@@ -702,7 +704,28 @@ namespace wowvr
         bool g_compensateOrbit = true;
         bool g_aimEnabled = true;
         bool g_pitchTrace = false;
+
+        // Runtime switch for the head-driven cull frustum, so the two arms of an A/B can
+        // be compared inside one session rather than across two launches. Kept separate
+        // from the config flag rather than folded into it: a bool ORed with a setting made
+        // "on" a silent no-op the last time culling was being tested, and both arms of
+        // that A/B were the same state.
+        bool g_cullRotateEnabled = true;
+        // Pushed once rather than every frame so that a command can change the threshold
+        // mid-session and not be overwritten by the config on the very next frame.
+        bool g_cullSpanConfigured = false;
         bool g_directChainEverWorked = false;
+
+        // The same runtime switch for the head-driven sound listener, and for the same
+        // reason: the difference between ears on the head and ears on the camera is a
+        // thing you judge by listening to it twice in a row, not across two launches.
+        bool g_headListenerEnabled = true;
+
+        // The INI's ListenerFollowsHeadPosition is the STARTING state of a switch a
+        // command can move afterwards, so it is pushed once rather than every frame -
+        // re-asserting a setting each frame would silently undo "sndmove 0" a few
+        // milliseconds after it was typed.
+        bool g_headListenerConfigured = false;
 
         // Stepped pitch aiming. The camera is a culling device, not the view - the
         // view takes its pitch from the head matrix regardless of what the camera
@@ -927,6 +950,11 @@ namespace wowvr
                        "sky-slice eye draws %llu",
                        g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
                        g_drawsStrayBackBuffer, g_lastPeriodCount, g_skySliceDraws);
+            // Alongside the draw counts on purpose: the claim this whole approach rests on
+            // is that pointing the culling volume somewhere else does not change how much
+            // is in it, and these two numbers together are what settles that.
+            CullView().Report();
+            HeadListener().Report();
             {
                 char line[512];
                 int used = 0;
@@ -2858,6 +2886,65 @@ namespace wowvr
                 GameCam().SetCullFrustum(g_cullFovOverride, g_cullAspectOverride);
             }
 
+            // Point the client's culling volume where the head looks, without writing a
+            // single byte of its camera. The head pose can only be sampled here, once a
+            // frame; everything else the rotation needs - the camera's position and
+            // heading - is read live inside the client's own plane builder, where it is
+            // already up to date for the frame those planes will cull.
+            //
+            // Suppressed while the camera is being aimed, because that path has already
+            // turned the frustum by the head rotation and turning it again would count
+            // the head twice.
+            {
+                const bool wantFrustum = g_cullRotateEnabled
+                                         && Cfg().headDrivenCullFrustum
+                                         && !Cfg().aimCameraAtHead;
+                CullView().Enable(wantFrustum);
+                if (!g_cullSpanConfigured)
+                {
+                    g_cullSpanConfigured = true;
+                    CullView().SetShapeGate(Cfg().cullRotateMinSpanDegrees,
+                                            Cfg().cullRotateMaxOffAxisDegrees);
+                }
+                CullView().SetCameraObject(
+                    haveGameCamera ? reinterpret_cast<const void*>(GameCam().Address())
+                                   : nullptr);
+                CullView().SetHeadRotation(Projection().HeadYaw(), Projection().HeadPitch());
+                const bool active = wantFrustum && Vr().IsActive() && haveGameCamera;
+                CullView().SetActive(active);
+                CullView().FrameBoundary();
+            }
+
+            // Move the ears to the headset. Head rotation and head displacement are both
+            // sampled here, once a frame, for the same reason as above - the pose only
+            // exists on this thread - and everything else the correction needs (where the
+            // client decided the listener goes and which way it faces) arrives as an
+            // argument inside the client's own listener call.
+            //
+            // Not gated on the game camera: the listener setter is handed its own base
+            // position and heading, so it needs nothing found by address.
+            {
+                const bool wantListener = g_headListenerEnabled
+                                          && Cfg().headDrivenSoundListener;
+                if (!g_headListenerConfigured)
+                {
+                    g_headListenerConfigured = true;
+                    HeadListener().SetTrackPosition(Cfg().soundListenerFollowsHead);
+                    HeadListener().SetEarsAtCamera(Cfg().soundListenerAtCamera);
+                }
+                HeadListener().Enable(wantListener);
+                HeadListener().SetCameraObject(
+                    haveGameCamera ? reinterpret_cast<const void*>(GameCam().Address())
+                                   : nullptr);
+                HeadListener().SetHeadRotation(Projection().HeadYaw(),
+                                               Projection().HeadPitch(),
+                                               Projection().HeadRoll());
+                HeadListener().SetHeadOffsetMetres(Projection().HeadOffsetMetres());
+                HeadListener().SetUnitsPerMetre(Cfg().unitsPerMetre);
+                HeadListener().SetActive(wantListener && Vr().IsActive()
+                                         && Cfg().headTracking);
+            }
+
             if (g_aimEnabled && Cfg().aimCameraAtHead && haveGameCamera)
             {
                 // The client ADDS these to the heading the camera would otherwise have, so
@@ -3059,6 +3146,135 @@ namespace wowvr
                     // of it has been found inside the camera object. Reported after the
                     // write as well as before, because the interesting question is not what
                     // we set but whether the client leaves it set.
+                    // Longer names first: a three-character prefix test on "cull" would
+                    // swallow every one of these.
+                    else if (strncmp(command, "cullrotview ", 12) == 0)
+                    {
+                        CullView().SetViewFilter(atoi(command + 12));
+                    }
+                    else if (strncmp(command, "cullrotall", 10) == 0)
+                    {
+                        CullView().SetViewFilter(-1);
+                    }
+                    else if (strncmp(command, "cullrotstate", 12) == 0)
+                    {
+                        CullView().Report();
+                    }
+                    else if (strncmp(command, "cullrotanyframe", 15) == 0)
+                    {
+                        CullView().SetWorldSpaceOnly(false);
+                    }
+                    else if (strncmp(command, "cullrotworldonly", 16) == 0)
+                    {
+                        CullView().SetWorldSpaceOnly(true);
+                    }
+                    else if (strncmp(command, "cullrotskip ", 12) == 0)
+                    {
+                        CullView().SetSkipCaller(
+                            static_cast<uintptr_t>(strtoul(command + 12, nullptr, 16)));
+                    }
+                    else if (strncmp(command, "cullrotnoskip", 13) == 0)
+                    {
+                        CullView().SetSkipCaller(0);
+                    }
+                    // "cullrotshape <minSpanDeg> <maxOffAxisDeg>". "cullrotshape 0 180"
+                    // turns every volume the client builds, including the narrow ones it
+                    // clips to a doorway - which is the fault this exists to keep out, and
+                    // the A/B for confirming it is the fault without a rebuild.
+                    else if (strncmp(command, "cullrotshape ", 13) == 0)
+                    {
+                        float span = 40.0f, offAxis = 5.0f;
+                        sscanf(command + 13, "%f %f", &span, &offAxis);
+                        CullView().SetShapeGate(span, offAxis);
+                    }
+                    else if (strncmp(command, "cullrotdump", 11) == 0)
+                    {
+                        CullView().RequestDump();
+                    }
+                    else if (strncmp(command, "cullrotsign ", 12) == 0)
+                    {
+                        CullView().SetYawSign(static_cast<float>(atof(command + 12)));
+                    }
+                    else if (strncmp(command, "cullrotpitchsign ", 17) == 0)
+                    {
+                        CullView().SetPitchSign(static_cast<float>(atof(command + 17)));
+                    }
+                    else if (strncmp(command, "cullrotforce ", 13) == 0)
+                    {
+                        CullView().SetForcedYawDegrees(
+                            static_cast<float>(atof(command + 13)));
+                    }
+                    else if (strncmp(command, "cullroton", 9) == 0)
+                    {
+                        g_cullRotateEnabled = true;
+                        WOWVR_INFO("Head-driven cull frustum enabled.");
+                    }
+                    else if (strncmp(command, "cullrotoff", 10) == 0)
+                    {
+                        g_cullRotateEnabled = false;
+                        WOWVR_INFO("Head-driven cull frustum disabled; the client culls "
+                                   "against its own heading.");
+                    }
+                    // The head-driven sound listener. Ordered longest-prefix-first, like
+                    // the block above and for the same reason: "sndon" tested before
+                    // "sndoff" would swallow it.
+                    else if (strncmp(command, "sndstate", 8) == 0)
+                    {
+                        HeadListener().Report();
+                    }
+                    else if (strncmp(command, "snddump", 7) == 0)
+                    {
+                        HeadListener().RequestDump();
+                    }
+                    else if (strncmp(command, "sndpitchsign ", 13) == 0)
+                    {
+                        HeadListener().SetPitchSign(
+                            static_cast<float>(atof(command + 13)));
+                    }
+                    else if (strncmp(command, "sndrollsign ", 12) == 0)
+                    {
+                        HeadListener().SetRollSign(static_cast<float>(atof(command + 12)));
+                    }
+                    else if (strncmp(command, "sndlateralsign ", 15) == 0)
+                    {
+                        HeadListener().SetLateralSign(
+                            static_cast<float>(atof(command + 15)));
+                    }
+                    else if (strncmp(command, "sndsign ", 8) == 0)
+                    {
+                        HeadListener().SetYawSign(static_cast<float>(atof(command + 8)));
+                    }
+                    // "sndforce <degrees>" turns the ears without turning the picture,
+                    // which is how this gets judged with the headset sitting still: stand
+                    // by something that loops, force 90, and the sound should move to one
+                    // ear and hold there.
+                    else if (strncmp(command, "sndforce ", 9) == 0)
+                    {
+                        HeadListener().SetForcedYawDegrees(
+                            static_cast<float>(atof(command + 9)));
+                    }
+                    else if (strncmp(command, "sndmove ", 8) == 0)
+                    {
+                        HeadListener().SetTrackPosition(atoi(command + 8) != 0);
+                    }
+                    // "sndcam 1" puts the ears at the viewpoint, "sndcam 0" hands the
+                    // position back to the client - which parks it on the character, so
+                    // this is the A/B for "does zooming out make anything quieter".
+                    else if (strncmp(command, "sndcam ", 7) == 0)
+                    {
+                        HeadListener().SetEarsAtCamera(atoi(command + 7) != 0);
+                    }
+                    else if (strncmp(command, "sndon", 5) == 0)
+                    {
+                        g_headListenerEnabled = true;
+                        WOWVR_INFO("Head-driven sound listener enabled.");
+                    }
+                    else if (strncmp(command, "sndoff", 6) == 0)
+                    {
+                        g_headListenerEnabled = false;
+                        WOWVR_INFO("Head-driven sound listener disabled; the ears go back "
+                                   "on the client's camera.");
+                    }
                     else if (strncmp(command, "cullaspect ", 11) == 0)
                     {
                         g_cullAspectOverride = static_cast<float>(atof(command + 11));

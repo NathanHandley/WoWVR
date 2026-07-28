@@ -52,6 +52,27 @@ namespace wowvr
             L"; How much wider than the display frustum WoW is told to cull. Raise if\r\n"
             L"; geometry pops in at the edges when you turn your head quickly.\r\n"
             L"CullFovScale=1.6\r\n"
+            L"; What shape a culling volume must be before the head is allowed to turn\r\n"
+            L"; it: at least this wide, in degrees from the camera's forward axis out to\r\n"
+            L"; its widest corner, and with its corners averaging no further than\r\n"
+            L"; CullRotateMaxOffAxisDegrees from that axis. The client also builds narrow\r\n"
+            L"; volumes clipped to whatever doorway you are looking through, and turning\r\n"
+            L"; one of those makes the building beyond the doorway disappear. 0 and 180\r\n"
+            L"; turn every volume, which is that fault.\r\n"
+            L"CullRotateMinSpanDegrees=40\r\n"
+            L"CullRotateMaxOffAxisDegrees=5\r\n"
+            L"\r\n"
+            L"[Sound]\r\n"
+            L"; 1 puts the listener on the headset: sounds pan with your head and get\r\n"
+            L"; louder as you step towards them. 0 leaves the ears on the client's camera.\r\n"
+            L"HeadDrivenListener=1\r\n"
+            L"; 1 also moves the listener as you move about the room; 0 keeps the\r\n"
+            L"; rotation only.\r\n"
+            L"ListenerFollowsHeadPosition=1\r\n"
+            L"; 1 puts the ears at the camera - the viewpoint - instead of on the\r\n"
+            L"; character, which is where the client puts them and why zooming out\r\n"
+            L"; never made anything quieter.\r\n"
+            L"ListenerAtCamera=1\r\n"
             L"\r\n"
             L"[Panel]\r\n"
             L"; The floating UI panel. It is body-locked: it stays put while you glance\r\n"
@@ -203,8 +224,24 @@ namespace wowvr
             ReadBool(path, L"Camera", L"AutoLocateCamera", config.autoLocateCamera);
         config.aimCameraAtHead =
             ReadBool(path, L"Camera", L"AimCameraAtHead", config.aimCameraAtHead);
+        config.headDrivenCullFrustum =
+            ReadBool(path, L"Camera", L"HeadDrivenCullFrustum", config.headDrivenCullFrustum);
+        config.cullRotateMinSpanDegrees =
+            ReadFloat(path, L"Camera", L"CullRotateMinSpanDegrees",
+                      config.cullRotateMinSpanDegrees);
+        config.cullRotateMaxOffAxisDegrees =
+            ReadFloat(path, L"Camera", L"CullRotateMaxOffAxisDegrees",
+                      config.cullRotateMaxOffAxisDegrees);
         config.disableCameraCollision =
             ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
+
+        config.headDrivenSoundListener =
+            ReadBool(path, L"Sound", L"HeadDrivenListener", config.headDrivenSoundListener);
+        config.soundListenerFollowsHead =
+            ReadBool(path, L"Sound", L"ListenerFollowsHeadPosition",
+                     config.soundListenerFollowsHead);
+        config.soundListenerAtCamera =
+            ReadBool(path, L"Sound", L"ListenerAtCamera", config.soundListenerAtCamera);
 
         config.panelDistance = ReadFloat(path, L"Panel", L"Distance", config.panelDistance);
         config.panelWidth = ReadFloat(path, L"Panel", L"Width", config.panelWidth);

@@ -153,11 +153,72 @@ namespace wowvr
         // setting that writes to the client's memory; it does nothing until the camera
         // has been located, and it stops the moment that object stops looking right.
         //
-        // On by default now that the camera is reached through the same pointer chain the
-        // client's own FlipCameraYaw uses, and the two fields written are the ones that
-        // function adds to. It was off while the camera was being guessed at by searching
-        // memory, which is a different and much worse proposition.
-        bool aimCameraAtHead = true;
+        // Off by default: the client bakes its distant pass (sky, backdrop terrain, far
+        // WMO canopy) against a heading that adopts the aim over a second or two, so
+        // continuous aiming makes the sky drag with the head during real worn motion.
+        // The widened static frustum covers normal head movement without any writes.
+        bool aimCameraAtHead = false;
+
+        // Rotates the six planes the client culls against so they follow the head, while
+        // leaving its camera exactly where the character put it.
+        //
+        // This is the third answer to head-driven culling and the first that does not go
+        // through the camera. Aiming the camera works for culling and drags the sky,
+        // because the distant pass adopts the aim over a second or two; a deadzone hides
+        // the drag behind a visible pop; drawing everything costs 114 fps to 68. Rotating
+        // the culling volume alone has none of those: the camera's heading never moves so
+        // the distant pass has nothing to lag behind, the viewpoint never translates so
+        // there is nothing to correct, and the volume is the same size pointed elsewhere
+        // so the draw count is unchanged.
+        //
+        // Independent of AimCameraAtHead, and meant to replace it. Both on would rotate
+        // the frustum of an already-aimed camera, which double-counts the head.
+        bool headDrivenCullFrustum = true;
+
+        // What shape a culling volume has to be before the head is allowed to turn it.
+        //
+        // The client builds two kinds through the same function: the camera's whole view,
+        // and views clipped to an opening you are looking through. Both are in world space
+        // and both are apexed at the camera, so neither the space they are in nor where
+        // they were built from tells them apart - only their shape does. Turning a clipped
+        // one swings it off the opening and takes the building beyond the doorway with it,
+        // which is a WMO disappearing while you look straight at it.
+        //
+        // Measured in the Stormwind gate's archway: the camera's own view is 70.2 degrees
+        // wide with its corners averaging 0.0 degrees off the forward axis; the two
+        // clipped to the arch are 43.5 and 31.6 wide, averaging 26.1 and 24.2 off it. The
+        // average is the real test and it is exact - a perspective frustum is symmetric
+        // about the axis it was built on. The width covers the one case symmetry does not,
+        // an opening dead ahead, and 40 clears the narrowest the camera's own view ever
+        // gets, which is 46 with CullWidenScale at 1.0.
+        //
+        // 0 and 180 turn everything, which is the fault these exist to prevent.
+        float cullRotateMinSpanDegrees = 40.0f;
+        float cullRotateMaxOffAxisDegrees = 5.0f;
+
+        // [Sound]
+        // Puts FMOD's listener on the headset instead of the client's camera: the ears
+        // turn with the head, so a sound to the left of the headset is heard on the left,
+        // and they walk with it, so stepping towards something in the room brings it
+        // closer. The client's own placement rule - its Sound_ListenerAtCharacter,
+        // Sound_ListenerBackDist and Sound_ListenerUpDist CVars - still chooses where the
+        // listener starts from; this is a correction applied on top of it.
+        bool headDrivenSoundListener = true;
+
+        // The half of that which needs a scale to be believed. Off keeps the rotation and
+        // drops the walk, which is the setting to reach for if the room and the world
+        // disagree about how far a step is.
+        bool soundListenerFollowsHead = true;
+
+        // Start the correction from the CAMERA rather than from wherever the client put
+        // the listener. Its own answer is the character - Sound_ListenerAtCharacter
+        // defaults on, and that branch takes the position from the player object while
+        // still taking the orientation from the camera - so distance to a sound never
+        // responded to the view at all: zooming a third-person camera out over a fire left
+        // the fire exactly as loud. In a headset the viewpoint is the head, so the ears
+        // belong at the camera, which is what every other part of this project already
+        // treats as the eye origin.
+        bool soundListenerAtCamera = true;
 
         // Turns off the client's third-person camera collision, by removing one conditional
         // jump in its own code. Aiming the camera at the head sweeps it through terrain, and

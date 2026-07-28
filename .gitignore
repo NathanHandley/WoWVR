@@ -3,3 +3,5 @@ build-asan/
 out/
 .vs/
 *.user
+# Vendored SDK, cloned rather than committed; see README.md.
+third_party/

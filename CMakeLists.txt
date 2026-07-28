@@ -57,6 +57,10 @@ set(WOWVR_SOURCES
     src/diag/frame_report.h
     src/game/camera_probe.cpp
     src/game/camera_probe.h
+    src/game/cull_frustum.cpp
+    src/game/cull_frustum.h
+    src/game/sound_listener.cpp
+    src/game/sound_listener.h
     src/game/field_watch.cpp
     src/game/field_watch.h
     src/game/game_camera.cpp
