@@ -266,6 +266,16 @@ namespace wowvr
         m_headOffset.x = dx * headInverse.m[0][0] + dy * headInverse.m[1][0] + dz * headInverse.m[2][0];
         m_headOffset.y = dx * headInverse.m[0][1] + dy * headInverse.m[1][1] + dz * headInverse.m[2][1];
         m_headOffset.z = -(dx * headInverse.m[0][2] + dy * headInverse.m[1][2] + dz * headInverse.m[2][2]);
+
+        // The same displacement in the NEUTRAL frame, kept alongside the head-frame
+        // one above because the two consumers genuinely want different frames. The
+        // world correction wants head-frame (see above). The body-locked panel wants
+        // a frame that does NOT turn with the head - its whole job is to hold still
+        // in body space while the head moves - and handing it the head-frame value
+        // made it breathe in and out with every nod.
+        m_headOffsetNeutral.x = dx * m_neutralInverse.m[0][0] + dy * m_neutralInverse.m[1][0] + dz * m_neutralInverse.m[2][0];
+        m_headOffsetNeutral.y = dx * m_neutralInverse.m[0][1] + dy * m_neutralInverse.m[1][1] + dz * m_neutralInverse.m[2][1];
+        m_headOffsetNeutral.z = -(dx * m_neutralInverse.m[0][2] + dy * m_neutralInverse.m[1][2] + dz * m_neutralInverse.m[2][2]);
     }
 
     // The head rotation with whatever the game's own camera has already been turned by taken

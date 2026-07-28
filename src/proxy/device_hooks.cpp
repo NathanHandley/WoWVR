@@ -2297,18 +2297,23 @@ namespace wowvr
             return GameCam().AppliedPitch();
         }
 
-        // Re-measures the camera compensation from the camera the client has JUST
-        // updated for the frame it is about to build.
+        // Re-measures the camera compensation from the camera as the client is USING
+        // it for the frame being built.
         //
-        // The measurement in the Present hook is a frame old by the time it is used:
+        // A measurement in the Present hook is a frame old by the time it is used:
         // the camera is written at the end of frame N, the client moves it during its
         // update, and frame N+1 is rendered against wherever it actually ended up.
         // While the camera is still - the common case - stale equals fresh and nothing
         // shows. While it is in motion the error is (camera movement per frame), which
         // during a third-person zoom is the radius change every single frame: the
-        // world bounced against the head at exactly the zoom rate. BeginScene runs
-        // after the client's update and before any draw, on the same thread, so a
-        // measurement here is exact for the frame being built.
+        // world bounced against the head at exactly the zoom rate. And BeginScene is
+        // not safe either: whether the client updates its camera before or after it is
+        // an assumption, and a nodding head - a pitch target moving every frame -
+        // twitched the world at exactly the per-frame pitch delta whenever that
+        // assumption missed. The one moment that needs no assumption is the first
+        // camera-derived constant upload of the frame: those constants are computed
+        // FROM the camera, so by then it is necessarily final. That is where this is
+        // called from, once per frame, via EnsureFreshCameraCompensation.
         void RefreshCameraCompensation()
         {
             if (!g_aimEnabled || !Cfg().aimCameraAtHead || !Vr().IsActive())
@@ -2340,15 +2345,34 @@ namespace wowvr
             }
         }
 
+        // Once per frame, at the first moment the values are actually needed.
+        bool g_compensationFresh = false;
+
+        void EnsureFreshCameraCompensation()
+        {
+            if (g_compensationFresh)
+            {
+                return;
+            }
+            g_compensationFresh = true;
+            RefreshCameraCompensation();
+        }
+
         HRESULT WINAPI HookedBeginScene(IDirect3DDevice9* device)
         {
-            RefreshCameraCompensation();
+            // Deliberately does not refresh the compensation: whether the client's
+            // camera update has run yet at BeginScene is an assumption, and the
+            // refresh must only happen once the camera is provably final. Kept as a
+            // hook so that changes.
             return g_originalBeginScene(device);
         }
 
         HRESULT WINAPI HookedPresent(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                      HWND windowOverride, const RGNDATA* dirtyRegion)
         {
+            // The next frame's first constant upload re-measures the compensation.
+            g_compensationFresh = false;
+
             // Closes the observation window on the frame the game has just finished.
             Report().EndFrame();
 
@@ -3252,6 +3276,8 @@ namespace wowvr
         HRESULT WINAPI HookedSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state,
                                           const D3DMATRIX* matrix)
         {
+            EnsureFreshCameraCompensation();
+
             if (Report().IsActive() && matrix != nullptr)
             {
                 Report().NoteTransform(static_cast<uint32_t>(state), &matrix->_11);
@@ -4218,6 +4244,11 @@ namespace wowvr
         HRESULT WINAPI HookedSetVertexShaderConstantF(IDirect3DDevice9* device, UINT startRegister,
                                                       const float* data, UINT vector4Count)
         {
+            // These constants were computed from the client's camera, so the camera is
+            // final for this frame; the first upload is the earliest provably-safe
+            // moment to measure the compensation against it.
+            EnsureFreshCameraCompensation();
+
             if (Report().IsActive())
             {
                 Report().NoteVertexShaderConstants(startRegister, data, vector4Count);

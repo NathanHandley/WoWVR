@@ -145,8 +145,13 @@ namespace wowvr
         // The same correction applied to the world: rotation into the current view
         // frame, and displacement since recentring, in metres. Anything that wants to
         // sit still in space has to use these, not just the yaw.
+        //
+        // The offset here is in the NEUTRAL (body) frame - it does not turn with the
+        // head, which is what the body-locked panel needs. The world path uses a
+        // head-frame copy internally; handing that one out is what made the panel
+        // slide forward and back with every nod.
         const Mat4& HeadRotation() const { return m_headRotation; }
-        const Vec3& HeadOffsetMetres() const { return m_headOffset; }
+        const Vec3& HeadOffsetMetres() const { return m_headOffsetNeutral; }
 
         // Diagnostics for the log.
         unsigned long long PatchedCount() const { return m_patched; }
@@ -181,7 +186,8 @@ namespace wowvr
         Mat4 m_headRotation = Mat4Identity();
         Mat4 m_neutralInverse = Mat4Identity();
         Vec3 m_neutralPosition;
-        Vec3 m_headOffset;              // metres, relative to the recentred origin
+        Vec3 m_headOffset;              // metres, in the head's own frame (world path)
+        Vec3 m_headOffsetNeutral;       // metres, in the neutral frame (panel)
         float m_headYaw = 0.0f;
         float m_fakeHeadYaw = 0.0f;
         float m_fakeHeadPitch = 0.0f;
