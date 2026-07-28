@@ -2271,7 +2271,33 @@ namespace wowvr
             }
         }
 
-        // Re-measures the orbit compensation from the camera the client has JUST
+        // The pitch to take back out of the view: the camera's MEASURED pitch, never
+        // the intent that was written into it.
+        //
+        // While the free-look pitch field is being written the client discards its own
+        // pitch entirely (the mouse cannot pitch the view), so every degree the camera
+        // actually holds is either our aim or motion the client added on its own - the
+        // follow logic that re-levels the camera while the character moves is the one
+        // that showed: intent-based compensation left its easing visible, and the
+        // world slowly tilted down as long as the character was walking. The head owns
+        // all visible pitch in this design, so whatever the camera really holds is
+        // exactly what must be removed. Measured also covers the client's write
+        // smoothing, where the camera has not yet reached the intent.
+        //
+        // Yaw stays on intent: the yaw field is an offset on top of a heading the
+        // mouse and character legitimately own and which must remain visible.
+        float CompensationPitch()
+        {
+            float facingYaw = 0.0f;
+            float facingPitch = 0.0f;
+            if (GameCam().CameraFacing(facingYaw, facingPitch))
+            {
+                return facingPitch;
+            }
+            return GameCam().AppliedPitch();
+        }
+
+        // Re-measures the camera compensation from the camera the client has JUST
         // updated for the frame it is about to build.
         //
         // The measurement in the Present hook is a frame old by the time it is used:
@@ -2283,7 +2309,7 @@ namespace wowvr
         // world bounced against the head at exactly the zoom rate. BeginScene runs
         // after the client's update and before any draw, on the same thread, so a
         // measurement here is exact for the frame being built.
-        void RefreshOrbitCompensation()
+        void RefreshCameraCompensation()
         {
             if (!g_aimEnabled || !Cfg().aimCameraAtHead || !Vr().IsActive())
             {
@@ -2296,6 +2322,8 @@ namespace wowvr
             {
                 return;
             }
+
+            Projection().SetGameCameraPitch(CompensationPitch());
 
             Projection().SetGameCameraOrbitRadius(
                 g_compensateOrbit ? GameCam().OrbitRadius() : 0.0f);
@@ -2314,7 +2342,7 @@ namespace wowvr
 
         HRESULT WINAPI HookedBeginScene(IDirect3DDevice9* device)
         {
-            RefreshOrbitCompensation();
+            RefreshCameraCompensation();
             return g_originalBeginScene(device);
         }
 
@@ -2741,9 +2769,10 @@ namespace wowvr
                                       g_aimPitch ? Projection().HeadPitch() : 0.0f);
 
                 // And taken straight back out of the projection we substitute, or the head
-                // rotation lands twice and the world turns at double rate.
+                // rotation lands twice and the world turns at double rate. Pitch is the
+                // measured value, not the intent; see CompensationPitch.
                 Projection().SetGameCameraYaw(GameCam().AppliedYaw());
-                Projection().SetGameCameraPitch(GameCam().AppliedPitch());
+                Projection().SetGameCameraPitch(CompensationPitch());
                 // Before anything reads the radius: collision is the dominant motion in
                 // third person, and pinning it is the only thing that addresses that.
                 GameCam().PinOrbitRadius(g_pinOrbitRadius);
