@@ -702,6 +702,7 @@ namespace wowvr
         bool g_compensateOrbit = true;
         bool g_aimEnabled = true;
         bool g_pitchTrace = false;
+        bool g_directChainEverWorked = false;
 
         // Stepped pitch aiming. The camera is a culling device, not the view - the
         // view takes its pitch from the head matrix regardless of what the camera
@@ -2741,7 +2742,7 @@ namespace wowvr
             // begins to function.
             if (Cfg().autoLocateCamera && !Camera().Calibrating()
                 && !Camera().CameraLocated() && !g_signatureSweepDone
-                && !GameCam().Found()
+                && !GameCam().Found() && !g_directChainEverWorked
                 && g_inWorldFrames > 600)
             {
                 g_signatureSweepDone = true;
@@ -2774,7 +2775,8 @@ namespace wowvr
             // the feature silently off after that is the worst outcome, and another attempt
             // costs half a minute.
             if (Cfg().autoLocateCamera && Camera().LocateFailed()
-                && !Camera().Calibrating() && !GameCam().Found() && g_locateAttempts < 3)
+                && !Camera().Calibrating() && !GameCam().Found()
+                && !g_directChainEverWorked && g_locateAttempts < 3)
             {
                 ++g_locateAttempts;
                 Camera().ResetLocate();
@@ -2810,6 +2812,20 @@ namespace wowvr
             // Two dereferences, so this is re-run every frame rather than located once:
             // the object is destroyed and rebuilt across every loading screen.
             const bool haveGameCamera = GameCam().Update();
+
+            // Once the direct chain has resolved even once, the search-and-calibrate
+            // fallback is disabled for the rest of the session. A zone change destroys
+            // the camera object for a few hundred frames, and the fallback's gates
+            // read that brief absence as "camera never found": the memory sweep then
+            // stalled the render thread (the freeze the user felt), the calibration
+            // started swinging the view, and a device reset in the middle of it left a
+            // probe value in the real camera's pitch-bias field. A client the chain
+            // works on never needs the fallback; a client it does not work on never
+            // sets this latch.
+            if (haveGameCamera)
+            {
+                g_directChainEverWorked = true;
+            }
 
             // Camera collision has to go for third person to be usable at all: aiming the
             // camera at the head sweeps it through the ground and the client answers by
