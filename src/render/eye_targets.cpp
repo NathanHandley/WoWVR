@@ -72,13 +72,19 @@ namespace wowvr
             }
         }
 
-        hr = device->CreateOffscreenPlainSurface(
-            width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &m_staging, nullptr);
-        if (FAILED(hr))
+        // Two system-memory surfaces so the readback can be pipelined: the GPU
+        // fills one while the CPU locks the other. Both exist in every kind and
+        // mode - the second is a few megabytes and lets pipelining toggle live.
+        for (int slot = 0; slot < 2; ++slot)
         {
-            WOWVR_ERROR("CreateOffscreenPlainSurface(%ux%u) failed (0x%08lx).", width, height, hr);
-            Destroy();
-            return false;
+            hr = device->CreateOffscreenPlainSurface(
+                width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &m_staging[slot], nullptr);
+            if (FAILED(hr))
+            {
+                WOWVR_ERROR("CreateOffscreenPlainSurface(%ux%u) failed (0x%08lx).", width, height, hr);
+                Destroy();
+                return false;
+            }
         }
 
         WOWVR_INFO("Eye targets created at %ux%u%s.", width, height,
@@ -105,11 +111,17 @@ namespace wowvr
         // The share handle is a kernel identifier, not an NT handle; nothing to close.
         m_sharedHandle = nullptr;
         m_kind = KindCopy;
-        if (m_staging != nullptr)
+        for (int slot = 0; slot < 2; ++slot)
         {
-            m_staging->Release();
-            m_staging = nullptr;
+            if (m_staging[slot] != nullptr)
+            {
+                m_staging[slot]->Release();
+                m_staging[slot] = nullptr;
+            }
+            m_stagingFilled[slot] = false;
         }
+        m_writeIndex = 0;
+        m_lockedIndex = 0;
 
         m_width = 0;
         m_height = 0;
@@ -161,9 +173,17 @@ namespace wowvr
             return true;
         }
 
-        hr = device->GetRenderTargetData(m_scaled, m_staging);
+        // GetRenderTargetData only queues the copy; the wait happens at LockRect.
+        // Pipelined, each frame targets the other ring slot so the lock can take
+        // last frame's slot without waiting for this frame's GPU work.
+        if (m_pipelined)
+        {
+            m_writeIndex ^= 1;
+        }
+        hr = device->GetRenderTargetData(m_scaled, m_staging[m_writeIndex]);
         if (FAILED(hr))
         {
+            m_stagingFilled[m_writeIndex] = false;
             if (!m_captureFailureLogged)
             {
                 WOWVR_ERROR("GetRenderTargetData failed (0x%08lx).", hr);
@@ -171,6 +191,7 @@ namespace wowvr
             }
             return false;
         }
+        m_stagingFilled[m_writeIndex] = true;
 
         return true;
     }
@@ -203,9 +224,14 @@ namespace wowvr
             return true;
         }
 
-        hr = device->GetRenderTargetData(m_scaled, m_staging);
+        if (m_pipelined)
+        {
+            m_writeIndex ^= 1;
+        }
+        hr = device->GetRenderTargetData(m_scaled, m_staging[m_writeIndex]);
         if (FAILED(hr))
         {
+            m_stagingFilled[m_writeIndex] = false;
             if (!m_captureFailureLogged)
             {
                 WOWVR_ERROR("GetRenderTargetData from the stereo target failed (0x%08lx).", hr);
@@ -213,6 +239,7 @@ namespace wowvr
             }
             return false;
         }
+        m_stagingFilled[m_writeIndex] = true;
 
         return true;
     }
@@ -223,18 +250,37 @@ namespace wowvr
         {
             return false;
         }
-        return SUCCEEDED(device->GetRenderTargetData(m_scaled, m_staging));
+        // Dump-only helper: land in the current write slot without advancing the
+        // ring, so a Lock(true) right after reads exactly this frame.
+        if (FAILED(device->GetRenderTargetData(m_scaled, m_staging[m_writeIndex])))
+        {
+            return false;
+        }
+        m_stagingFilled[m_writeIndex] = true;
+        return true;
     }
 
-    bool EyeTargets::Lock()
+    bool EyeTargets::Lock(bool newestFrame)
     {
-        if (m_staging == nullptr || m_lockedPixels != nullptr)
+        if (m_staging[0] == nullptr || m_lockedPixels != nullptr)
         {
             return m_lockedPixels != nullptr;
         }
 
+        int index = m_writeIndex;
+        if (m_pipelined && !newestFrame && m_stagingFilled[m_writeIndex ^ 1])
+        {
+            // The previous frame's readback: the GPU finished it a frame ago, so
+            // this lock returns without draining the current frame.
+            index = m_writeIndex ^ 1;
+        }
+        if (!m_stagingFilled[index])
+        {
+            return false;
+        }
+
         D3DLOCKED_RECT locked = {};
-        const HRESULT hr = m_staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+        const HRESULT hr = m_staging[index]->LockRect(&locked, nullptr, D3DLOCK_READONLY);
         if (FAILED(hr))
         {
             return false;
@@ -242,14 +288,15 @@ namespace wowvr
 
         m_lockedPixels = locked.pBits;
         m_lockedPitch = static_cast<uint32_t>(locked.Pitch);
+        m_lockedIndex = index;
         return true;
     }
 
     void EyeTargets::Unlock()
     {
-        if (m_staging != nullptr && m_lockedPixels != nullptr)
+        if (m_staging[m_lockedIndex] != nullptr && m_lockedPixels != nullptr)
         {
-            m_staging->UnlockRect();
+            m_staging[m_lockedIndex]->UnlockRect();
         }
         m_lockedPixels = nullptr;
         m_lockedPitch = 0;

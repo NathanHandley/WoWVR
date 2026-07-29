@@ -37,10 +37,19 @@ namespace wowvr
 
         // Copies the eye render target into the system-memory surface so Lock can
         // reach the pixels. The copy path does this inside Capture*; shared mode
-        // needs it only for the occasional BMP dump.
+        // needs it only for the occasional BMP dump. Always lands in the current
+        // write surface without advancing the ring, so Lock(true) reads it.
         bool ReadBack(IDirect3DDevice9* device);
 
-        bool IsReady() const { return m_scaled != nullptr && m_staging != nullptr; }
+        // Pipelined readback: Capture* alternates between two system-memory
+        // surfaces and Lock() returns the PREVIOUS frame's pixels, which the GPU
+        // finished long ago - so the LockRect no longer drains the whole frame.
+        // Costs one frame of latency on the copy path only. Off = classic
+        // same-frame lock (the A/B baseline).
+        void SetPipelined(bool on) { m_pipelined = on; }
+        bool Pipelined() const { return m_pipelined; }
+
+        bool IsReady() const { return m_scaled != nullptr && m_staging[0] != nullptr; }
         uint32_t Width() const { return m_width; }
         uint32_t Height() const { return m_height; }
 
@@ -52,14 +61,25 @@ namespace wowvr
         bool CaptureRegion(IDirect3DDevice9* device, IDirect3DSurface9* source,
                            const RECT* sourceRect);
 
-        bool Lock();
+        // newestFrame forces the surface the last capture/ReadBack wrote, waiting
+        // for the GPU if it must - what a BMP dump of THIS frame needs. The
+        // default returns the previous frame's surface when pipelining (falling
+        // back to the newest one the first frame after Create, when no previous
+        // frame exists yet).
+        bool Lock(bool newestFrame = false);
         void Unlock();
         const void* LockedPixels() const { return m_lockedPixels; }
         uint32_t LockedPitch() const { return m_lockedPitch; }
 
+        // Whether the last Lock returned the frame captured this iteration (the
+        // write slot) rather than the previous frame's. The submit stamps the
+        // frame with the pose it was rendered at, and that is which pose this
+        // picks. Stays valid after Unlock until the next capture.
+        bool LockedIsCurrentFrame() const { return m_lockedIndex == m_writeIndex; }
+
     private:
-        IDirect3DSurface9* m_scaled = nullptr;    // D3DPOOL_DEFAULT render target
-        IDirect3DSurface9* m_staging = nullptr;   // D3DPOOL_SYSTEMMEM readback target
+        IDirect3DSurface9* m_scaled = nullptr;      // D3DPOOL_DEFAULT render target
+        IDirect3DSurface9* m_staging[2] = {};       // D3DPOOL_SYSTEMMEM readback ring
         IDirect3DTexture9* m_renderTexture = nullptr; // owns m_scaled in the texture kinds
         void* m_sharedHandle = nullptr;
         Kind m_kind = KindCopy;
@@ -69,6 +89,11 @@ namespace wowvr
 
         void* m_lockedPixels = nullptr;
         uint32_t m_lockedPitch = 0;
+        int m_lockedIndex = 0;
+
+        bool m_pipelined = false;
+        int m_writeIndex = 0;            // ring slot the next/last readback targets
+        bool m_stagingFilled[2] = {};    // slot has ever received a frame
 
         bool m_captureFailureLogged = false;
     };

@@ -238,7 +238,20 @@ namespace wowvr
         bottom = m_tangents[eye][3];
     }
 
-    bool VrSession::SubmitEye(int eye, void* texture)
+    HeadPoseStamp VrSession::CurrentPoseStamp() const
+    {
+        HeadPoseStamp stamp = {};
+        stamp.valid = m_headPoseValid;
+        if (stamp.valid)
+        {
+            const vr::HmdMatrix34_t& pose =
+                g_poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking;
+            memcpy(stamp.m, pose.m, sizeof(stamp.m));
+        }
+        return stamp;
+    }
+
+    bool VrSession::SubmitEye(int eye, void* texture, const HeadPoseStamp* renderPose)
     {
         if (!m_active || texture == nullptr)
         {
@@ -252,7 +265,7 @@ namespace wowvr
         // washes the whole image out.
         submission.eColorSpace = vr::ColorSpace_Gamma;
 
-        return SubmitTexture(eye, submission, nullptr);
+        return SubmitTexture(eye, submission, nullptr, renderPose);
     }
 
     bool VrSession::SubmitEyeGl(int eye, uint32_t glTexture)
@@ -294,10 +307,28 @@ namespace wowvr
     }
 
     bool VrSession::SubmitTexture(int eye, const vr::Texture_t& texture,
-                                  const vr::VRTextureBounds_t* bounds)
+                                  const vr::VRTextureBounds_t* bounds,
+                                  const HeadPoseStamp* renderPose)
     {
+        // A stamped submission tells the compositor which pose the pixels were
+        // rendered with, so it reprojects from THAT pose to the display pose. The
+        // pipelined readback submits a frame-old image; unstamped, the compositor
+        // assumes it belongs to the current pose and head movement jitters by one
+        // frame's rotation.
+        vr::VRTextureWithPose_t stamped;
+        const vr::Texture_t* submission = &texture;
+        vr::EVRSubmitFlags flags = vr::Submit_Default;
+        if (renderPose != nullptr && renderPose->valid)
+        {
+            static_cast<vr::Texture_t&>(stamped) = texture;
+            memcpy(stamped.mDeviceToAbsoluteTracking.m, renderPose->m,
+                   sizeof(stamped.mDeviceToAbsoluteTracking.m));
+            submission = &stamped;
+            flags = vr::Submit_TextureWithPose;
+        }
+
         const vr::EVRCompositorError error =
-            vr::VRCompositor()->Submit(ToOpenVREye(eye), &texture, bounds);
+            vr::VRCompositor()->Submit(ToOpenVREye(eye), submission, bounds, flags);
 
         if (static_cast<int>(error) != m_lastSubmitError)
         {

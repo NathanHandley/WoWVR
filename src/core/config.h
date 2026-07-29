@@ -43,6 +43,15 @@ namespace wowvr
         // if no sharing route works; 0 forces the copy path outright.
         bool zeroCopyPresenter = true;
 
+        // Copy path only: read this frame's pixels back NEXT frame instead of
+        // stalling on them now. GetRenderTargetData merely queues the copy; it is
+        // the same-frame LockRect that waits for the whole GPU frame to drain.
+        // With two staging surfaces per eye the lock takes the previous frame's
+        // finished readback, for one frame of extra latency on a path that is a
+        // frame behind by nature. Off restores the same-frame lock (A/B via the
+        // "pipereadback" command).
+        bool pipelinedReadback = true;
+
         // Run the client through Windows' D3D9On12 mapping layer. A plain D3D9
         // device cannot share its allocations at all (share handles and the GL
         // interop both fail), but on 9on12 every D3D9 resource is a D3D12 resource

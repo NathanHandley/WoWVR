@@ -924,6 +924,12 @@ namespace wowvr
         FrameTimers g_timers;
         LARGE_INTEGER g_qpcFrequency = {};
 
+        // The HMD pose this frame and last frame were rendered with. The pipelined
+        // readback uploads last frame's pixels, and the submit stamps them with
+        // last frame's pose so the compositor reprojects by the true delta.
+        HeadPoseStamp g_renderPoseCurrent;
+        HeadPoseStamp g_renderPosePrevious;
+
         double ElapsedMs(const LARGE_INTEGER& from, const LARGE_INTEGER& to)
         {
             if (g_qpcFrequency.QuadPart == 0)
@@ -1107,6 +1113,7 @@ namespace wowvr
             for (int eye = 0; eye < EyeCount; ++eye)
             {
                 ready = g_eyeTargets[eye].Create(device, width, height, kind) && ready;
+                g_eyeTargets[eye].SetPipelined(Cfg().pipelinedReadback);
             }
             g_creatingProxyResource = false;
             return ready;
@@ -2129,6 +2136,12 @@ namespace wowvr
                     && g_frameCount == static_cast<unsigned long long>(Cfg().dumpFrameNumber));
             g_dumpNextFrame = false;
 
+            // The pose this frame was rendered with, and the one before it, so a
+            // pipelined submit can stamp its frame-old pixels with the pose that
+            // actually produced them.
+            g_renderPosePrevious = g_renderPoseCurrent;
+            g_renderPoseCurrent = Vr().CurrentPoseStamp();
+
             const LARGE_INTEGER captureStart = Now();
 
             const bool zeroCopy = g_zeroCopyActive || g_glInteropActive || g_d3d12Active;
@@ -2189,9 +2202,11 @@ namespace wowvr
                 // The lock is where the readback's real cost lands -
                 // GetRenderTargetData is asynchronous and LockRect waits for the
                 // GPU - so its time is booked under 'capture', leaving 'upload' as
-                // the pure CPU-to-D3D11 copy.
+                // the pure CPU-to-D3D11 copy. Pipelined it takes last frame's
+                // surface and returns at once; dump frames force this frame's so
+                // the BMP shows what the log line says it shows.
                 const LARGE_INTEGER lockStart = Now();
-                const bool locked = g_eyeTargets[eye].Lock();
+                const bool locked = g_eyeTargets[eye].Lock(zeroCopy || dumpThisFrame);
                 lockMs += ElapsedMs(lockStart, Now());
                 if (!locked)
                 {
@@ -2277,9 +2292,22 @@ namespace wowvr
             }
             else
             {
+                // Copy path: the uploaded pixels may be a frame old (pipelined
+                // readback), so stamp the submission with the pose they were
+                // rendered at and let the compositor reproject the difference.
+                // The adopted-texture zero-copy route holds this frame's pixels
+                // and keeps the classic unstamped submit.
+                const HeadPoseStamp* renderPose = nullptr;
+                if (!zeroCopy)
+                {
+                    renderPose = g_eyeTargets[EyeLeft].LockedIsCurrentFrame()
+                                     ? &g_renderPoseCurrent
+                                     : &g_renderPosePrevious;
+                }
                 void* leftTexture = g_presenter.EyeTexture(EyeLeft);
-                Vr().SubmitEye(EyeLeft, leftTexture);
-                Vr().SubmitEye(EyeRight, stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture);
+                Vr().SubmitEye(EyeLeft, leftTexture, renderPose);
+                Vr().SubmitEye(EyeRight, stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
+                               renderPose);
                 Vr().PostSubmit();
             }
             const LARGE_INTEGER submitEnd = Now();
@@ -3351,6 +3379,26 @@ namespace wowvr
                         {
                             WOWVR_WARN("cullfeed wants '<site> s' (shadow) or "
                                        "'<site> l' (live).");
+                        }
+                    }
+                    // "pipereadback <0|1>": the copy path's staging ring, live. 1
+                    // locks the previous frame's readback (no GPU drain), 0 the
+                    // classic same-frame lock - the A/B pair for the frame report's
+                    // capture time.
+                    else if (strncmp(command, "pipereadback ", 13) == 0)
+                    {
+                        int on = -1;
+                        if (sscanf(command + 13, "%d", &on) == 1 && (on == 0 || on == 1))
+                        {
+                            for (int eye = 0; eye < EyeCount; ++eye)
+                            {
+                                g_eyeTargets[eye].SetPipelined(on == 1);
+                            }
+                            WOWVR_INFO("Pipelined readback -> %s.", (on == 1) ? "on" : "off");
+                        }
+                        else
+                        {
+                            WOWVR_WARN("pipereadback wants 0 or 1.");
                         }
                     }
                     // Toggles the map-object family bypass; the setter logs both ways.

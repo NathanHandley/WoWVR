@@ -19,6 +19,18 @@ namespace wowvr
         EyeCount = 2
     };
 
+    // The raw HMD pose a frame was rendered with, in a shape the render layer can
+    // hold without seeing OpenVR types. Submitting a frame with the stamp of the
+    // pose that actually produced its pixels lets the compositor reproject a
+    // frame-late image by the right delta - without it, a pipelined (one frame
+    // old) submission is treated as belonging to the current pose and every head
+    // movement carries a one-frame mismatch, felt as microjitter.
+    struct HeadPoseStamp
+    {
+        float m[3][4];
+        bool valid = false;
+    };
+
     // Owns the OpenVR runtime connection. Every failure path here is non-fatal:
     // if there is no headset, or SteamVR will not start, the session stays inactive
     // and the game carries on rendering flat to the desktop.
@@ -51,9 +63,15 @@ namespace wowvr
 
         void EyeTangents(int eye, float& left, float& right, float& top, float& bottom) const;
 
+        // The device pose from the latest WaitGetPoses, for stamping the frame
+        // rendered against it.
+        HeadPoseStamp CurrentPoseStamp() const;
+
         // 'texture' is an ID3D11Texture2D. Returns false once and logs on failure,
-        // then stays quiet so a broken frame cannot flood the log.
-        bool SubmitEye(int eye, void* texture);
+        // then stays quiet so a broken frame cannot flood the log. A valid
+        // renderPose is passed to the compositor as the pose the frame was
+        // rendered with (Submit_TextureWithPose); null keeps the classic submit.
+        bool SubmitEye(int eye, void* texture, const HeadPoseStamp* renderPose = nullptr);
 
         // Same, for an OpenGL texture name (the zero-copy interop path). The caller
         // must have its GL context current; the compositor reads through it.
@@ -66,7 +84,8 @@ namespace wowvr
 
     private:
         bool SubmitTexture(int eye, const vr::Texture_t& texture,
-                           const vr::VRTextureBounds_t* bounds);
+                           const vr::VRTextureBounds_t* bounds,
+                           const HeadPoseStamp* renderPose = nullptr);
 
         bool m_active = false;
         uint32_t m_renderWidth = 0;

@@ -195,6 +195,8 @@ namespace wowvr
         config.renderScale = ReadFloat(path, L"VR", L"RenderScale", config.renderScale);
         config.zeroCopyPresenter =
             ReadBool(path, L"VR", L"ZeroCopyPresenter", config.zeroCopyPresenter);
+        config.pipelinedReadback =
+            ReadBool(path, L"VR", L"PipelinedReadback", config.pipelinedReadback);
         config.useD3D9On12 = ReadBool(path, L"VR", L"UseD3D9On12", config.useD3D9On12);
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);
