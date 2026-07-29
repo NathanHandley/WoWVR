@@ -52,6 +52,14 @@ namespace wowvr
         // "pipereadback" command).
         bool pipelinedReadback = true;
 
+        // Copy path only: run the D3D11 upload and the compositor submit on a
+        // worker thread instead of the game's render thread. The game thread
+        // keeps WaitGetPoses (it paces the game and delivers poses) and hands
+        // the worker the locked previous-frame staging pointer; the lock is
+        // held until the worker is provably idle next frame, so the two threads
+        // never touch the same slot. Live toggle: "presenterthread 0|1".
+        bool presenterThread = true;
+
         // Run the client through Windows' D3D9On12 mapping layer. A plain D3D9
         // device cannot share its allocations at all (share handles and the GL
         // interop both fail), but on 9on12 every D3D9 resource is a D3D12 resource

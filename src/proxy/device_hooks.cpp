@@ -947,6 +947,126 @@ namespace wowvr
             return value;
         }
 
+        // The presenter thread: takes the locked previous-frame staging pointers
+        // and runs the D3D11 upload + compositor submit off the game thread. The
+        // game thread owns every D3D9 call and WaitGetPoses; the worker owns the
+        // D3D11 context and Submit while a job is in flight. The done event is
+        // manual-reset and doubles as the idle gate - the game thread waits on it
+        // before unlocking the staging surfaces the worker was reading and before
+        // any device teardown touches the presenter's textures.
+        struct PresenterJob
+        {
+            const void* pixels[EyeCount];
+            uint32_t pitch[EyeCount];
+            bool stereo;
+            HeadPoseStamp pose;
+        };
+
+        PresenterJob g_presenterJob = {};
+        HANDLE g_presenterJobEvent = nullptr;    // auto-reset: a job is ready
+        HANDLE g_presenterDoneEvent = nullptr;   // manual-reset: worker is idle
+        HANDLE g_presenterThreadHandle = nullptr;
+        bool g_presenterThreadOn = true;         // runtime half of Cfg().presenterThread
+        bool g_presenterThreadConfigApplied = false;
+        bool g_presenterThreadBroken = false;
+
+        // Worker-side frame cost, accumulated in integer microseconds because the
+        // game thread reads and resets them from ReportFrameTimings.
+        volatile LONGLONG g_presenterUploadUs = 0;
+        volatile LONGLONG g_presenterSubmitUs = 0;
+        volatile LONG g_presenterSamples = 0;
+
+        void RunPresenterJob(const PresenterJob& job)
+        {
+            const LARGE_INTEGER uploadStart = Now();
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                if (!job.stereo && eye == EyeRight)
+                {
+                    break;
+                }
+                if (job.pixels[eye] != nullptr)
+                {
+                    g_presenter.Upload(eye, job.pixels[eye], job.pitch[eye]);
+                }
+            }
+
+            const LARGE_INTEGER submitStart = Now();
+            void* leftTexture = g_presenter.EyeTexture(EyeLeft);
+            Vr().SubmitEye(EyeLeft, leftTexture, &job.pose);
+            Vr().SubmitEye(EyeRight,
+                           job.stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
+                           &job.pose);
+            Vr().PostSubmit();
+            const LARGE_INTEGER submitEnd = Now();
+
+            InterlockedExchangeAdd64(&g_presenterUploadUs,
+                                     static_cast<LONGLONG>(ElapsedMs(uploadStart, submitStart) * 1000.0));
+            InterlockedExchangeAdd64(&g_presenterSubmitUs,
+                                     static_cast<LONGLONG>(ElapsedMs(submitStart, submitEnd) * 1000.0));
+            InterlockedIncrement(&g_presenterSamples);
+        }
+
+        DWORD WINAPI PresenterThreadProc(LPVOID)
+        {
+            for (;;)
+            {
+                WaitForSingleObject(g_presenterJobEvent, INFINITE);
+                RunPresenterJob(g_presenterJob);
+                SetEvent(g_presenterDoneEvent);
+            }
+        }
+
+        // Lazily brings the worker up. Never torn down: the thread parks in an
+        // event wait and dies with the process, which is the only shutdown that
+        // cannot deadlock a DllMain.
+        bool EnsurePresenterThread()
+        {
+            if (g_presenterThreadHandle != nullptr)
+            {
+                return true;
+            }
+            if (g_presenterThreadBroken)
+            {
+                return false;
+            }
+
+            g_presenterJobEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            g_presenterDoneEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+            if (g_presenterJobEvent != nullptr && g_presenterDoneEvent != nullptr)
+            {
+                g_presenterThreadHandle =
+                    CreateThread(nullptr, 0, PresenterThreadProc, nullptr, 0, nullptr);
+            }
+            if (g_presenterThreadHandle == nullptr)
+            {
+                WOWVR_WARN("Presenter thread unavailable (%lu); upload and submit stay "
+                           "on the game thread.", GetLastError());
+                g_presenterThreadBroken = true;
+                return false;
+            }
+
+            WOWVR_INFO("Presenter thread up; D3D11 upload and compositor submit run "
+                       "off the game thread.");
+            return true;
+        }
+
+        // Blocks until the worker has finished the outstanding job, then releases
+        // the staging locks it was reading from. Cheap in the steady state: the
+        // worker had a whole game frame to do ~1.3 ms of work.
+        void WaitPresenterIdleAndUnlock()
+        {
+            if (g_presenterThreadHandle == nullptr)
+            {
+                return;
+            }
+            WaitForSingleObject(g_presenterDoneEvent, INFINITE);
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                g_eyeTargets[eye].Unlock();
+            }
+        }
+
         void ReportFrameTimings()
         {
             if (g_timers.samples == 0)
@@ -965,6 +1085,20 @@ namespace wowvr
                        Vr().RenderWidth(), Vr().RenderHeight());
 
             g_timers = FrameTimers();
+
+            const LONG presenterSamples = g_presenterSamples;
+            if (presenterSamples > 0)
+            {
+                WOWVR_INFO("Presenter thread cost over %ld frames: upload %.2f ms, "
+                           "submit %.2f ms.",
+                           presenterSamples,
+                           static_cast<double>(g_presenterUploadUs) / 1000.0 / presenterSamples,
+                           static_cast<double>(g_presenterSubmitUs) / 1000.0 / presenterSamples);
+                InterlockedExchange64(&g_presenterUploadUs, 0);
+                InterlockedExchange64(&g_presenterSubmitUs, 0);
+                InterlockedExchange(&g_presenterSamples, 0);
+            }
+
             WOWVR_INFO("Pool census (default/managed/sysmem/scratch): textures %llu/%llu/%llu/%llu, "
                        "vertex buffers %llu/%llu/%llu/%llu, index buffers %llu/%llu/%llu/%llu",
                        g_poolCounts[CensusTexture][0], g_poolCounts[CensusTexture][1],
@@ -1071,6 +1205,10 @@ namespace wowvr
 
         void ReleaseFrameResources()
         {
+            // The presenter thread may still be uploading into textures about to
+            // die; everything below assumes exclusive ownership.
+            WaitPresenterIdleAndUnlock();
+
             // The presenter's adopted textures and the GL registrations alias the
             // D3D9 surfaces being destroyed just below, so they go first. The GL
             // context and interop device survive; only the per-texture state dies.
@@ -2146,6 +2284,21 @@ namespace wowvr
 
             const bool zeroCopy = g_zeroCopyActive || g_glInteropActive || g_d3d12Active;
 
+            // The worker may still be reading last frame's locked staging surfaces
+            // and owning the D3D11 context; both must settle before this frame
+            // captures into the slot it was reading or touches the presenter
+            // inline. Steady state this wait is ~0 - the worker had a whole game
+            // frame for ~1.3 ms of work - and it books under 'capture'. Dump
+            // frames run the classic inline path so a shot stays frame-exact.
+            if (!g_presenterThreadConfigApplied)
+            {
+                g_presenterThreadConfigApplied = true;
+                g_presenterThreadOn = Cfg().presenterThread;
+            }
+            WaitPresenterIdleAndUnlock();
+            const bool threaded = g_presenterThreadOn && !zeroCopy && !dumpThisFrame
+                && EnsurePresenterThread();
+
             for (int eye = 0; eye < EyeCount; ++eye)
             {
                 if (stereo)
@@ -2213,7 +2366,7 @@ namespace wowvr
                     continue;
                 }
 
-                if (!zeroCopy)
+                if (!zeroCopy && !threaded)
                 {
                     g_presenter.Upload(eye, g_eyeTargets[eye].LockedPixels(),
                                        g_eyeTargets[eye].LockedPitch());
@@ -2259,7 +2412,13 @@ namespace wowvr
                     }
                 }
 
-                g_eyeTargets[eye].Unlock();
+                // Threaded, the lock stays held: the worker reads these pixels
+                // for the rest of the frame, and the release happens at the top
+                // of the next SubmitFrame once the worker is provably idle.
+                if (!threaded)
+                {
+                    g_eyeTargets[eye].Unlock();
+                }
             }
 
             const LARGE_INTEGER submitStart = Now();
@@ -2304,11 +2463,33 @@ namespace wowvr
                                      ? &g_renderPoseCurrent
                                      : &g_renderPosePrevious;
                 }
-                void* leftTexture = g_presenter.EyeTexture(EyeLeft);
-                Vr().SubmitEye(EyeLeft, leftTexture, renderPose);
-                Vr().SubmitEye(EyeRight, stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
-                               renderPose);
-                Vr().PostSubmit();
+
+                if (threaded)
+                {
+                    // Hand the frame to the worker: locked staging pointers, the
+                    // pose that produced them, and the upload + submit + handoff
+                    // happen off the game thread. WaitGetPoses stays here.
+                    g_presenterJob.pixels[EyeLeft] = g_eyeTargets[EyeLeft].LockedPixels();
+                    g_presenterJob.pitch[EyeLeft] = g_eyeTargets[EyeLeft].LockedPitch();
+                    g_presenterJob.pixels[EyeRight] =
+                        stereo ? g_eyeTargets[EyeRight].LockedPixels() : nullptr;
+                    g_presenterJob.pitch[EyeRight] =
+                        stereo ? g_eyeTargets[EyeRight].LockedPitch() : 0;
+                    g_presenterJob.stereo = stereo;
+                    g_presenterJob.pose =
+                        (renderPose != nullptr) ? *renderPose : HeadPoseStamp{};
+                    ResetEvent(g_presenterDoneEvent);
+                    SetEvent(g_presenterJobEvent);
+                }
+                else
+                {
+                    void* leftTexture = g_presenter.EyeTexture(EyeLeft);
+                    Vr().SubmitEye(EyeLeft, leftTexture, renderPose);
+                    Vr().SubmitEye(EyeRight,
+                                   stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
+                                   renderPose);
+                    Vr().PostSubmit();
+                }
             }
             const LARGE_INTEGER submitEnd = Now();
 
@@ -3399,6 +3580,23 @@ namespace wowvr
                         else
                         {
                             WOWVR_WARN("pipereadback wants 0 or 1.");
+                        }
+                    }
+                    // "presenterthread <0|1>": whether upload + submit run on the
+                    // worker. Off falls back to the inline game-thread path the
+                    // next frame; the frame-top idle wait drains the worker first.
+                    else if (strncmp(command, "presenterthread ", 16) == 0)
+                    {
+                        int on = -1;
+                        if (sscanf(command + 16, "%d", &on) == 1 && (on == 0 || on == 1))
+                        {
+                            g_presenterThreadConfigApplied = true;
+                            g_presenterThreadOn = (on == 1);
+                            WOWVR_INFO("Presenter thread -> %s.", (on == 1) ? "on" : "off");
+                        }
+                        else
+                        {
+                            WOWVR_WARN("presenterthread wants 0 or 1.");
                         }
                     }
                     // Toggles the map-object family bypass; the setter logs both ways.
