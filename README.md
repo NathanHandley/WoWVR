@@ -156,3 +156,7 @@ It exists because SteamVR takes focus while it starts and silently swallows hotk
 scripted runs impossible to drive any other way. `cullrotstate` is a good first one to try: it
 prints every culling volume the client rebuilt, which call site built it, and how far the camera
 sits from its side planes.
+
+## Credits
+
+Claude (Opus 5 and Fable) actually wrote most of the code, so releasing this under MIT
