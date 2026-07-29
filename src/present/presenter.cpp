@@ -41,6 +41,32 @@ namespace wowvr
             }
         }
 
+        // The slices of one dispatch, claimed by pool workers with an interlocked
+        // index. Upload is only ever called from the game's render thread, so a
+        // single static dispatch state is enough.
+        struct RowCopyDispatch
+        {
+            RowCopySlice slices[6];
+            LONG nextSlice = 0;
+            LONG remaining = 0;
+            HANDLE doneEvent = nullptr;
+        };
+
+        RowCopyDispatch g_rowCopyDispatch;
+        PTP_WORK g_rowCopyWork = nullptr;
+        bool g_rowCopyPoolBroken = false;
+
+        VOID CALLBACK RowCopyWorkCallback(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WORK)
+        {
+            RowCopyDispatch* dispatch = static_cast<RowCopyDispatch*>(context);
+            const LONG index = InterlockedIncrement(&dispatch->nextSlice) - 1;
+            CopyRowSlice(dispatch->slices[index]);
+            if (InterlockedDecrement(&dispatch->remaining) == 0)
+            {
+                SetEvent(dispatch->doneEvent);
+            }
+        }
+
         void CopyRowsParallel(void* destination, uint32_t destinationPitch,
                               const void* source, uint32_t sourcePitch,
                               uint32_t rowBytes, uint32_t rows)
@@ -49,9 +75,38 @@ namespace wowvr
             sliceCount = std::clamp(sliceCount, 2u, 6u);
             sliceCount = std::min(sliceCount, rows);
 
-            std::thread workers[6];
+            // The workers come from the process's kernel thread pool: no
+            // per-frame thread creation (the old std::thread version paid up to
+            // ten spawn/joins a frame across both eyes), and no threads of our
+            // own to tear down at DLL unload. Created once, never closed - the
+            // pool must outlive every Upload, and the process reclaims it.
+            if (g_rowCopyWork == nullptr && !g_rowCopyPoolBroken && sliceCount > 1)
+            {
+                g_rowCopyDispatch.doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (g_rowCopyDispatch.doneEvent != nullptr)
+                {
+                    g_rowCopyWork = CreateThreadpoolWork(RowCopyWorkCallback,
+                                                         &g_rowCopyDispatch, nullptr);
+                }
+                if (g_rowCopyWork == nullptr)
+                {
+                    WOWVR_WARN("Thread pool unavailable (%lu); frame copies run "
+                               "single-threaded.", GetLastError());
+                    g_rowCopyPoolBroken = true;
+                }
+            }
+
+            if (g_rowCopyWork == nullptr)
+            {
+                sliceCount = 1;
+            }
+
             const uint32_t rowsPerSlice = (rows + sliceCount - 1) / sliceCount;
 
+            g_rowCopyDispatch.nextSlice = 0;
+            g_rowCopyDispatch.remaining = static_cast<LONG>(sliceCount) - 1;
+
+            RowCopySlice callerSlice = {};
             for (unsigned i = 0; i < sliceCount; ++i)
             {
                 RowCopySlice slice;
@@ -65,17 +120,24 @@ namespace wowvr
 
                 if (i + 1 == sliceCount)
                 {
-                    CopyRowSlice(slice);  // the calling thread takes the last slice
+                    callerSlice = slice;  // the calling thread takes the last slice
                 }
                 else
                 {
-                    workers[i] = std::thread(CopyRowSlice, slice);
+                    g_rowCopyDispatch.slices[i] = slice;
                 }
             }
 
             for (unsigned i = 0; i + 1 < sliceCount; ++i)
             {
-                workers[i].join();
+                SubmitThreadpoolWork(g_rowCopyWork);
+            }
+
+            CopyRowSlice(callerSlice);
+
+            if (sliceCount > 1)
+            {
+                WaitForSingleObject(g_rowCopyDispatch.doneEvent, INFINITE);
             }
         }
         // Picks the adapter the headset is plugged into. Falls back to the default
