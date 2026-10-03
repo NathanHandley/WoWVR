@@ -78,6 +78,12 @@ namespace wowvr
         // Returns false to leave the upload alone.
         bool TryPatch(const float* uploaded, float* outLeft, float* outRight);
 
+        // The same eye matrices, without TryPatch recording the upload as the scene
+        // camera. For re-deriving an already-known camera block under different
+        // settings (the sky's infinite distance) mid-frame, where re-recording an
+        // older block's matrix would change what the combined path divides by.
+        bool TryPatchNoRecord(const float* uploaded, float* outLeft, float* outRight);
+
         // Same, for a *combined* world-view-projection. Terrain hands the shader one
         // matrix with the camera already multiplied in, so there is no projection to
         // substitute. But if M = WV * P for the camera P we already know, then

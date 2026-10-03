@@ -351,6 +351,35 @@ namespace wowvr
         return correction;
     }
 
+    bool ProjectionPatch::TryPatchNoRecord(const float* uploaded, float* outLeft,
+                                           float* outRight)
+    {
+        const Mat4 sceneMatrix = m_sceneMatrix;
+        const bool haveSceneMatrix = m_haveSceneMatrix;
+        const float sceneNear = m_sceneNear;
+        const float sceneFar = m_sceneFar;
+        const float sceneVerticalScale = m_sceneVerticalScale;
+        const float lastAspect = m_lastAspect;
+        const float lastNear = m_lastNear;
+        const float lastFar = m_lastFar;
+        const unsigned long long patched = m_patched;
+        const unsigned long long rejected = m_rejected;
+
+        const bool result = TryPatch(uploaded, outLeft, outRight);
+
+        m_sceneMatrix = sceneMatrix;
+        m_haveSceneMatrix = haveSceneMatrix;
+        m_sceneNear = sceneNear;
+        m_sceneFar = sceneFar;
+        m_sceneVerticalScale = sceneVerticalScale;
+        m_lastAspect = lastAspect;
+        m_lastNear = lastNear;
+        m_lastFar = lastFar;
+        m_patched = patched;
+        m_rejected = rejected;
+        return result;
+    }
+
     Mat4 ProjectionPatch::GameViewToBody() const
     {
         // m_headRotation is a pure rotation, so its transpose is its inverse.

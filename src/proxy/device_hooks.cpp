@@ -646,10 +646,22 @@ namespace wowvr
         // A small fixed cache. The game cycles through a handful of shapes and each one
         // costs several GDI round trips to build, which is not something to be doing in
         // the middle of a frame every time the pointer crosses a button.
-        const int kCursorCacheSize = 32;
+        //
+        // The client creates a NEW cursor handle every time its pointer art changes -
+        // 32 distinct handles in about thirty seconds of play - and destroys the old
+        // ones, so a handle value can come back later meaning a different picture. A
+        // cache keyed on handles therefore cannot be a lookup table. It is a small ring
+        // instead: art is rebuilt whenever the handle differs from the one drawn last,
+        // and reused only while it stays the same. (The old fixed table of 32 filled up
+        // and then served "whatever was drawn last" forever, which after one hidden
+        // frame - mouselook - was nothing: the pointer vanished for the session.)
+        const int kCursorCacheSize = 4;
         CursorArt g_cursorCache[kCursorCacheSize];
         int g_cursorCacheCount = 0;
-        bool g_cursorCacheFullLogged = false;
+        int g_cursorCacheNext = 0;
+        HCURSOR g_lastLookupShape = nullptr;
+        int g_lastLookupSlot = -1;
+        unsigned long long g_cursorArtBuilds = 0;
         const CursorArt* g_activeCursor = nullptr;
         unsigned long long g_cursorDrawn = 0;
         float g_lastCursorU = -1.0f;
@@ -676,6 +688,44 @@ namespace wowvr
         int g_systemCursorCount = 0;
         HCURSOR g_lastGameCursor = nullptr;
         unsigned long long g_staleCursorSubstitutions = 0;
+
+        // The client's own "cursor visible" switch: CGxDevice +0x2950, written only by
+        // its cursor-visibility method (0x00683640 via 0x0068E750) and read by its
+        // WM_SETCURSOR handler at 0x006A056B. The device is the global at 0x00C5DF88.
+        //
+        // This is the authority on whether the pointer should show. Windows' own
+        // answer (GetCursorInfo's CURSOR_SHOWING) also goes false when "Hide pointer
+        // while typing" is on and a key is pressed - i.e. constantly while moving with
+        // WASD - and stays false until the mouse moves, which is what made the pointer
+        // vanish from the panel mid-play. The client never hid it; Windows did.
+        const uintptr_t kGxDevicePtrRva = 0x00C5DF88u - 0x00400000u;
+        const uintptr_t kGxCursorVisible = 0x2950u;
+        unsigned long long g_vanishSubstitutions = 0;
+        int g_lastGameCursorFlag = -1;
+
+        // 1 shown, 0 hidden, -1 unreadable (no device yet, or not this client).
+        int ReadGameCursorVisible()
+        {
+            __try
+            {
+                const uintptr_t image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                const uintptr_t device = *reinterpret_cast<const uintptr_t*>(image + kGxDevicePtrRva);
+                if (device == 0)
+                {
+                    return -1;
+                }
+                const uint32_t value = *reinterpret_cast<const uint32_t*>(device + kGxCursorVisible);
+                if (value > 1u)
+                {
+                    return -1;   // not a flag: wrong object, so do not trust it
+                }
+                return static_cast<int>(value);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return -1;
+            }
+        }
 
         // Whether the pointer is currently confined to the game window, so ClipCursor
         // is only called when the answer actually changes.
@@ -1073,6 +1123,57 @@ namespace wowvr
             }
         }
 
+        // The per-frame version, which must never be able to freeze the game.
+        //
+        // Measured 2026-10-03: the worker sat inside IVRCompositor::Submit - in
+        // vrclient, waiting in the NVIDIA D3D11 driver - and never came back, and the
+        // unbounded wait above then hung the game thread with it: the whole client
+        // locked up a few seconds into the world. Nothing in the frame can make a
+        // stuck compositor submit return, but the game does not have to wait for it.
+        // So: wait a bounded time, and if the worker is still busy, skip this frame's
+        // VR output entirely (its staging slot is still the worker's, so nothing may
+        // capture into it) and keep polling on later frames; the moment the submit
+        // returns, the locks are released and output resumes.
+        bool g_presenterStalled = false;
+        unsigned long long g_presenterStalledFrames = 0;
+        const DWORD kPresenterStallTimeoutMs = 500;
+
+        bool TryWaitPresenterIdleAndUnlock()
+        {
+            if (g_presenterThreadHandle == nullptr)
+            {
+                return true;
+            }
+
+            const DWORD timeout = g_presenterStalled ? 0 : kPresenterStallTimeoutMs;
+            if (WaitForSingleObject(g_presenterDoneEvent, timeout) != WAIT_OBJECT_0)
+            {
+                if (!g_presenterStalled)
+                {
+                    g_presenterStalled = true;
+                    WOWVR_ERROR("Presenter worker has been inside the compositor submit for "
+                                "over %lu ms; pausing headset output so the game keeps "
+                                "running. It resumes by itself if the submit returns.",
+                                kPresenterStallTimeoutMs);
+                }
+                ++g_presenterStalledFrames;
+                return false;
+            }
+
+            if (g_presenterStalled)
+            {
+                g_presenterStalled = false;
+                WOWVR_WARN("Presenter worker came back after %llu skipped frames; headset "
+                           "output resumed.", g_presenterStalledFrames);
+                g_presenterStalledFrames = 0;
+            }
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                g_eyeTargets[eye].Unlock();
+            }
+            return true;
+        }
+
         void ReportFrameTimings()
         {
             if (g_timers.samples == 0)
@@ -1181,20 +1282,24 @@ namespace wowvr
                        static_cast<unsigned>(kShadowRegisters),
                        g_oversizeUploads, g_beyondShadowMirror);
 
-            WOWVR_INFO("Cursor: window %p, %d shape(s) cached, current %s, drawn %llu, "
+            WOWVR_INFO("Cursor: window %p, %d shape(s) cached (%llu built so far), current %s, drawn %llu, "
                        "last position %.3f, %.3f",
                        static_cast<void*>(g_gameWindow), g_cursorCacheCount,
-                       g_activeCursor != nullptr ? "shown" : "hidden",
+                       g_cursorArtBuilds, g_activeCursor != nullptr ? "shown" : "hidden",
                        g_cursorDrawn, g_lastCursorU, g_lastCursorV);
             WOWVR_INFO("UI panel compositing: %s, %llu additive interface draws given a "
                        "no-coverage alpha blend",
                        Cfg().premultipliedUi ? "premultiplied" : "straight alpha",
                        g_additiveUiDraws);
             WOWVR_INFO("Cursor: %llu stale-pointer substitutions after focus changes, "
-                       "last game art %p, focus %s, confined %s",
+                       "last game art %p, focus %s, confined %s; game says %s, %llu frames "
+                       "drawn while Windows had it hidden",
                        g_staleCursorSubstitutions, static_cast<void*>(g_lastGameCursor),
                        GameHasFocus() ? "held" : "elsewhere",
-                       g_cursorConfined ? "yes" : "no");
+                       g_cursorConfined ? "yes" : "no",
+                       g_lastGameCursorFlag == 1 ? "shown"
+                           : (g_lastGameCursorFlag == 0 ? "hidden" : "unknown"),
+                       g_vanishSubstitutions);
             WOWVR_INFO("World draws using pre-transformed screen coordinates: %llu",
                        g_preTransformedWorldDraws);
             WOWVR_INFO("World draws with the scissor test on: %llu (game scissor %ld,%ld - %ld,%ld)",
@@ -1714,12 +1819,27 @@ namespace wowvr
             cursorInfo.cbSize = sizeof(cursorInfo);
             const bool haveGlobal = GetCursorInfo(&cursorInfo) != FALSE;
 
-            // A hidden pointer stays hidden: that is the game suppressing it while you
-            // hold the right button to look around, and it must not be second-guessed.
+            // A hidden pointer stays hidden when the GAME hid it - mouselook, a drag of
+            // the camera - and that must not be second-guessed. When the game says it is
+            // showing, Windows hiding it (hide-while-typing) or reporting no shape is not
+            // the game's doing, and the last art the game set is drawn instead.
+            const int gameFlag = ReadGameCursorVisible();
+            g_lastGameCursorFlag = gameFlag;
+            const bool windowsShowing = haveGlobal && (cursorInfo.flags & CURSOR_SHOWING) != 0;
             HCURSOR shape = nullptr;
-            if (haveGlobal && (cursorInfo.flags & CURSOR_SHOWING) != 0)
+            if (windowsShowing)
             {
                 shape = cursorInfo.hCursor;
+            }
+            if (gameFlag == 0)
+            {
+                shape = nullptr;
+            }
+            else if (gameFlag == 1 && shape == nullptr && g_lastGameCursor != nullptr
+                     && GameHasFocus())
+            {
+                shape = g_lastGameCursor;
+                ++g_vanishSubstitutions;
             }
 
             if (shape != nullptr && GameHasFocus())
@@ -1749,12 +1869,12 @@ namespace wowvr
                     lastGlobal = cursorInfo.hCursor;
                     lastShape = shape;
                     WOWVR_INFO("Cursor decision: focus=%s global=%p (%s) drawing=%p "
-                               "lastGameArt=%p flags=0x%lx substitutions=%llu",
+                               "lastGameArt=%p flags=0x%lx gameFlag=%d substitutions=%llu",
                                focus ? "yes" : "no", static_cast<void*>(cursorInfo.hCursor),
                                IsSystemCursor(cursorInfo.hCursor) ? "standard" : "game art",
                                static_cast<void*>(shape),
                                static_cast<void*>(g_lastGameCursor),
-                               cursorInfo.flags, g_staleCursorSubstitutions);
+                               cursorInfo.flags, gameFlag, g_staleCursorSubstitutions);
                 }
             }
 
@@ -1763,26 +1883,26 @@ namespace wowvr
                 return nullptr;
             }
 
-            for (int i = 0; i < g_cursorCacheCount; ++i)
+            // Same handle as last time: the art already built for it, or nothing if it
+            // would not build (remembered, so a broken shape is not retried per frame).
+            if (shape == g_lastLookupShape && g_lastLookupSlot >= 0)
             {
-                if (g_cursorCache[i].source == shape)
-                {
-                    // A cached entry with no texture is a shape that already failed to
-                    // build; remembering that is what stops it being retried per frame.
-                    return (g_cursorCache[i].texture != nullptr) ? &g_cursorCache[i] : nullptr;
-                }
+                const CursorArt& known = g_cursorCache[g_lastLookupSlot];
+                return (known.texture != nullptr) ? &known : nullptr;
             }
 
-            if (g_cursorCacheCount >= kCursorCacheSize)
+            // A different handle: build afresh into the oldest slot.
+            const int slot = g_cursorCacheNext;
+            g_cursorCacheNext = (g_cursorCacheNext + 1) % kCursorCacheSize;
+            if (g_cursorCacheCount < kCursorCacheSize)
             {
-                if (!g_cursorCacheFullLogged)
-                {
-                    g_cursorCacheFullLogged = true;
-                    WOWVR_WARN("Saw more than %d cursor shapes; the pointer will keep the "
-                               "last one it managed to cache.", kCursorCacheSize);
-                }
-                return g_activeCursor;
+                ++g_cursorCacheCount;
             }
+            if (g_cursorCache[slot].texture != nullptr)
+            {
+                g_cursorCache[slot].texture->Release();
+            }
+            g_cursorCache[slot] = CursorArt();
 
             CursorArt art;
             const bool built = BuildCursorArt(device, shape, art);
@@ -1791,18 +1911,17 @@ namespace wowvr
                 art.source = shape;
                 art.texture = nullptr;
             }
-            g_cursorCache[g_cursorCacheCount] = art;
-            ++g_cursorCacheCount;
+            g_cursorCache[slot] = art;
+            g_lastLookupShape = shape;
+            g_lastLookupSlot = slot;
+            ++g_cursorArtBuilds;
 
             if (!built)
             {
                 WOWVR_WARN("Could not read cursor shape %p; it will not be drawn.", shape);
                 return nullptr;
             }
-
-            WOWVR_INFO("Cached cursor shape %d: %dx%d, hotspot %d,%d.", g_cursorCacheCount,
-                       art.width, art.height, art.hotspotX, art.hotspotY);
-            return &g_cursorCache[g_cursorCacheCount - 1];
+            return &g_cursorCache[slot];
         }
 
         void ReleaseCursorTextures()
@@ -1816,7 +1935,9 @@ namespace wowvr
                 g_cursorCache[i] = CursorArt();
             }
             g_cursorCacheCount = 0;
-            g_cursorCacheFullLogged = false;
+            g_cursorCacheNext = 0;
+            g_lastLookupShape = nullptr;
+            g_lastLookupSlot = -1;
             g_activeCursor = nullptr;
         }
 
@@ -2314,7 +2435,10 @@ namespace wowvr
                 g_presenterThreadConfigApplied = true;
                 g_presenterThreadOn = Cfg().presenterThread;
             }
-            WaitPresenterIdleAndUnlock();
+            if (!TryWaitPresenterIdleAndUnlock())
+            {
+                return;
+            }
             const bool threaded = g_presenterThreadOn && !zeroCopy && !dumpThisFrame
                 && EnsurePresenterThread();
 
@@ -2726,9 +2850,14 @@ namespace wowvr
             // also what paces the game to the headset's refresh rate.
             if (Cfg().enabled && Vr().IsActive())
             {
-                const LARGE_INTEGER waitStart = Now();
-                Vr().WaitForFrame();
-                g_timers.waitMs += ElapsedMs(waitStart, Now());
+                // Not while the worker is stuck in a submit: the compositor is waiting
+                // on that frame, so WaitGetPoses could block the game thread too.
+                if (!g_presenterStalled)
+                {
+                    const LARGE_INTEGER waitStart = Now();
+                    Vr().WaitForFrame();
+                    g_timers.waitMs += ElapsedMs(waitStart, Now());
+                }
 
                 // Recentre the moment the headset is first actually worn. Until then
                 // "forward" would be measured from wherever it happened to be lying.
@@ -4554,6 +4683,22 @@ namespace wowvr
                 g_originalSetViewport(device, &viewport);
             }
 
+            // The sky dome is squashed into the very top of the depth range, above the
+            // distant backdrop terrain at 0.998..0.999. That slice is the reliable way
+            // to recognise it: it needs the head's rotation but neither the head's
+            // displacement nor the per-eye offset, or it stops reading as a horizon.
+            //
+            // Decided HERE, before any camera constant goes back in. It used to be set
+            // only just before the fixed-function projection further down, so every
+            // sky draw made through a vertex shader - the dome and the zone skybox
+            // models - still got the cached per-eye blocks and the combined transform
+            // WITH stereo separation and head translation: it sat at its real, finite
+            // radius (nearer than distant buildings) and slid against the head when
+            // leaning.
+            const bool skyDepthSlice = viewport.MinZ >= 0.9985f;
+            if (skyDepthSlice) { ++g_skySliceDraws; }
+            Projection().SetInfiniteDistance(skyDepthSlice);
+
             // Only the scene camera gets swapped. UI and other ortho passes never had
             // a patched projection, so they are simply drawn into each half as-is.
             for (int i = 0; i < g_patchedBlockCount; ++i)
@@ -4578,6 +4723,26 @@ namespace wowvr
                     && !MatricesMatch(&g_shadowConstants[block.startRegister][0], block.source))
                 {
                     continue;
+                }
+
+                // A sky draw needs the rotation-only version, which the cached eye
+                // matrices are not; rebuilt from the game's own matrix with the
+                // infinite-distance flag set. Falls back to the cached pair if the
+                // rebuild is refused.
+                if (skyDepthSlice)
+                {
+                    float skyLeft[16];
+                    float skyRight[16];
+                    const bool rebuilt = block.combined
+                        ? Projection().TryPatchCombined(block.source, skyLeft, skyRight)
+                        : Projection().TryPatchNoRecord(block.source, skyLeft, skyRight);
+                    if (rebuilt)
+                    {
+                        g_originalSetVertexShaderConstantF(
+                            device, block.startRegister,
+                            eye == EyeLeft ? skyLeft : skyRight, 4);
+                        continue;
+                    }
                 }
 
                 g_originalSetVertexShaderConstantF(
@@ -4608,14 +4773,6 @@ namespace wowvr
                     }
                 }
             }
-
-            // The sky dome is squashed into the very top of the depth range, above the
-            // distant backdrop terrain at 0.998..0.999. That slice is the reliable way
-            // to recognise it: it needs the head's rotation but neither the head's
-            // displacement nor the per-eye offset, or it stops reading as a horizon.
-            const bool skyDepthSlice = viewport.MinZ >= 0.9985f;
-            if (skyDepthSlice) { ++g_skySliceDraws; }
-            Projection().SetInfiniteDistance(skyDepthSlice);
 
             // Rebuilt from whatever projection the game currently has set, not from a
             // cached one. The sky dome supplies its own projection with a far plane of
