@@ -218,6 +218,14 @@ namespace wowvr
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
         config.radialFog = ReadBool(path, L"Camera", L"RadialFog", config.radialFog);
+        config.fogDistanceScale =
+            ReadFloat(path, L"Camera", L"FogDistanceScale", config.fogDistanceScale);
+        if (!(config.fogDistanceScale >= 0.25f)) { config.fogDistanceScale = 0.25f; }
+        if (config.fogDistanceScale > 8.0f) { config.fogDistanceScale = 8.0f; }
+        config.viewDistanceScale =
+            ReadFloat(path, L"Camera", L"ViewDistanceScale", config.viewDistanceScale);
+        if (!(config.viewDistanceScale >= 1.0f)) { config.viewDistanceScale = 1.0f; }
+        if (config.viewDistanceScale > 4.0f) { config.viewDistanceScale = 4.0f; }
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);
         config.cullWidenScale =
             ReadFloat(path, L"Camera", L"CullWidenScale", config.cullWidenScale);
@@ -278,6 +286,7 @@ namespace wowvr
             ReadBool(path, L"Panel", L"PremultipliedUi", config.premultipliedUi);
 
         config.desktopMirror = ReadBool(path, L"Mirror", L"DesktopMirror", config.desktopMirror);
+        config.mirrorCrop = ReadBool(path, L"Mirror", L"MirrorCrop", config.mirrorCrop);
 
         config.dumpFrameNumber = ReadInt(path, L"Debug", L"DumpFrameNumber", config.dumpFrameNumber);
         config.frameReportNumber = ReadInt(path, L"Debug", L"FrameReportNumber", config.frameReportNumber);

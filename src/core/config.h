@@ -107,6 +107,22 @@ namespace wowvr
         // side. On, the shaders are rewritten as they are created (see
         // stereo/fog_rewrite.h); off, they are left exactly as shipped.
         bool radialFog = true;
+
+        // How far the fog reaches, relative to the game's own: 2 starts and ends it
+        // twice as far out, 0.5 half as far. Needs RadialFog. Baked into each shader
+        // as it is created, so a change takes effect on the next client start, not on
+        // an INI reload. Very large values show the edge of the terrain the client has
+        // loaded rather than fog.
+        float fogDistanceScale = 1.0f;
+
+        // How far the world is drawn, as a multiple of the client's own draw distance
+        // (791.67 yards at most on the old continents, 1583.33 elsewhere). Applied where
+        // the client computes it each frame, so culling, streaming, the projection and
+        // the low-detail backdrop all follow; changes apply live on an INI reload. Costs
+        // frame rate in proportion to the extra world drawn. Fog is separate
+        // (FogDistanceScale) - the periodic log reports where the terrain fog closes, to
+        // tell whether the client already moves it with the draw distance. 1.0 = stock.
+        float viewDistanceScale = 1.5f;
         float cullFovScale = 1.6f;
 
         // Multiplies the field of view the client CULLS against, inside the camera object.
@@ -358,6 +374,11 @@ namespace wowvr
 
         // [Mirror]
         bool desktopMirror = true;      // keep drawing something in the game window
+
+        // What the mirror shows: 1 crops the left eye to the window's shape around the
+        // eye's optical centre, so the desktop sees what the player sees undistorted;
+        // 0 stretches the whole (tall) eye image into the window as before.
+        bool mirrorCrop = true;
 
         // [Debug]
         // Writes the eye buffer of this frame number out as WoWVR_frame.bmp so the

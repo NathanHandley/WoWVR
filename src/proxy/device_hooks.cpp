@@ -9,6 +9,7 @@
 #include "game/camera_probe.h"
 #include "game/cull_frustum.h"
 #include "game/sound_listener.h"
+#include "game/view_distance.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
@@ -566,6 +567,12 @@ namespace wowvr
         // maps the mouse through the panel, so it must stand down whenever the
         // interface is anywhere else - a flat frame, a loading screen.
         bool g_panelCompositedLastFrame = false;
+        bool g_dumpMirrorNext = false;
+
+        // Where the terrain shader's fog ramp reaches full fog, from its fog constants
+        // (c12: factor = (depth * x + y) ^ z, so zero at depth = -y / x). Diagnostic, to
+        // see whether the client moves its fog with the draw distance.
+        float g_terrainFogEnd = 0.0f;
 
         // Radial fog bookkeeping, for the periodic log.
         unsigned long long g_fogShadersRewritten = 0;
@@ -1225,6 +1232,9 @@ namespace wowvr
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
             Pointer().LogStatus();
+            WOWVR_INFO("Draw distance: client %.1f yards, drawn to %.1f (x%.2f); terrain fog "
+                       "fully closes at %.1f yards of view depth.", DrawRange().ClientDistance(),
+                       DrawRange().DrawDistance(), Cfg().viewDistanceScale, g_terrainFogEnd);
             WOWVR_INFO("Radial fog: %llu world shaders rewritten, %llu left as shipped (last "
                        "reason: %s), %llu refused by the runtime.", g_fogShadersRewritten,
                        g_fogShadersLeft, g_fogLastSkipReason, g_fogRewriteRefused);
@@ -2655,21 +2665,128 @@ namespace wowvr
         // Puts the device back on its real back buffer so that Present, and anything
         // the game does before the next frame starts, behave normally. Also mirrors
         // the left eye to the desktop window so the game is still watchable on screen.
+        // Diagnostic: what the desktop mirror actually put in the back buffer.
+        void DumpBackBuffer(IDirect3DDevice9* device)
+        {
+            D3DSURFACE_DESC desc = {};
+            if (g_realBackBuffer == nullptr || FAILED(g_realBackBuffer->GetDesc(&desc)))
+            {
+                return;
+            }
+            IDirect3DSurface9* staging = nullptr;
+            if (FAILED(device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                           D3DPOOL_SYSTEMMEM, &staging, nullptr)))
+            {
+                return;
+            }
+            const HRESULT hr = device->GetRenderTargetData(g_realBackBuffer, staging);
+            D3DLOCKED_RECT locked = {};
+            if (SUCCEEDED(hr) && SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+            {
+                SaveBgraBmp(ModuleFile(L"WoWVR_mirror.bmp").c_str(), locked.pBits, desc.Width,
+                            desc.Height, static_cast<uint32_t>(locked.Pitch));
+                staging->UnlockRect();
+                WOWVR_INFO("Back buffer %ux%u written to WoWVR_mirror.bmp.", desc.Width,
+                           desc.Height);
+            }
+            else
+            {
+                WOWVR_WARN("Back buffer readback failed (0x%08lx).", hr);
+            }
+            staging->Release();
+        }
+
         void FinishStereoFrame(IDirect3DDevice9* device)
         {
-            if (!g_stereoRedirected || g_realBackBuffer == nullptr)
+            if (g_realBackBuffer == nullptr)
             {
                 return;
             }
 
-            if (Cfg().desktopMirror)
+            // Mirrored whenever this frame drew into the stereo target - NOT only while
+            // the redirect is still in force. The interface pass ends the redirect every
+            // frame (it moves the target to the panel), so gating the mirror on it meant
+            // the copy never ran and the window kept showing a stale early frame.
+            if (Cfg().desktopMirror && g_stereoHasContent && g_stereo.IsReady())
             {
                 RECT half;
                 half.left = 0;
                 half.top = 0;
                 half.right = static_cast<LONG>(g_stereo.EyeWidth());
                 half.bottom = static_cast<LONG>(g_stereo.EyeHeight());
-                device->StretchRect(g_stereo.Color(), &half, g_realBackBuffer, nullptr, D3DTEXF_LINEAR);
+
+                // The eye is tall (1480x1644 on the Index) and the window is wide, so
+                // stretching one into the other squashes everything. Crop the eye to
+                // the window's shape instead, centred on the eye's optical centre - the
+                // point straight ahead of the eye, which an Index's canted, asymmetric
+                // frustum puts well off the middle of the image.
+                const float eyeW = static_cast<float>(g_stereo.EyeWidth());
+                const float eyeH = static_cast<float>(g_stereo.EyeHeight());
+                if (Cfg().mirrorCrop && g_backBufferWidth > 0 && g_backBufferHeight > 0
+                    && eyeW > 0.0f && eyeH > 0.0f)
+                {
+                    const float windowAspect = static_cast<float>(g_backBufferWidth)
+                                             / static_cast<float>(g_backBufferHeight);
+                    float cropW = eyeW;
+                    float cropH = eyeW / windowAspect;
+                    if (cropH > eyeH)
+                    {
+                        cropH = eyeH;
+                        cropW = eyeH * windowAspect;
+                    }
+
+                    float tanLeft = -1.0f;
+                    float tanRight = 1.0f;
+                    float tanTop = -1.0f;
+                    float tanBottom = 1.0f;
+                    Vr().EyeTangents(EyeLeft, tanLeft, tanRight, tanTop, tanBottom);
+                    const float centreX = (tanRight > tanLeft)
+                        ? eyeW * (-tanLeft / (tanRight - tanLeft)) : eyeW * 0.5f;
+                    const float centreY = (tanBottom > tanTop)
+                        ? eyeH * (-tanTop / (tanBottom - tanTop)) : eyeH * 0.5f;
+
+                    float left = centreX - cropW * 0.5f;
+                    float top = centreY - cropH * 0.5f;
+                    if (left < 0.0f) { left = 0.0f; }
+                    if (top < 0.0f) { top = 0.0f; }
+                    if (left + cropW > eyeW) { left = eyeW - cropW; }
+                    if (top + cropH > eyeH) { top = eyeH - cropH; }
+
+                    half.left = static_cast<LONG>(left);
+                    half.top = static_cast<LONG>(top);
+                    half.right = half.left + static_cast<LONG>(cropW);
+                    half.bottom = half.top + static_cast<LONG>(cropH);
+                }
+
+                const HRESULT mirrorHr = device->StretchRect(g_stereo.Color(), &half,
+                                                             g_realBackBuffer, nullptr,
+                                                             D3DTEXF_LINEAR);
+                static bool mirrorRectLogged = false;
+                if (!mirrorRectLogged)
+                {
+                    mirrorRectLogged = true;
+                    WOWVR_INFO("Desktop mirror: eye rect %ld,%ld - %ld,%ld into the %ux%u back "
+                               "buffer (StretchRect 0x%08lx).", half.left, half.top, half.right,
+                               half.bottom, g_backBufferWidth, g_backBufferHeight, mirrorHr);
+                }
+                static bool mirrorFailureLogged = false;
+                if (FAILED(mirrorHr) && !mirrorFailureLogged)
+                {
+                    mirrorFailureLogged = true;
+                    WOWVR_WARN("Desktop mirror: StretchRect failed (0x%08lx); the window will "
+                               "not show the headset view.", mirrorHr);
+                }
+            }
+
+            if (g_dumpMirrorNext)
+            {
+                g_dumpMirrorNext = false;
+                DumpBackBuffer(device);
+            }
+
+            if (!g_stereoRedirected)
+            {
+                return;
             }
 
             // Bypasses our own hook deliberately, otherwise this would be redirected
@@ -2894,6 +3011,9 @@ namespace wowvr
                     {
                         Pointer().Install();
                     }
+
+                    DrawRange().Install();
+                    DrawRange().SetScale(Cfg().viewDistanceScale);
                     Pointer().Update(Cfg().panelWorldPointing && g_uiPanel.IsReady()
                                          && g_panelCompositedLastFrame,
                                      g_uiPanel.Shape(), Projection().HeadOffsetMetres(),
@@ -2913,8 +3033,10 @@ namespace wowvr
             }
             else
             {
-                // No headset frame, so no panel: the client gets its own picking back.
+                // No headset frame, so no panel: the client gets its own picking back,
+                // and its own draw distance.
                 Pointer().Deactivate();
+                DrawRange().SetScale(1.0f);
             }
 
             // One line per frame while armed. Reading across a row: 'head' and 'wrote'
@@ -3484,6 +3606,7 @@ namespace wowvr
                     // The desktop window only mirrors the interface, so the world can
                     // only be seen by capturing the eye buffer itself.
                     else if (strncmp(command, "shot", 4) == 0)   { g_dumpNextFrame = true; }
+                    else if (strncmp(command, "mirrorshot", 10) == 0) { g_dumpMirrorNext = true; }
                     // "holdall" must be tested before "hold", or the prefix swallows it.
                     else if (strncmp(command, "holdall", 7) == 0) { Camera().HoldSurvivors(true, 1.57f); }
                     else if (strncmp(command, "aim", 3) == 0)    { Camera().SetHeadingWrite(1, 1.57f); }
@@ -5173,6 +5296,13 @@ namespace wowvr
                 Report().NoteVertexShaderConstants(startRegister, data, vector4Count);
             }
 
+            // The terrain block (c12, 22 registers - see the frame report) leads with the
+            // fog ramp.
+            if (startRegister == 12 && vector4Count == 22 && data != nullptr && data[0] < 0.0f)
+            {
+                g_terrainFogEnd = -data[1] / data[0];
+            }
+
             // The camera projection sits at the head of its upload, on both of the
             // paths the client uses (c2 transposed, c0 not). Rather than hard-coding
             // either register, every upload long enough to hold a matrix is offered to
@@ -5756,7 +5886,8 @@ namespace wowvr
             {
                 std::vector<uint32_t> rewritten;
                 const FogRewriteResult fog =
-                    RewriteFogToRadial(reinterpret_cast<const uint32_t*>(function), rewritten);
+                    RewriteFogToRadial(reinterpret_cast<const uint32_t*>(function), rewritten,
+                                       Cfg().fogDistanceScale);
                 if (fog.rewritten)
                 {
                     const HRESULT rewrittenHr = g_originalCreateVertexShader(
@@ -5766,8 +5897,9 @@ namespace wowvr
                         if (g_fogShadersRewritten++ == 0)
                         {
                             WOWVR_INFO("Radial fog: first world shader rewritten (view "
-                                       "position r%u, distance in r%u).",
-                                       fog.viewRegister, fog.scratchRegister);
+                                       "position r%u, distance in r%u, fog distance x%.2f).",
+                                       fog.viewRegister, fog.scratchRegister,
+                                       Cfg().fogDistanceScale);
                         }
                         DumpShaderBytecode(function, *shader);
                         return rewrittenHr;

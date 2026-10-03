@@ -1,5 +1,7 @@
 #include "stereo/fog_rewrite.h"
 
+#include <cstring>
+
 namespace wowvr
 {
     namespace
@@ -205,7 +207,8 @@ namespace wowvr
         }
     }
 
-    FogRewriteResult RewriteFogToRadial(const uint32_t* tokens, std::vector<uint32_t>& out)
+    FogRewriteResult RewriteFogToRadial(const uint32_t* tokens, std::vector<uint32_t>& out,
+                                        float distanceScale)
     {
         FogRewriteResult result;
         out.clear();
@@ -396,18 +399,89 @@ namespace wowvr
         }
 
         // dst rT.x: temp type (0), write mask x.
+        // A register for the distance scale, if one is wanted: unused by the shader,
+        // and below every relatively addressed array, whose reach is unknowable.
+        const bool scaled = distanceScale > 0.0f
+            && (distanceScale < 0.999f || distanceScale > 1.001f);
+        uint32_t scaleRegister = 0;
+        if (scaled)
+        {
+            bool used[256] = {};
+            uint32_t limit = 256;
+            for (const Instruction& ins : list)
+            {
+                if (ins.opcode == OpDef || ins.opcode == OpDefI || ins.opcode == OpDefB)
+                {
+                    const uint32_t dst = tokens[ins.start + 1];
+                    if (RegType(dst) == RegConst && RegNum(dst) < 256) { used[RegNum(dst)] = true; }
+                    continue;
+                }
+                for (int s = 0; s < ins.sourceCount; ++s)
+                {
+                    const uint32_t src = tokens[ins.sources[s]];
+                    if (RegType(src) != RegConst || RegNum(src) >= 256)
+                    {
+                        continue;
+                    }
+                    used[RegNum(src)] = true;
+                    if ((src & kRelativeBit) != 0 && RegNum(src) < limit)
+                    {
+                        limit = RegNum(src);
+                    }
+                }
+            }
+            bool found = false;
+            for (uint32_t r = limit; r-- > 0;)
+            {
+                if (!used[r])
+                {
+                    scaleRegister = r;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                result.reason = "no free constant register for the fog distance";
+                return result;
+            }
+        }
+
         const uint32_t scratchX = 0x80000000u | (0x1u << 16) | scratch;
         const uint32_t viewXyz = 0x80000000u | (kSwizzleIdentity << 16) | view;
         const uint32_t scratchSrcX = 0x80000000u | (kSwizzleReplicateX << 16) | scratch;
 
         const size_t insertAt = list[depthWriter].start + 1 + list[depthWriter].length;
-        out.assign(tokens, tokens + insertAt);
+        // The version token, then the scale's def (definitions belong at the top),
+        // then the shader up to the insertion point.
+        out.assign(tokens, tokens + 1);
+        if (scaled)
+        {
+            const float inverse = 1.0f / distanceScale;
+            uint32_t bits = 0;
+            memcpy(&bits, &inverse, sizeof(bits));
+            out.push_back(OpDef | (5u << 24));
+            out.push_back(0x80000000u | (RegConst << 28) | (0xFu << 16) | scaleRegister);
+            out.push_back(bits);
+            out.push_back(0u);
+            out.push_back(0u);
+            out.push_back(0u);
+        }
+        out.insert(out.end(), tokens + 1, tokens + insertAt);
         out.push_back(OpDp3 | (3u << 24));    // dp3 rT.x, rV, rV
         out.push_back(scratchX);
         out.push_back(viewXyz);
         out.push_back(viewXyz);
         Emit(out, OpRsq, scratchX, scratchSrcX);
         Emit(out, OpRcp, scratchX, scratchSrcX);
+        if (scaled)
+        {
+            out.push_back(OpMul | (3u << 24));    // mul rT.x, rT.x, cK.x
+            out.push_back(scratchX);
+            out.push_back(scratchSrcX);
+            out.push_back(0x80000000u | (RegConst << 28) | (kSwizzleReplicateX << 16)
+                          | scaleRegister);
+        }
 
         // Everything from here on, the ramp included, has moved by the inserted tokens.
         const size_t rampOffset = out.size() - insertAt;

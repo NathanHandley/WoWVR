@@ -33,6 +33,12 @@ namespace wowvr
     //
     // and points the ramp at rT.x. Nothing else in the shader - position, lighting,
     // shadow coordinates - is touched. Shader models 2.0 and 3.0 only.
+    //
+    // 'distanceScale' pushes the fog out (2 = fog starts and ends twice as far). Other
+    // than 1 it adds 'mul rT.x, rT.x, cK.x' with cK = 1/scale defined INSIDE the shader
+    // (def), in a register the shader never reads - below any relatively-addressed
+    // array such as the bone palette. A runtime constant was not an option: the client
+    // uploads all the way to c255, and skinned models index their bones that far.
     struct FogRewriteResult
     {
         bool rewritten = false;
@@ -41,5 +47,6 @@ namespace wowvr
         uint32_t scratchRegister = 0;  // rT
     };
 
-    FogRewriteResult RewriteFogToRadial(const uint32_t* tokens, std::vector<uint32_t>& out);
+    FogRewriteResult RewriteFogToRadial(const uint32_t* tokens, std::vector<uint32_t>& out,
+                                        float distanceScale = 1.0f);
 }
