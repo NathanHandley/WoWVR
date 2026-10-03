@@ -307,10 +307,28 @@ namespace wowvr
         bool probeCameraByWriting = false;      // widen WoW's culling frustum so edges do not pop
 
         // [Panel]
-        float panelDistance = 1.6f;     // metres in front of the body
-        float panelWidth = 2.2f;        // metres
-        float panelDeadzoneDegrees = 20.0f;
-        float panelFollowSpeed = 4.0f;  // higher = panel catches up to your body faster
+        // The interface is a curved sheet - a section of an upright cylinder around the
+        // head - that stays where it was put. Ctrl+Alt+F8 puts it straight ahead again
+        // (yaw only, centred at eye height); Ctrl+Alt+F11 recentres it with the view.
+        float panelDistance = 1.6f;     // metres: the cylinder's radius
+
+        // How many of the interface's pixels fit in one degree of arc. This fixes the
+        // size elements appear at, so a higher game resolution makes the panel bigger
+        // - more room between elements - instead of making everything smaller. 27.8 is
+        // what the old flat 2.2 m panel at 1.6 m gave a 1920-wide interface.
+        float panelPixelsPerDegree = 27.8f;
+
+        // Upper bound on how far round the panel may wrap. Past it the whole panel
+        // shrinks, aspect kept, rather than closing into a ring.
+        float panelMaxArcDegrees = 150.0f;
+
+        // Aim the mouse into the world along the line from the HEAD through the pointer
+        // on the panel, and place nameplates, floating combat text and chat bubbles
+        // where that same line from the head meets the panel. Without it the client
+        // picks and places along its own flat camera, which the headset never shows
+        // and which is widened for culling, so neither lines up with anything.
+        bool panelWorldPointing = true;
+
         float panelOpacity = 1.0f;
 
         // The pointer is drawn at the size the game uses, which is small seen through a

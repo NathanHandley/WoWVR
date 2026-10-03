@@ -45,6 +45,10 @@ namespace wowvr
 
     Vec3 Mat4TranslationOf(const Mat4& a);
 
+    // v * M for a point (w = 1) and for a direction (w = 0), row-vector convention.
+    Vec3 Mat4TransformPoint(const Vec3& v, const Mat4& a);
+    Vec3 Mat4TransformDirection(const Vec3& v, const Mat4& a);
+
     // True when the bottom column is (0,0,0,1), i.e. the matrix is affine rather than
     // projective. Used in the stereo path to confirm that a candidate world matrix
     // really is one.

@@ -153,6 +153,13 @@ namespace wowvr
         const Mat4& HeadRotation() const { return m_headRotation; }
         const Vec3& HeadOffsetMetres() const { return m_headOffsetNeutral; }
 
+        // Rotation taking a direction in the game camera's view space into the body
+        // (neutral) frame the panel lives in. The world reaches the eye as
+        // gameView * HeadCorrection and the panel as body * HeadRotation, so the two
+        // frames differ by exactly the turn the game's own camera has been given -
+        // the identity unless AimCameraAtHead is steering it.
+        Mat4 GameViewToBody() const;
+
         // Trace taps for the pitch pipeline: the camera pitch actually baked into this
         // frame's geometry (from the combined-transform residual) and the compensation
         // pitch this frame was corrected with. Comparing the two per frame is how a

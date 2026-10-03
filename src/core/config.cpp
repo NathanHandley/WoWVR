@@ -75,12 +75,17 @@ namespace wowvr
             L"ListenerAtCamera=1\r\n"
             L"\r\n"
             L"[Panel]\r\n"
-            L"; The floating UI panel. It is body-locked: it stays put while you glance\r\n"
-            L"; around and follows once your head passes the dead zone.\r\n"
+            L"; The interface, on a curved sheet around you that stays where it is put.\r\n"
+            L"; Ctrl+Alt+F8 brings it back in front of you (left/right only, centred at\r\n"
+            L"; eye height). Distance is the curve's radius in metres. PixelsPerDegree\r\n"
+            L"; sets how big elements look: raise the game's resolution (and lower its\r\n"
+            L"; UI scale to match) and the sheet grows instead of everything shrinking.\r\n"
             L"Distance=1.6\r\n"
-            L"Width=2.2\r\n"
-            L"DeadzoneDegrees=20.0\r\n"
-            L"FollowSpeed=4.0\r\n"
+            L"PixelsPerDegree=27.8\r\n"
+            L"MaxArcDegrees=150\r\n"
+            L"; 1 aims the mouse into the world from your head through the pointer, and\r\n"
+            L"; puts nameplates where your head sees the creature through the sheet.\r\n"
+            L"WorldPointing=1\r\n"
             L"Opacity=1.0\r\n"
             L"\r\n"
             L"[Mirror]\r\n"
@@ -259,9 +264,12 @@ namespace wowvr
             ReadBool(path, L"Sound", L"ListenerAtCamera", config.soundListenerAtCamera);
 
         config.panelDistance = ReadFloat(path, L"Panel", L"Distance", config.panelDistance);
-        config.panelWidth = ReadFloat(path, L"Panel", L"Width", config.panelWidth);
-        config.panelDeadzoneDegrees = ReadFloat(path, L"Panel", L"DeadzoneDegrees", config.panelDeadzoneDegrees);
-        config.panelFollowSpeed = ReadFloat(path, L"Panel", L"FollowSpeed", config.panelFollowSpeed);
+        config.panelPixelsPerDegree =
+            ReadFloat(path, L"Panel", L"PixelsPerDegree", config.panelPixelsPerDegree);
+        config.panelMaxArcDegrees =
+            ReadFloat(path, L"Panel", L"MaxArcDegrees", config.panelMaxArcDegrees);
+        config.panelWorldPointing =
+            ReadBool(path, L"Panel", L"WorldPointing", config.panelWorldPointing);
         config.panelOpacity = ReadFloat(path, L"Panel", L"Opacity", config.panelOpacity);
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);

@@ -17,6 +17,7 @@ namespace wowvr
             { VK_F10, false },
             { VK_F11, false },
             { VK_F12, false },
+            { VK_F8,  false },
         };
     }
 

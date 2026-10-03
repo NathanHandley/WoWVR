@@ -9,6 +9,7 @@
 #include "game/camera_probe.h"
 #include "game/cull_frustum.h"
 #include "game/sound_listener.h"
+#include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
 #include "present/d3d12_present.h"
@@ -559,6 +560,11 @@ namespace wowvr
 
         UiPanel g_uiPanel;
         bool g_uiRendered = false;
+
+        // Whether the last frame actually put the interface on the panel. World pointing
+        // maps the mouse through the panel, so it must stand down whenever the
+        // interface is anywhere else - a flat frame, a loading screen.
+        bool g_panelCompositedLastFrame = false;
         unsigned long long g_panelDrawn = 0;
         unsigned long long g_panelSkipped = 0;
         const char* g_lastSkipReason = "none";
@@ -1110,6 +1116,7 @@ namespace wowvr
             Projection().LogLastDecision();
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
+            Pointer().LogStatus();
             WOWVR_INFO("Draw routing: stereo %llu, ui %llu, offscreen %llu, "
                        "STRAY-to-backbuffer %llu; periods last frame %d; "
                        "sky-slice eye draws %llu",
@@ -1418,7 +1425,10 @@ namespace wowvr
             float v;
         };
 
-        // Draws the interface texture as a quad in front of the viewer, once per eye,
+        // Upright slices the curved interface sheet is drawn with.
+        const int kPanelSlices = 96;
+
+        // Draws the interface texture as a curved sheet around the viewer, once per eye,
         // straight into the stereo target. Because it is real geometry at a real
         // distance the compositor stops treating it as a flat sheet at infinity, which
         // is what made it swim about when the head moved.
@@ -1892,6 +1902,7 @@ namespace wowvr
             EndUiAlphaOverride(device);
             g_uiTargetBound = false;
 
+            g_panelCompositedLastFrame = false;
             if (!g_uiRendered || !g_uiPanel.IsReady() || !g_stereoHasContent)
             {
                 ++g_panelSkipped;
@@ -1901,6 +1912,7 @@ namespace wowvr
                 return;
             }
             ++g_panelDrawn;
+            g_panelCompositedLastFrame = true;
 
             // Back onto the stereo target; the interface pass moved it away.
             g_originalSetRenderTarget(device, 0, g_stereo.Color());
@@ -1925,18 +1937,19 @@ namespace wowvr
             UpdateCursorConfinement();
             g_activeCursor = CurrentCursorArt(device);
 
-            const float width = Cfg().panelWidth;
-            const float height = width * static_cast<float>(g_uiPanel.Height())
-                                       / static_cast<float>(g_uiPanel.Width());
-            const float halfWidth = width * 0.5f;
-            const float halfHeight = height * 0.5f;
-
-            const PanelVertex quad[4] = {
-                { -halfWidth,  halfHeight, 0.0f, 0.0f, 0.0f },
-                {  halfWidth,  halfHeight, 0.0f, 1.0f, 0.0f },
-                { -halfWidth, -halfHeight, 0.0f, 0.0f, 1.0f },
-                {  halfWidth, -halfHeight, 0.0f, 1.0f, 1.0f },
-            };
+            // The curved sheet as one triangle strip of upright slices. Enough slices
+            // that the chord sag is far below a pixel: at the default 1.6 m radius and
+            // ~70-90 degrees of arc, 96 slices sag well under a tenth of a millimetre.
+            const PanelShape& shape = g_uiPanel.Shape();
+            static PanelVertex sheet[(kPanelSlices + 1) * 2];
+            for (int i = 0; i <= kPanelSlices; ++i)
+            {
+                const float u = static_cast<float>(i) / static_cast<float>(kPanelSlices);
+                const Vec3 top = shape.LocalPoint(u, 0.0f);
+                const Vec3 bottom = shape.LocalPoint(u, 1.0f);
+                sheet[i * 2] = { top.x, top.y, top.z, u, 0.0f };
+                sheet[i * 2 + 1] = { bottom.x, bottom.y, bottom.z, u, 1.0f };
+            }
 
             // Fixed function is enough for a textured quad and avoids having to ship
             // shaders that match whatever the client is using.
@@ -2013,7 +2026,8 @@ namespace wowvr
                 g_originalSetTransform(device, D3DTS_WORLD,
                                        reinterpret_cast<const D3DMATRIX*>(&world));
 
-                g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(PanelVertex));
+                g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, kPanelSlices * 2, sheet,
+                                          sizeof(PanelVertex));
 
                 // The pointer, on the same panel and in the same world transform, so it
                 // sits on the interface rather than floating in front of it.
@@ -2032,21 +2046,26 @@ namespace wowvr
                     // the interface here as it does on the desktop. Scale is on a knob
                     // because a 32-pixel cursor at true size is small through a headset.
                     const float scale = Cfg().cursorScale;
-                    const float pixel = (width / clientWidth) * scale;
-                    const float artWidth = g_activeCursor->width * pixel;
-                    const float artHeight = g_activeCursor->height * pixel;
+                    const float pixel = shape.metresPerPixel
+                                      * (static_cast<float>(g_uiPanel.Width()) / clientWidth)
+                                      * scale;
 
-                    // Shifted by the hotspot so the part of the image that does the
-                    // pointing lands on the pixel being pointed at, rather than the
+                    // A small flat card laid against the curve where the pointer is,
+                    // shifted by the hotspot so the part of the image that does the
+                    // pointing lands on the pixel being pointed at rather than the
                     // image's top-left corner. Panel Y runs up, image Y runs down.
-                    const float left = -halfWidth + u * width - g_activeCursor->hotspotX * pixel;
-                    const float top = halfHeight - v * height + g_activeCursor->hotspotY * pixel;
+                    const Vec3 at = shape.LocalPoint(u, v);
+                    const Vec3 across = shape.LocalTangentU(u);
+                    const float left = -g_activeCursor->hotspotX * pixel;
+                    const float right = (g_activeCursor->width - g_activeCursor->hotspotX) * pixel;
+                    const float top = g_activeCursor->hotspotY * pixel;
+                    const float bottom = -(g_activeCursor->height - g_activeCursor->hotspotY) * pixel;
 
                     const PanelVertex pointer[4] = {
-                        { left,            top,             0.0f, 0.0f, 0.0f },
-                        { left + artWidth, top,             0.0f, 1.0f, 0.0f },
-                        { left,            top - artHeight, 0.0f, 0.0f, 1.0f },
-                        { left + artWidth, top - artHeight, 0.0f, 1.0f, 1.0f },
+                        { at.x + across.x * left,  at.y + top,    at.z + across.z * left,  0.0f, 0.0f },
+                        { at.x + across.x * right, at.y + top,    at.z + across.z * right, 1.0f, 0.0f },
+                        { at.x + across.x * left,  at.y + bottom, at.z + across.z * left,  0.0f, 1.0f },
+                        { at.x + across.x * right, at.y + bottom, at.z + across.z * right, 1.0f, 1.0f },
                     };
 
                     // Built straight rather than premultiplied, so it needs the
@@ -2554,9 +2573,24 @@ namespace wowvr
 
             if (HotkeyPressed(Hotkey::Recenter))
             {
+                // The body frame is about to be re-measured from the current pose, so
+                // "straight ahead at the origin" is where the panel belongs in it.
                 Projection().Recenter();
-                g_uiPanel.Recenter(0.0f);
+                g_uiPanel.RecenterAt(0.0f, Vec3());
                 WOWVR_INFO("F11: recentre requested.");
+            }
+
+            if (HotkeyPressed(Hotkey::RecenterUi))
+            {
+                // Only the interface moves. Negated yaw: PanelToBody composes
+                // Mat4RotationY(yaw) the same way the old body-lock did, and that faces the
+                // way the head does only for the NEGATIVE of HeadYaw(). Yaw alone, so the
+                // panel turns to the face but never tilts; centred at eye height because
+                // its centre is the head's current position in the body frame.
+                g_uiPanel.RecenterAt(-Projection().HeadYaw(), Projection().HeadOffsetMetres());
+                WOWVR_INFO("F8: interface panel placed in front of the head (yaw %.1f deg, "
+                           "eye height %+.2f m).", -Projection().HeadYaw() * 57.29578f,
+                           Projection().HeadOffsetMetres().y);
             }
 
             if (HotkeyPressed(Hotkey::ReloadConfig))
@@ -2702,6 +2736,7 @@ namespace wowvr
                 if (userPresent && !g_userWasPresent)
                 {
                     Projection().Recenter();
+                    g_uiPanel.RecenterAt(0.0f, Vec3());
                     WOWVR_INFO("Headset picked up; recentring on the current head pose.");
                 }
                 g_userWasPresent = userPresent;
@@ -2710,16 +2745,21 @@ namespace wowvr
                 if (Vr().HasHeadPose())
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
-                    // Negated, because the panel wants the opposite convention to the world.
-                    //
-                    // PanelToEye composes Mat4RotationY(m_bodyYaw) with m_headRotation and
-                    // rotations about the same axis add their yaws, so the panel points
-                    // straight ahead only when the body yaw is the NEGATIVE of the head's.
-                    // HeadYaw() used to be negated at its source, which suited the panel and
-                    // silently contradicted the head matrix everything else is built from.
-                    // Now that it agrees with the matrix, the negation belongs here - at the
-                    // one consumer that genuinely wants the other sign.
-                    g_uiPanel.Update(-Projection().HeadYaw(), 1.0f / Vr().DisplayFrequency());
+
+                    // The panel no longer follows the head; it only picks up INI changes
+                    // to its size here. It moves when Ctrl+Alt+F8 (or a full recentre)
+                    // places it again.
+                    g_uiPanel.RefreshGeometry();
+
+                    if (Cfg().panelWorldPointing && g_uiPanel.IsReady())
+                    {
+                        Pointer().Install();
+                    }
+                    Pointer().Update(Cfg().panelWorldPointing && g_uiPanel.IsReady()
+                                         && g_panelCompositedLastFrame,
+                                     g_uiPanel.Shape(), Projection().HeadOffsetMetres(),
+                                     Projection().GameViewToBody(),
+                                     Cfg().unitsPerMetre * Cfg().worldScale);
 
                     // The persisted camera blocks are deliberately NOT refreshed here.
                     // At this point the client has not updated its camera for the
@@ -2731,6 +2771,11 @@ namespace wowvr
                     // rebuilt in EnsureFreshCameraCompensation instead, at the first
                     // constant upload of the new frame, when the camera is final.
                 }
+            }
+            else
+            {
+                // No headset frame, so no panel: the client gets its own picking back.
+                Pointer().Deactivate();
             }
 
             // One line per frame while armed. Reading across a row: 'head' and 'wrote'

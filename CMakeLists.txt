@@ -65,6 +65,8 @@ set(WOWVR_SOURCES
     src/game/field_watch.h
     src/game/game_camera.cpp
     src/game/game_camera.h
+    src/game/world_pointer.cpp
+    src/game/world_pointer.h
     src/present/d3d12_present.cpp
     src/present/d3d12_present.h
     src/present/gl_interop.cpp

@@ -4,14 +4,19 @@ SteamVR support for a 3.3.5a (12340) World of Warcraft client, aimed at the Valv
 
 The world is rendered stereoscopically around you and the headset drives the view. Movement,
 targeting and everything else stay on mouse and keyboard — there is no motion-controller input.
-The game UI is lifted out of the eye buffer and hung in space as a body-locked panel.
+The game UI is lifted out of the eye buffer and hung in space on a curved sheet that stays where
+you put it. The mouse points into the world from your head through that sheet, and nameplates sit
+where your head sees the creature through it.
 
 It works as a proxy `d3d9.dll` that the client loads out of its own folder. Nothing in the client
 is patched on disk.
 
 ## Commands
 
-ALT + CTRL + F11 "recenters" the view
+ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
+
+ALT + CTRL + F8 recenters only the interface: it turns to face where you are looking (left/right
+only) with its middle at eye height
 
 ## Status
 

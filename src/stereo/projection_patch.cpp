@@ -351,6 +351,12 @@ namespace wowvr
         return correction;
     }
 
+    Mat4 ProjectionPatch::GameViewToBody() const
+    {
+        // m_headRotation is a pure rotation, so its transpose is its inverse.
+        return Mat4Multiply(HeadCorrection(), Mat4Transpose(m_headRotation));
+    }
+
     Mat4 ProjectionPatch::HeadCorrection() const
     {
         Mat4 corrected = m_headRotation;

@@ -10,6 +10,7 @@ namespace wowvr
         FrameDump,     // Ctrl+Alt+F10 - write the current eye buffers to BMPs
         Recenter,      // Ctrl+Alt+F11 - recentre the view and the UI panel
         ReloadConfig,  // Ctrl+Alt+F12 - re-read WoWVR.ini
+        RecenterUi,    // Ctrl+Alt+F8  - bring the UI panel in front of the head again
         Count
     };
 

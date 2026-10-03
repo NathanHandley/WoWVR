@@ -187,6 +187,24 @@ namespace wowvr
         return result;
     }
 
+    Vec3 Mat4TransformPoint(const Vec3& v, const Mat4& a)
+    {
+        Vec3 result = Mat4TransformDirection(v, a);
+        result.x += a.m[3][0];
+        result.y += a.m[3][1];
+        result.z += a.m[3][2];
+        return result;
+    }
+
+    Vec3 Mat4TransformDirection(const Vec3& v, const Mat4& a)
+    {
+        Vec3 result;
+        result.x = v.x * a.m[0][0] + v.y * a.m[1][0] + v.z * a.m[2][0];
+        result.y = v.x * a.m[0][1] + v.y * a.m[1][1] + v.z * a.m[2][1];
+        result.z = v.x * a.m[0][2] + v.y * a.m[1][2] + v.z * a.m[2][2];
+        return result;
+    }
+
     bool Mat4IsAffine(const Mat4& a, float tolerance)
     {
         return std::fabs(a.m[0][3]) < tolerance
