@@ -217,6 +217,7 @@ namespace wowvr
             ReadInt(path, L"VR", L"PerShaderCombined", config.perShaderCombined ? 1 : 0) != 0;
 
         config.headTracking = ReadBool(path, L"Camera", L"HeadTracking", config.headTracking);
+        config.radialFog = ReadBool(path, L"Camera", L"RadialFog", config.radialFog);
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);
         config.cullWidenScale =
             ReadFloat(path, L"Camera", L"CullWidenScale", config.cullWidenScale);

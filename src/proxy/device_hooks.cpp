@@ -18,6 +18,7 @@
 #include "proxy/d3d9_slots.h"
 #include "proxy/vtable_hook.h"
 #include "render/eye_targets.h"
+#include "stereo/fog_rewrite.h"
 #include "stereo/projection_patch.h"
 #include "stereo/stereo_targets.h"
 #include "ui/ui_panel.h"
@@ -565,6 +566,12 @@ namespace wowvr
         // maps the mouse through the panel, so it must stand down whenever the
         // interface is anywhere else - a flat frame, a loading screen.
         bool g_panelCompositedLastFrame = false;
+
+        // Radial fog bookkeeping, for the periodic log.
+        unsigned long long g_fogShadersRewritten = 0;
+        unsigned long long g_fogShadersLeft = 0;
+        unsigned long long g_fogRewriteRefused = 0;
+        const char* g_fogLastSkipReason = "none";
         unsigned long long g_panelDrawn = 0;
         unsigned long long g_panelSkipped = 0;
         const char* g_lastSkipReason = "none";
@@ -1218,6 +1225,9 @@ namespace wowvr
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
             Pointer().LogStatus();
+            WOWVR_INFO("Radial fog: %llu world shaders rewritten, %llu left as shipped (last "
+                       "reason: %s), %llu refused by the runtime.", g_fogShadersRewritten,
+                       g_fogShadersLeft, g_fogLastSkipReason, g_fogRewriteRefused);
             WOWVR_INFO("Draw routing: stereo %llu, ui %llu, offscreen %llu, "
                        "STRAY-to-backbuffer %llu; periods last frame %d; "
                        "sky-slice eye draws %llu",
@@ -5736,6 +5746,45 @@ namespace wowvr
                                                 IDirect3DVertexShader9** shader)
         {
             Report().NoteVertexShaderCreated(0);
+
+            // The world shaders get their fog measured by distance rather than depth
+            // (stereo/fog_rewrite.h). Strictly additive: if the rewrite does not apply,
+            // or the runtime refuses the result, the client's own bytecode is created
+            // exactly as it would have been.
+            if (Cfg().enabled && Cfg().vrEnabled && Cfg().radialFog && function != nullptr
+                && shader != nullptr)
+            {
+                std::vector<uint32_t> rewritten;
+                const FogRewriteResult fog =
+                    RewriteFogToRadial(reinterpret_cast<const uint32_t*>(function), rewritten);
+                if (fog.rewritten)
+                {
+                    const HRESULT rewrittenHr = g_originalCreateVertexShader(
+                        device, reinterpret_cast<const DWORD*>(rewritten.data()), shader);
+                    if (SUCCEEDED(rewrittenHr) && *shader != nullptr)
+                    {
+                        if (g_fogShadersRewritten++ == 0)
+                        {
+                            WOWVR_INFO("Radial fog: first world shader rewritten (view "
+                                       "position r%u, distance in r%u).",
+                                       fog.viewRegister, fog.scratchRegister);
+                        }
+                        DumpShaderBytecode(function, *shader);
+                        return rewrittenHr;
+                    }
+                    if (g_fogRewriteRefused++ == 0)
+                    {
+                        WOWVR_WARN("Radial fog: the runtime refused a rewritten shader "
+                                   "(0x%08lx); using the original for it.", rewrittenHr);
+                    }
+                }
+                else
+                {
+                    ++g_fogShadersLeft;
+                    g_fogLastSkipReason = fog.reason;
+                }
+            }
+
             const HRESULT hr = g_originalCreateVertexShader(device, function, shader);
             if (SUCCEEDED(hr) && shader != nullptr && *shader != nullptr)
             {

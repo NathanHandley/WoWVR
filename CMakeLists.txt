@@ -87,6 +87,8 @@ set(WOWVR_SOURCES
     src/proxy/vtable_hook.h
     src/render/eye_targets.cpp
     src/render/eye_targets.h
+    src/stereo/fog_rewrite.cpp
+    src/stereo/fog_rewrite.h
     src/stereo/projection_patch.cpp
     src/stereo/projection_patch.h
     src/stereo/stereo_targets.cpp

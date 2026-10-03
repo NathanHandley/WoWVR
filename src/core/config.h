@@ -99,6 +99,14 @@ namespace wowvr
 
         // [Camera]
         bool headTracking = true;       // HMD orientation drives the in-game view
+
+        // Fog by true distance instead of depth along the game camera's axis. Every
+        // world vertex shader the client ships computes fog from view-space depth,
+        // which on a monitor is fine and in a headset leaves a cone straight down the
+        // camera's axis visibly foggier than terrain at the same distance off to the
+        // side. On, the shaders are rewritten as they are created (see
+        // stereo/fog_rewrite.h); off, they are left exactly as shipped.
+        bool radialFog = true;
         float cullFovScale = 1.6f;
 
         // Multiplies the field of view the client CULLS against, inside the camera object.
