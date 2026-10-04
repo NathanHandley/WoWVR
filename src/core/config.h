@@ -123,6 +123,12 @@ namespace wowvr
         // (FogDistanceScale) - the periodic log reports where the terrain fog closes, to
         // tell whether the client already moves it with the draw distance. 1.0 = stock.
         float viewDistanceScale = 1.5f;
+
+        // Turn sprites the client keeps facing the viewer - the sun and moon, glows,
+        // M2 parts flagged as spherical billboards - to face the head rather than the
+        // game camera, so they stop being seen edge-on and swinging as the character
+        // turns. Interface model frames (portraits) are left facing the panel.
+        bool billboardsFaceHead = true;
         float cullFovScale = 1.6f;
 
         // Multiplies the field of view the client CULLS against, inside the camera object.

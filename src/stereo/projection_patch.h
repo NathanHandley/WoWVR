@@ -166,6 +166,12 @@ namespace wowvr
         // the identity unless AimCameraAtHead is steering it.
         Mat4 GameViewToBody() const;
 
+        // The rotation from the game camera's view space into the head's: what the
+        // world is turned by on its way to the eye. Anything the client builds square
+        // to ITS view (billboards) has to be turned back by the inverse of this to end
+        // up square to the head.
+        Mat4 GameViewToHead() const { return HeadCorrection(); }
+
         // Trace taps for the pitch pipeline: the camera pitch actually baked into this
         // frame's geometry (from the combined-transform residual) and the compensation
         // pitch this frame was corrected with. Comparing the two per frame is how a

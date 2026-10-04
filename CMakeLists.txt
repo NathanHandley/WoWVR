@@ -65,6 +65,8 @@ set(WOWVR_SOURCES
     src/game/field_watch.h
     src/game/game_camera.cpp
     src/game/game_camera.h
+    src/game/billboard_facing.cpp
+    src/game/billboard_facing.h
     src/game/view_distance.cpp
     src/game/view_distance.h
     src/game/world_pointer.cpp

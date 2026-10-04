@@ -224,6 +224,8 @@ namespace wowvr
         if (config.fogDistanceScale > 8.0f) { config.fogDistanceScale = 8.0f; }
         config.viewDistanceScale =
             ReadFloat(path, L"Camera", L"ViewDistanceScale", config.viewDistanceScale);
+        config.billboardsFaceHead =
+            ReadBool(path, L"Camera", L"BillboardsFaceHead", config.billboardsFaceHead);
         if (!(config.viewDistanceScale >= 1.0f)) { config.viewDistanceScale = 1.0f; }
         if (config.viewDistanceScale > 4.0f) { config.viewDistanceScale = 4.0f; }
         config.cullFovScale = ReadFloat(path, L"Camera", L"CullFovScale", config.cullFovScale);

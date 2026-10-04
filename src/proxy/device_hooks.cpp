@@ -9,6 +9,7 @@
 #include "game/camera_probe.h"
 #include "game/cull_frustum.h"
 #include "game/sound_listener.h"
+#include "game/billboard_facing.h"
 #include "game/view_distance.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
@@ -1232,6 +1233,7 @@ namespace wowvr
             WOWVR_INFO("UI panel: composited %llu frames, skipped %llu (last reason: %s)",
                        g_panelDrawn, g_panelSkipped, g_lastSkipReason);
             Pointer().LogStatus();
+            Billboards().LogStatus();
             WOWVR_INFO("Draw distance: client %.1f yards, drawn to %.1f (x%.2f); terrain fog "
                        "fully closes at %.1f yards of view depth.", DrawRange().ClientDistance(),
                        DrawRange().DrawDistance(), Cfg().viewDistanceScale, g_terrainFogEnd);
@@ -3014,6 +3016,13 @@ namespace wowvr
 
                     DrawRange().Install();
                     DrawRange().SetScale(Cfg().viewDistanceScale);
+
+                    if (Cfg().billboardsFaceHead)
+                    {
+                        Billboards().Install();
+                    }
+                    Billboards().Update(Cfg().billboardsFaceHead && Cfg().headTracking,
+                                        Projection().GameViewToHead());
                     Pointer().Update(Cfg().panelWorldPointing && g_uiPanel.IsReady()
                                          && g_panelCompositedLastFrame,
                                      g_uiPanel.Shape(), Projection().HeadOffsetMetres(),
@@ -3037,6 +3046,7 @@ namespace wowvr
                 // and its own draw distance.
                 Pointer().Deactivate();
                 DrawRange().SetScale(1.0f);
+                Billboards().Update(false, Mat4Identity());
             }
 
             // One line per frame while armed. Reading across a row: 'head' and 'wrote'
