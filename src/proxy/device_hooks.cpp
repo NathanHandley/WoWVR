@@ -997,6 +997,24 @@ namespace wowvr
         };
 
         FrameTimers g_timers;
+
+        // Game-thread frame pacing, Present to Present, with where a slow frame went.
+        struct FramePacing
+        {
+            LARGE_INTEGER last = {};
+            double maxIntervalMs = 0.0;
+            double sumIntervalMs = 0.0;
+            unsigned over10 = 0;
+            unsigned over20 = 0;
+            unsigned over50 = 0;
+            unsigned samples = 0;
+            double maxPresentMs = 0.0;      // the real Present (DXVK / driver)
+            double maxWorkerWaitMs = 0.0;   // waiting for the presenter worker's Submit
+            double maxPoseWaitMs = 0.0;     // WaitGetPoses
+            double sumPresentMs = 0.0;
+            double sumWorkerWaitMs = 0.0;
+        };
+        FramePacing g_pacing;
         LARGE_INTEGER g_qpcFrequency = {};
 
         // The HMD pose this frame and last frame were rendered with. The pipelined
@@ -1051,6 +1069,16 @@ namespace wowvr
         PresenterJob g_presenterJob = {};
         HANDLE g_presenterJobEvent = nullptr;    // auto-reset: a job is ready
         HANDLE g_presenterDoneEvent = nullptr;   // manual-reset: worker is idle
+        // Manual-reset: the job's frame is through the compositor - eyes submitted,
+        // PostPresentHandoff, and the WaitGetPoses for the next frame, all on the
+        // worker and in that order - so fresh poses are ready for the game thread.
+        // The interface overlay upload that follows does not involve the
+        // compositor's frame protocol and overlaps the game's next frame.
+        HANDLE g_presenterSubmittedEvent = nullptr;
+        // Set by SubmitFrame when it handed this frame to the worker, so the
+        // worker - not the game thread - makes this frame's WaitGetPoses call.
+        bool g_presenterJobPostedThisFrame = false;
+        volatile LONGLONG g_presenterPoseWaitUs = 0;
         HANDLE g_presenterThreadHandle = nullptr;
         bool g_presenterThreadOn = true;         // runtime half of Cfg().presenterThread
         bool g_presenterThreadConfigApplied = false;
@@ -1060,6 +1088,7 @@ namespace wowvr
         // game thread reads and resets them from ReportFrameTimings.
         volatile LONGLONG g_presenterUploadUs = 0;
         volatile LONGLONG g_presenterSubmitUs = 0;
+        volatile LONGLONG g_presenterOverlayUs = 0;
         volatile LONG g_presenterSamples = 0;
 
         // Uploads and shows the interface overlay, or hides it. On whichever thread owns
@@ -1103,8 +1132,22 @@ namespace wowvr
                            job.stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
                            &job.pose);
             Vr().PostSubmit();
-            ApplyInterfaceOverlay(job);
             const LARGE_INTEGER submitEnd = Now();
+
+            // WaitGetPoses here, straight after this thread's own Submit. Every call in
+            // the compositor's frame protocol stays on one thread in its required
+            // order: never concurrent (the compositor is not thread-safe), never a
+            // WaitGetPoses ahead of the Submit it follows, and never skipped after
+            // one - skipping it while a submit was slow is what once left every
+            // later Submit blocking for half a second.
+            Vr().WaitForFrame();
+            InterlockedExchangeAdd64(&g_presenterPoseWaitUs,
+                                     static_cast<LONGLONG>(ElapsedMs(submitEnd, Now()) * 1000.0));
+            const LARGE_INTEGER posesReady = Now();
+            SetEvent(g_presenterSubmittedEvent);
+            ApplyInterfaceOverlay(job);
+            InterlockedExchangeAdd64(&g_presenterOverlayUs,
+                                     static_cast<LONGLONG>(ElapsedMs(posesReady, Now()) * 1000.0));
 
             InterlockedExchangeAdd64(&g_presenterUploadUs,
                                      static_cast<LONGLONG>(ElapsedMs(uploadStart, submitStart) * 1000.0));
@@ -1139,7 +1182,9 @@ namespace wowvr
 
             g_presenterJobEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             g_presenterDoneEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-            if (g_presenterJobEvent != nullptr && g_presenterDoneEvent != nullptr)
+            g_presenterSubmittedEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+            if (g_presenterJobEvent != nullptr && g_presenterDoneEvent != nullptr
+                && g_presenterSubmittedEvent != nullptr)
             {
                 g_presenterThreadHandle =
                     CreateThread(nullptr, 0, PresenterThreadProc, nullptr, 0, nullptr);
@@ -1189,7 +1234,10 @@ namespace wowvr
         unsigned long long g_presenterStalledFrames = 0;
         const DWORD kPresenterStallTimeoutMs = 500;
 
-        bool TryWaitPresenterIdleAndUnlock()
+        // Waits (bounded) for the worker to finish its job, keeping the stall state
+        // and its log lines. countSkip: this call decides whether the frame's VR
+        // output is skipped, so it is the one that counts skipped frames.
+        bool TryWaitPresenterDone(bool countSkip, bool submittedOnly = false)
         {
             if (g_presenterThreadHandle == nullptr)
             {
@@ -1197,7 +1245,8 @@ namespace wowvr
             }
 
             const DWORD timeout = g_presenterStalled ? 0 : kPresenterStallTimeoutMs;
-            if (WaitForSingleObject(g_presenterDoneEvent, timeout) != WAIT_OBJECT_0)
+            const HANDLE gate = submittedOnly ? g_presenterSubmittedEvent : g_presenterDoneEvent;
+            if (WaitForSingleObject(gate, timeout) != WAIT_OBJECT_0)
             {
                 if (!g_presenterStalled)
                 {
@@ -1207,7 +1256,10 @@ namespace wowvr
                                 "running. It resumes by itself if the submit returns.",
                                 kPresenterStallTimeoutMs);
                 }
-                ++g_presenterStalledFrames;
+                if (countSkip)
+                {
+                    ++g_presenterStalledFrames;
+                }
                 return false;
             }
 
@@ -1217,6 +1269,19 @@ namespace wowvr
                 WOWVR_WARN("Presenter worker came back after %llu skipped frames; headset "
                            "output resumed.", g_presenterStalledFrames);
                 g_presenterStalledFrames = 0;
+            }
+            return true;
+        }
+
+        bool TryWaitPresenterIdleAndUnlock()
+        {
+            if (!TryWaitPresenterDone(true))
+            {
+                return false;
+            }
+            if (g_presenterThreadHandle == nullptr)
+            {
+                return true;
             }
             for (int eye = 0; eye < EyeCount; ++eye)
             {
@@ -1245,16 +1310,41 @@ namespace wowvr
 
             g_timers = FrameTimers();
 
+            if (g_pacing.samples > 0)
+            {
+                const double n = static_cast<double>(g_pacing.samples);
+                WOWVR_INFO("Frame pacing over %u frames: interval avg %.2f max %.2f ms, %u over "
+                           "10 ms, %u over 20 ms, %u over 50 ms; Present avg %.2f max %.2f ms; "
+                           "waiting for fresh poses avg %.2f max %.2f ms (worker "
+                           "WaitGetPoses %.2f ms avg).",
+                           g_pacing.samples, g_pacing.sumIntervalMs / n, g_pacing.maxIntervalMs,
+                           g_pacing.over10, g_pacing.over20, g_pacing.over50,
+                           g_pacing.sumPresentMs / n, g_pacing.maxPresentMs,
+                           g_pacing.sumWorkerWaitMs / n, g_pacing.maxWorkerWaitMs,
+                           static_cast<double>(InterlockedExchange64(&g_presenterPoseWaitUs, 0))
+                               / 1000.0 / n);
+                const LARGE_INTEGER keepLast = g_pacing.last;
+                g_pacing = FramePacing();
+                g_pacing.last = keepLast;
+            }
+            // Only while the worker is idle: the compositor is not thread-safe.
+            if (!g_presenterStalled)
+            {
+                Vr().LogCompositorStats();
+            }
+
             const LONG presenterSamples = g_presenterSamples;
             if (presenterSamples > 0)
             {
                 WOWVR_INFO("Presenter thread cost over %ld frames: upload %.2f ms, "
-                           "submit %.2f ms.",
+                           "submit %.2f ms, interface overlay %.2f ms (after the submit).",
                            presenterSamples,
                            static_cast<double>(g_presenterUploadUs) / 1000.0 / presenterSamples,
-                           static_cast<double>(g_presenterSubmitUs) / 1000.0 / presenterSamples);
+                           static_cast<double>(g_presenterSubmitUs) / 1000.0 / presenterSamples,
+                           static_cast<double>(g_presenterOverlayUs) / 1000.0 / presenterSamples);
                 InterlockedExchange64(&g_presenterUploadUs, 0);
                 InterlockedExchange64(&g_presenterSubmitUs, 0);
+                InterlockedExchange64(&g_presenterOverlayUs, 0);
                 InterlockedExchange(&g_presenterSamples, 0);
             }
 
@@ -2900,6 +2990,8 @@ namespace wowvr
                     g_presenterJob.overlayPremultiplied = overlayJob.overlayPremultiplied;
                     g_presenterJob.hideOverlay = overlayJob.hideOverlay;
                     ResetEvent(g_presenterDoneEvent);
+                    ResetEvent(g_presenterSubmittedEvent);
+                    g_presenterJobPostedThisFrame = true;
                     SetEvent(g_presenterJobEvent);
                 }
                 else
@@ -3246,20 +3338,56 @@ namespace wowvr
                 FinishStereoFrame(device);
             }
 
+            const LARGE_INTEGER presentStart = Now();
             const HRESULT hr = g_originalPresent(device, source, destination, windowOverride, dirtyRegion);
+            {
+                const double presentMs = ElapsedMs(presentStart, Now());
+                g_pacing.sumPresentMs += presentMs;
+                if (presentMs > g_pacing.maxPresentMs) { g_pacing.maxPresentMs = presentMs; }
+                if (g_pacing.last.QuadPart != 0)
+                {
+                    const double interval = ElapsedMs(g_pacing.last, presentStart);
+                    g_pacing.sumIntervalMs += interval;
+                    ++g_pacing.samples;
+                    if (interval > g_pacing.maxIntervalMs) { g_pacing.maxIntervalMs = interval; }
+                    if (interval > 10.0) { ++g_pacing.over10; }
+                    if (interval > 20.0) { ++g_pacing.over20; }
+                    if (interval > 50.0) { ++g_pacing.over50; }
+                }
+                g_pacing.last = presentStart;
+            }
 
             // WaitGetPoses blocks until the compositor wants the next frame, which is
             // also what paces the game to the headset's refresh rate.
             if (Cfg().enabled && Vr().IsActive())
             {
-                // Not while the worker is stuck in a submit: the compositor is waiting
-                // on that frame, so WaitGetPoses could block the game thread too.
-                if (!g_presenterStalled)
+                // The compositor's frame protocol is strictly Submit, then
+                // WaitGetPoses, and the compositor is not thread-safe. Called from here
+                // while the worker was still submitting, WaitGetPoses opened the next
+                // frame early, the late Submit landed in it and the following one was
+                // refused ("eye already submitted"): dropped frames and doubled images
+                // on every head turn. (The native D3D9 Present blocked long enough to
+                // hide it; DXVK's returns at once.) So when the worker has this frame,
+                // it makes the WaitGetPoses call itself, right after its Submit, and
+                // this thread only waits for the fresh poses. When it does not (dump
+                // frames, frames with nothing to submit), this thread calls it, once
+                // the worker is entirely idle. A worker stuck in the compositor is
+                // waited for a bounded time and then left behind, as before.
+                const LARGE_INTEGER poseWaitStart = Now();
+                const bool posted = g_presenterJobPostedThisFrame;
+                g_presenterJobPostedThisFrame = false;
+                if (posted)
                 {
-                    const LARGE_INTEGER waitStart = Now();
-                    Vr().WaitForFrame();
-                    g_timers.waitMs += ElapsedMs(waitStart, Now());
+                    TryWaitPresenterDone(false, true);
                 }
+                else if (TryWaitPresenterDone(false))
+                {
+                    Vr().WaitForFrame();
+                }
+                const double poseWaitMs = ElapsedMs(poseWaitStart, Now());
+                g_timers.waitMs += poseWaitMs;
+                g_pacing.sumWorkerWaitMs += poseWaitMs;
+                if (poseWaitMs > g_pacing.maxWorkerWaitMs) { g_pacing.maxWorkerWaitMs = poseWaitMs; }
 
                 // Recentre the moment the headset is first actually worn. Until then
                 // "forward" would be measured from wherever it happened to be lying.

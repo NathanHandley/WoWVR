@@ -41,6 +41,9 @@ namespace wowvr
             L"; true zero-copy present on this client, but the layer roughly thirds the\r\n"
             L"; frame rate, so it is off by default.\r\n"
             L"UseD3D9On12=0\r\n"
+            L"; Another d3d9.dll to run the client through, relative to the client folder\r\n"
+            L"; - e.g. DXVK's 32-bit d3d9.dll renamed to dxvk_d3d9.dll. Empty: the system's.\r\n"
+            L"D3D9Library=\r\n"
             L"; Interpupillary distance in metres. 0 uses the value reported by the headset.\r\n"
             L"IpdOverride=0.0\r\n"
             L"; Above 1.0 the world feels bigger, below 1.0 it feels like a diorama.\r\n"
@@ -205,6 +208,7 @@ namespace wowvr
         config.presenterThread =
             ReadBool(path, L"VR", L"PresenterThread", config.presenterThread);
         config.useD3D9On12 = ReadBool(path, L"VR", L"UseD3D9On12", config.useD3D9On12);
+        config.d3d9Library = ReadString(path, L"VR", L"D3D9Library", L"");
         config.ipdOverride = ReadFloat(path, L"VR", L"IpdOverride", config.ipdOverride);
         config.worldScale = ReadFloat(path, L"VR", L"WorldScale", config.worldScale);
         config.unitsPerMetre = ReadFloat(path, L"VR", L"UnitsPerMetre", config.unitsPerMetre);

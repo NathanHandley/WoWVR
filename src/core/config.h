@@ -2,6 +2,8 @@
 
 #include "core/log.h"
 
+#include <string>
+
 namespace wowvr
 {
     struct Config
@@ -68,6 +70,13 @@ namespace wowvr
         // ~28 fps against ~75 native on this client (1100+ world draws a frame);
         // the perfect hand-off is not worth a third of the frame rate.
         bool useD3D9On12 = false;
+
+        // Which d3d9.dll does the real work. Empty: the system one. A file name is
+        // taken relative to the client folder - the point is DXVK's d3d9.dll (saved
+        // under another name, e.g. dxvk_d3d9.dll), which turns the client's D3D9 calls
+        // into Vulkan with a fraction of the per-draw CPU cost, and does the driver
+        // work on its own thread. Falls back to the system library if it will not load.
+        std::wstring d3d9Library;
         float ipdOverride = 0.0f;       // metres; 0 = whatever the headset reports
         float worldScale = 1.0f;        // >1 makes the world feel larger
 

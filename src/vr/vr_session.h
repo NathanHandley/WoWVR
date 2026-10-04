@@ -82,6 +82,12 @@ namespace wowvr
         bool SubmitEyeD3D12(int eye, void* textureData);
         void PostSubmit();
 
+        // Diagnostic: what the compositor did with our frames since the last call -
+        // presents, drops, reprojections (and whether motion smoothing / throttling
+        // was engaged) from its own per-frame records. Only while no other thread
+        // is inside the compositor.
+        void LogCompositorStats();
+
         // The interface as a SteamVR overlay rather than geometry in the eye images.
         // The compositor layers overlays on AFTER it has reprojected or motion-smoothed
         // the scene, so a static interface over a moving world no longer confuses the
@@ -102,6 +108,7 @@ namespace wowvr
                            const HeadPoseStamp* renderPose = nullptr);
 
         bool m_active = false;
+        int m_trackingSpace = 1;   // vr::ETrackingUniverseOrigin, read once at start
         uint32_t m_renderWidth = 0;
         uint32_t m_renderHeight = 0;
         float m_displayFrequency = 90.0f;

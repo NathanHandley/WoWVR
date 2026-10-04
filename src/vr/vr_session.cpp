@@ -182,6 +182,10 @@ namespace wowvr
         // The compositor hands out scene focus only once an application starts
         // waiting on it, and a Submit before that fails with DoNotHaveFocus. Priming
         // it here means the very first frame we push already has focus.
+        // The tracking space is read once, here: the overlay is posed from the
+        // presenter thread, which must not call into the compositor while the game
+        // thread may be inside WaitGetPoses.
+        m_trackingSpace = static_cast<int>(vr::VRCompositor()->GetTrackingSpace());
         WaitForFrame();
 
         return true;
@@ -397,7 +401,7 @@ namespace wowvr
                 pose.m[row][column] = trackingToOverlay[row][column];
             }
         }
-        overlay->SetOverlayTransformAbsolute(handle, vr::VRCompositor()->GetTrackingSpace(),
+        overlay->SetOverlayTransformAbsolute(handle, static_cast<vr::ETrackingUniverseOrigin>(m_trackingSpace),
                                              &pose);
 
         vr::Texture_t texture = {};
@@ -446,6 +450,72 @@ namespace wowvr
             return;
         }
         vr::VRCompositor()->PostPresentHandoff();
+    }
+
+    void VrSession::LogCompositorStats()
+    {
+        if (!m_active || vr::VRCompositor() == nullptr)
+        {
+            return;
+        }
+
+        static vr::Compositor_CumulativeStats previous = {};
+        static bool havePrevious = false;
+        vr::Compositor_CumulativeStats stats = {};
+        vr::VRCompositor()->GetCumulativeStats(&stats, sizeof(stats));
+        if (havePrevious && stats.m_nPid == previous.m_nPid)
+        {
+            WOWVR_INFO("Compositor since last report: %u submits, %u presents, %u dropped "
+                       "(old frame shown, no reprojection), %u reprojected, %u timed out.",
+                       stats.m_nNumFrameSubmits - previous.m_nNumFrameSubmits,
+                       stats.m_nNumFramePresents - previous.m_nNumFramePresents,
+                       stats.m_nNumDroppedFrames - previous.m_nNumDroppedFrames,
+                       stats.m_nNumReprojectedFrames - previous.m_nNumReprojectedFrames,
+                       stats.m_nNumFramePresentsTimedOut - previous.m_nNumFramePresentsTimedOut);
+        }
+        previous = stats;
+        havePrevious = true;
+
+        // The most recent frames, one record per compositor frame.
+        static vr::Compositor_FrameTiming timings[128];
+        timings[0].m_nSize = sizeof(vr::Compositor_FrameTiming);
+        const uint32_t count = vr::VRCompositor()->GetFrameTimings(timings, 128);
+        if (count == 0)
+        {
+            return;
+        }
+        uint32_t motion = 0, async = 0, throttled = 0, predicted = 0, cpuReason = 0, gpuReason = 0;
+        uint32_t misPresented = 0, dropped = 0, multiPresented = 0, longIntervals = 0;
+        float maxInterval = 0.0f, sumInterval = 0.0f, maxSubmit = 0.0f, maxRenderGpu = 0.0f;
+        const float frameMs = 1000.0f / (m_displayFrequency > 1.0f ? m_displayFrequency : 90.0f);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const vr::Compositor_FrameTiming& t = timings[i];
+            const uint32_t flags = t.m_nReprojectionFlags;
+            if (flags & vr::VRCompositor_ReprojectionMotion) { ++motion; }
+            if (flags & vr::VRCompositor_ReprojectionAsync) { ++async; }
+            if (flags & vr::VRCompositor_ReprojectionReason_Cpu) { ++cpuReason; }
+            if (flags & vr::VRCompositor_ReprojectionReason_Gpu) { ++gpuReason; }
+            if (flags & vr::VRCompositor_ThrottleMask) { ++throttled; }
+            if (flags & vr::VRCompositor_PredictionMask) { ++predicted; }
+            misPresented += t.m_nNumMisPresented;
+            dropped += t.m_nNumDroppedFrames;
+            if (t.m_nNumFramePresents > 1) { ++multiPresented; }
+            sumInterval += t.m_flClientFrameIntervalMs;
+            if (t.m_flClientFrameIntervalMs > maxInterval) { maxInterval = t.m_flClientFrameIntervalMs; }
+            if (t.m_flClientFrameIntervalMs > frameMs * 2.5f) { ++longIntervals; }
+            if (t.m_flSubmitFrameMs > maxSubmit) { maxSubmit = t.m_flSubmitFrameMs; }
+            if (t.m_flTotalRenderGpuMs > maxRenderGpu) { maxRenderGpu = t.m_flTotalRenderGpuMs; }
+        }
+        WOWVR_INFO("Compositor last %u frames (%.0f Hz): app interval avg %.2f max %.2f ms, %u "
+                   "longer than 2.5 vsyncs; shown more than once %u, mispresented %u, dropped %u; "
+                   "reprojection: motion smoothing %u, async %u, cpu-reason %u, gpu-reason %u, "
+                   "throttled %u, extra prediction %u; Submit max %.2f ms; total render gpu max "
+                   "%.2f ms; last flags 0x%X.",
+                   count, 1000.0f / frameMs, sumInterval / count, maxInterval, longIntervals,
+                   multiPresented, misPresented, dropped, motion, async, cpuReason, gpuReason,
+                   throttled, predicted, maxSubmit, maxRenderGpu,
+                   timings[count - 1].m_nReprojectionFlags);
     }
 
     VrSession& Vr()
