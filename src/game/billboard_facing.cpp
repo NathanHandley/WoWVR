@@ -46,6 +46,16 @@ namespace wowvr
         const uintptr_t kCelestialBasisCallRva = 0x009AC884u - kPublishedImageBase;
         const uintptr_t kCelestialBasisRva = 0x009ABB60u - kPublishedImageBase;
 
+        // World text - unit names over heads and floating combat text - is drawn by
+        // 0x007E7490 with the view set to identity and, per item, a world matrix that is
+        // a pure translation to the item's view-space position (identity, then
+        // 0x004C1B30 translate-in-place at 0x007E7A66, ecx = the matrix). So each string
+        // lies flat on the GAME camera's axes, tilting whenever the head and the camera
+        // disagree. The call is redirected so that, after the translation, the matrix's
+        // rotation becomes HC^T - the same turn the billboards get.
+        const uintptr_t kWorldTextTranslateCallRva = 0x007E7A66u - kPublishedImageBase;
+        const uintptr_t kTranslateInPlaceRva = 0x004C1B30u - kPublishedImageBase;
+
         // Read by the naked detours, which cannot reach a this-pointer.
         uintptr_t g_worldCallers[5] = {};
         volatile LONG g_sceneInWorld = 0;
@@ -53,6 +63,7 @@ namespace wowvr
         uint8_t* g_sceneTrampoline = nullptr;
         uintptr_t g_joinAddress = 0;
         uintptr_t g_basisFunction = 0;
+        uintptr_t g_translateInPlace = 0;
         unsigned long long g_celestialFacings = 0;
         bool g_installed = false;
         bool g_failed = false;
@@ -117,6 +128,32 @@ namespace wowvr
 
         typedef void(__stdcall* FaceCelestialFn)(float*, const float*, const uint8_t*);
         FaceCelestialFn g_faceCelestial = FaceCelestialAtCamera;
+
+        // Called in place of 0x004C1B30 (thiscall: ecx = matrix, one stack argument, ret 4).
+        // Runs the client's translate, then turns the matrix's rotation rows - which are
+        // the identity here - into HC^T. The translation row is untouched.
+        __declspec(naked) void WorldTextTranslateDetour()
+        {
+            __asm
+            {
+                push ecx                        // the matrix, kept across the call
+                push dword ptr [esp + 8]        // the client's translation argument
+                mov  eax, g_translateInPlace
+                call eax                        // thiscall, pops its argument
+                pop  ecx
+                cmp  g_active, 0
+                je   done
+                pushad
+                pushfd
+                push ecx
+                mov  eax, g_rotateRows
+                call eax
+                popfd
+                popad
+            done:
+                ret  4
+            }
+        }
 
         // Called in place of 0x009ABB60; tail-jumps to it, so it returns straight to
         // the client's caller.
@@ -228,6 +265,15 @@ namespace wowvr
         // to the shared tail, and the entry must be the expected prologue.
         bool ok = memcmp(entry, kSceneAnimateEntry, sizeof(kSceneAnimateEntry)) == 0;
         uint8_t* celestialCall = reinterpret_cast<uint8_t*>(base + kCelestialBasisCallRva);
+        uint8_t* worldTextCall = reinterpret_cast<uint8_t*>(base + kWorldTextTranslateCallRva);
+        if (ok)
+        {
+            int32_t rel = 0;
+            memcpy(&rel, worldTextCall + 1, 4);
+            ok = worldTextCall[0] == 0xE8u
+                && reinterpret_cast<uintptr_t>(worldTextCall) + 5 + static_cast<intptr_t>(rel)
+                       == base + kTranslateInPlaceRva;
+        }
         if (ok)
         {
             int32_t rel = 0;
@@ -258,6 +304,7 @@ namespace wowvr
         }
         g_joinAddress = join;
         g_basisFunction = base + kCelestialBasisRva;
+        g_translateInPlace = base + kTranslateInPlaceRva;
 
         uint8_t* stub = static_cast<uint8_t*>(
             VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
@@ -310,7 +357,22 @@ namespace wowvr
             }
         }
 
+        {
+            uint8_t call[5];
+            JumpTo(call, reinterpret_cast<uintptr_t>(worldTextCall), &WorldTextTranslateDetour);
+            call[0] = 0xE8u;
+            if (!Patch(worldTextCall, call, sizeof(call)))
+            {
+                g_failed = true;
+                WOWVR_WARN("Billboard facing: the world text call could not be patched.");
+                return false;
+            }
+        }
+
         g_installed = true;
+        WOWVR_INFO("Billboard facing: world text (unit names, combat text) now faces the "
+                   "head; hook at 0x%08X.",
+                   static_cast<unsigned>(reinterpret_cast<uintptr_t>(worldTextCall)));
         WOWVR_INFO("Billboard facing: the sun and moons, and spherical M2 billboards in the "
                    "world, now face the head. Sun/moon hook at 0x%08X.",
                    static_cast<unsigned>(reinterpret_cast<uintptr_t>(celestialCall)));
