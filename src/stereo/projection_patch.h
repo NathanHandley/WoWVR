@@ -36,7 +36,7 @@ namespace wowvr
         // which is both wrong and unpleasant to wear. So this is subtracted back out, and
         // what remains for the projection to apply is the part the game has not done:
         // pitch, roll, and any yaw still catching up.
-        void SetGameCameraYaw(float radians) { m_gameCameraYaw = radians; }
+        void SetGameCameraYaw(float radians) { Bump(m_gameCameraYaw, radians); }
 
         // The distance the game's camera orbits the character at.
         //
@@ -45,11 +45,16 @@ namespace wowvr
         // it around the character on a circle of this radius. Cancel only the rotation and
         // the leftover translation reads as the whole view sliding sideways with no change
         // of facing. Zero disables the correction, which is also correct in first person.
-        void SetGameCameraOrbitRadius(float yards) { m_gameCameraOrbitRadius = yards; }
+        void SetGameCameraOrbitRadius(float yards) { Bump(m_gameCameraOrbitRadius, yards); }
 
         // The measured view-space displacement aiming the camera caused, in yards.
-        void SetOrbitDisplacement(const Vec3& yards) { m_orbitDisplacement = yards; }
-        void SetGameCameraPitch(float radians) { m_gameCameraPitch = radians; }
+        void SetOrbitDisplacement(const Vec3& yards)
+        {
+            Bump(m_orbitDisplacement.x, yards.x);
+            Bump(m_orbitDisplacement.y, yards.y);
+            Bump(m_orbitDisplacement.z, yards.z);
+        }
+        void SetGameCameraPitch(float radians) { Bump(m_gameCameraPitch, radians); }
 
         // A synthetic head pitch, for the same reason as the synthetic yaw: looking up and
         // down has to be testable with the headset lying still on a desk.
@@ -60,11 +65,11 @@ namespace wowvr
         // Diagnostic: the order the game camera's two rotations are unwound in. Only has
         // any effect when yaw and pitch are both non-zero, which is exactly the case that
         // went untested and shipped a residual roll.
-        void SetUnwindPitchFirst(bool on) { m_unwindPitchFirst = on; }
+        void SetUnwindPitchFirst(bool on) { m_unwindPitchFirst = on; ++m_generation; }
 
         // +1 or -1 on the third-person orbit correction, so the direction can be measured
         // rather than argued about.
-        void SetOrbitSign(float sign) { m_orbitSign = sign >= 0.0f ? 1.0f : -1.0f; }
+        void SetOrbitSign(float sign) { Bump(m_orbitSign, sign >= 0.0f ? 1.0f : -1.0f); }
         float OrbitSign() const { return m_orbitSign; }
 
         void SetFakeHeadOffset(const Vec3& metres) { m_fakeHeadOffset = metres; }
@@ -172,12 +177,25 @@ namespace wowvr
         // up square to the head.
         Mat4 GameViewToHead() const { return HeadCorrection(); }
 
+        // A body-frame point or direction (metres, left-handed, the frame the interface
+        // panel is placed in) in OpenVR's tracking space (right-handed, the space the
+        // poses from WaitGetPoses are in). Undoes exactly what UpdateFromHeadPose does to
+        // put the head into the body frame: the yaw-only neutral rotation, the neutral
+        // position, and the z flip between the two handednesses.
+        Vec3 BodyToStage(const Vec3& body, bool isPoint) const;
+
         // Trace taps for the pitch pipeline: the camera pitch actually baked into this
         // frame's geometry (from the combined-transform residual) and the compensation
         // pitch this frame was corrected with. Comparing the two per frame is how a
         // shake gets attributed instead of theorised about.
         float LastBakedPitch() const { return m_lastBakedPitch; }
         float CompensationPitchUsed() const { return m_gameCameraPitch; }
+
+        // Everything the eye matrices are built from that is not in the upload itself:
+        // the head pose (refreshed once a frame), the game camera compensation, and the
+        // configuration. Any change bumps the generation and drops every cached result.
+        // Call after a configuration reload.
+        void InvalidateCaches() { ++m_generation; }
 
         // Diagnostics for the log.
         unsigned long long PatchedCount() const { return m_patched; }
@@ -207,6 +225,63 @@ namespace wowvr
 
         Mat4 BuildEyeProjection(int eye, float nearPlane, float farPlane,
                                 const Mat4& original) const;
+
+        // Caching. Every world draw is issued twice (once per eye) and nearly every
+        // constant upload is offered to the patch, so the same work was being redone
+        // thousands of times a frame: the scene projection's inverse, the per-eye head
+        // correction (with its trig), and whole results for the second eye of a draw.
+        // All of it depends only on the inputs below, so it is cached against them and
+        // the results are bit-for-bit what recomputing would give.
+        template <typename T>
+        void Bump(T& field, T value)
+        {
+            if (field != value)
+            {
+                field = value;
+                ++m_generation;
+            }
+        }
+        const Mat4* InverseScene();
+        const Mat4& CachedEyeProjection(int eye, float nearPlane, float farPlane,
+                                        const Mat4& original);
+
+        unsigned m_generation = 1;
+
+        Mat4 m_inverseSceneSource;
+        Mat4 m_inverseScene;
+        bool m_inverseSceneValid = false;
+        bool m_inverseSceneOk = false;
+
+        struct EyeCacheEntry
+        {
+            unsigned generation = 0;
+            bool infinite = false;
+            float nearPlane = 0.0f;
+            float farPlane = 0.0f;
+            float depth[4] = {};
+            Mat4 matrix;
+        };
+        EyeCacheEntry m_eyeCache[2][2];   // [eye][infinite]
+
+        // Single-entry memos: the second eye of a draw offers exactly the same upload.
+        struct ResultMemo
+        {
+            bool valid = false;
+            unsigned generation = 0;
+            bool infinite = false;
+            bool rigidChecked = false;   // combined only: passed the strict placement test
+            float input[16] = {};
+            float left[16] = {};
+            float right[16] = {};
+        };
+        ResultMemo m_patchMemo;
+        ResultMemo m_combinedMemo;
+        Mat4 m_combinedMemoScene;   // the scene matrix the combined memo divided by
+        Decoded m_patchMemoDecoded;
+
+        unsigned long long m_patchMemoHits = 0;
+        unsigned long long m_combinedMemoHits = 0;
+        unsigned long long m_noteCalls = 0;
 
         float m_sceneAspect = 16.0f / 9.0f;
         Mat4 m_headRotation = Mat4Identity();

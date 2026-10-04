@@ -56,39 +56,6 @@ namespace wowvr
         const uintptr_t kCamUp = 0x2Cu;
         const uintptr_t kCamNear = 0x38u;
         const uintptr_t kCamFar = 0x3Cu;
-        const uintptr_t kCamLiveDistance = 0x118u;   // orbit distance to the target
-
-        // CWorld::Intersect, the trace both the pick (0x004F99F8) and the camera's own
-        // collision (0x00605D60) use: (start, end, hitPoint out, fraction in/out,
-        // flags, 0), cdecl, true in al on a hit with the fraction shortened to it.
-        const uintptr_t kWorldIntersectRva = 0x0077F310u - kPublishedImageBase;
-        typedef unsigned char(__cdecl* WorldIntersectFn)(const float* start, const float* end,
-                                                         float* hitPoint, float* fraction,
-                                                         uint32_t flags, uint32_t unused);
-        // The camera collision's own flags (0x00605E11).
-        const uint32_t kCameraCollisionFlags = 0x00100171u;
-
-        // The pick's own trace flags (0x004F9964) and where the trace leaves the GUID
-        // of a game object it hit (read by the pick at 0x004F9A5C).
-        const uint32_t kPickTraceFlags = 0x01000124u;
-        const uintptr_t kTraceHitGuidRva = 0x00CD7768u - kPublishedImageBase;
-
-        // Diagnostic: the pick trace itself (0x004F9930), thiscall (start*, end*, flags,
-        // result*), ret 0x10; returns 0 for nothing, 2 for an object (GUID at result+0).
-        const uintptr_t kPickTraceRva = 0x004F9930u - kPublishedImageBase;
-        const uint8_t kPickTraceEntry[9] =
-            { 0x55u, 0x8Bu, 0xECu, 0x81u, 0xECu, 0xC4u, 0x00u, 0x00u, 0x00u };
-        const uintptr_t kMouseoverGuidRva = 0x00BD07A0u - kPublishedImageBase;
-        typedef int(__fastcall* PickTraceFn)(uint8_t* worldFrame, void* unusedEdx,
-                                             const float* start, const float* end,
-                                             uint32_t flags, uint32_t* result);
-        PickTraceFn g_pickTraceOriginal = nullptr;
-        DWORD g_lastPickResultLog = 0;
-
-        // Diagnostic: once a second, what the pick's world trace hits along the ray
-        // WoWVR hands it and along the one the client would have used.
-        DWORD g_lastPickLog = 0;
-
 
         typedef void(__cdecl* ScreenToRayFn)(float nx, float ny, float* start, float* end);
 
@@ -116,7 +83,6 @@ namespace wowvr
         unsigned long long g_rayCalls = 0;
         unsigned long long g_projectCalls = 0;
         unsigned long long g_projectOnPanel = 0;
-        unsigned long long g_rayStartsMoved = 0;
         unsigned long long g_basisFallbacks = 0;
         float g_lastRayU = -1.0f;
         float g_lastRayV = -1.0f;
@@ -316,28 +282,6 @@ namespace wowvr
             }
         }
 
-        void LogTrace(const char* label, const float* from, const float* to)
-        {
-            float hit[3] = {};
-            float fraction = 1.0f;
-            const WorldIntersectFn intersect =
-                reinterpret_cast<WorldIntersectFn>(ImageBase() + kWorldIntersectRva);
-            const bool hitSomething = intersect(from, to, hit, &fraction, kPickTraceFlags, 0) != 0;
-            uint32_t guid[2] = {};
-            CopyFloats(ImageBase() + kTraceHitGuidRva, reinterpret_cast<float*>(guid), 2);
-            const float dx = to[0] - from[0];
-            const float dy = to[1] - from[1];
-            const float dz = to[2] - from[2];
-            const float length = sqrtf(dx * dx + dy * dy + dz * dz);
-            WOWVR_INFO("Pick %s: from (%.2f %.2f %.2f) dir (%.3f %.3f %.3f) -> %s at %.2f yards, "
-                       "object %08X%08X", label, from[0], from[1], from[2],
-                       length > 0.0f ? dx / length : 0.0f, length > 0.0f ? dy / length : 0.0f,
-                       length > 0.0f ? dz / length : 0.0f,
-                       hitSomething ? "world hit" : "no world hit",
-                       hitSomething ? fraction * length : length,
-                       hitSomething ? guid[1] : 0u, hitSomething ? guid[0] : 0u);
-        }
-
         // Entered in place of 0x004BF0F0. The client's own answer is computed first:
         // its near and far distances are kept so the trace keeps the reach the client
         // gave it, and only the direction and origin are replaced.
@@ -371,46 +315,6 @@ namespace wowvr
                 return;
             }
 
-            // Where the pick may start. WoWVR turns the client's third-person camera
-            // collision off in VR, so the camera can sit behind geometry the character
-            // is standing inside - a lift's cage, a doorway - and a pick from there hits
-            // that geometry first and never reaches what the pointer is on. On a monitor
-            // the collision would have pulled the camera in front of it. So: trace from
-            // the camera's target back to the camera exactly as that collision does, and
-            // if something is in the way, start the pick at that depth along the ray.
-            float startDistance = 0.0f;
-            {
-                uintptr_t cameraObject = 0;
-                float distance = 0.0f;
-                if (ReadPointer(worldFrame + kActiveCamera, cameraObject) && cameraObject != 0
-                    && CopyFloats(cameraObject + kCamLiveDistance, &distance, 1)
-                    && Finite(distance) && distance > 1.0f && distance < 100.0f)
-                {
-                    const Vec3 target = { camera.position.x + camera.forward.x * distance,
-                                          camera.position.y + camera.forward.y * distance,
-                                          camera.position.z + camera.forward.z * distance };
-                    const float eye[3] = { camera.position.x + originWorld.x,
-                                           camera.position.y + originWorld.y,
-                                           camera.position.z + originWorld.z };
-                    const float from[3] = { target.x, target.y, target.z };
-                    float hit[3] = {};
-                    float fraction = 1.0f;
-                    const WorldIntersectFn intersect =
-                        reinterpret_cast<WorldIntersectFn>(ImageBase() + kWorldIntersectRva);
-                    if (intersect(from, eye, hit, &fraction, kCameraCollisionFlags, 0) != 0
-                        && fraction >= 0.0f && fraction < 1.0f)
-                    {
-                        // The blocking point, relative to the eye, measured along the ray.
-                        const Vec3 blocked = {
-                            target.x + (eye[0] - target.x) * fraction - eye[0],
-                            target.y + (eye[1] - target.y) * fraction - eye[1],
-                            target.z + (eye[2] - target.z) * fraction - eye[2] };
-                        startDistance = Dot(blocked, directionWorld);
-                        ++g_rayStartsMoved;
-                    }
-                }
-            }
-
             const Vec3 originalStart = { start[0], start[1], start[2] };
             const Vec3 originalEnd = { end[0], end[1], end[2] };
             float nearDistance = Length(originalStart);
@@ -425,37 +329,6 @@ namespace wowvr
             {
                 return;
             }
-            if (startDistance > nearDistance && startDistance < farDistance)
-            {
-                nearDistance = startDistance;
-            }
-
-            const DWORD now = GetTickCount();
-            if (now - g_lastPickLog > 1000u)
-            {
-                g_lastPickLog = now;
-                const float clientFrom[3] = { camera.position.x + originalStart.x,
-                                              camera.position.y + originalStart.y,
-                                              camera.position.z + originalStart.z };
-                const float clientTo[3] = { camera.position.x + originalEnd.x,
-                                            camera.position.y + originalEnd.y,
-                                            camera.position.z + originalEnd.z };
-                const float ourFrom[3] = {
-                    camera.position.x + originWorld.x + directionWorld.x * nearDistance,
-                    camera.position.y + originWorld.y + directionWorld.y * nearDistance,
-                    camera.position.z + originWorld.z + directionWorld.z * nearDistance };
-                const float ourTo[3] = {
-                    camera.position.x + originWorld.x + directionWorld.x * farDistance,
-                    camera.position.y + originWorld.y + directionWorld.y * farDistance,
-                    camera.position.z + originWorld.z + directionWorld.z * farDistance };
-                WOWVR_INFO("Pick: camera (%.2f %.2f %.2f) forward (%.3f %.3f %.3f), live distance "
-                           "moved start %s.", camera.position.x, camera.position.y,
-                           camera.position.z, camera.forward.x, camera.forward.y,
-                           camera.forward.z, startDistance > 0.0f ? "yes" : "no");
-                LogTrace("as WoWVR aims it", ourFrom, ourTo);
-                LogTrace("as the client aimed it", clientFrom, clientTo);
-            }
-
             start[0] = originWorld.x + directionWorld.x * nearDistance;
             start[1] = originWorld.y + directionWorld.y * nearDistance;
             start[2] = originWorld.z + directionWorld.z * nearDistance;
@@ -544,30 +417,6 @@ namespace wowvr
                 return 1u;
             }
             return 0u;
-        }
-
-        int __fastcall PickTraceDetour(uint8_t* worldFrame, void* unusedEdx, const float* start,
-                                       const float* end, uint32_t flags, uint32_t* result)
-        {
-            const int kind = g_pickTraceOriginal(worldFrame, unusedEdx, start, end, flags, result);
-            const DWORD now = GetTickCount();
-            if (g_state.active && now - g_lastPickResultLog > 1000u)
-            {
-                g_lastPickResultLog = now;
-                uint32_t mouseover[2] = {};
-                CopyFloats(ImageBase() + kMouseoverGuidRva, reinterpret_cast<float*>(mouseover), 2);
-                const float length = (start != nullptr && end != nullptr)
-                    ? sqrtf((end[0] - start[0]) * (end[0] - start[0])
-                            + (end[1] - start[1]) * (end[1] - start[1])
-                            + (end[2] - start[2]) * (end[2] - start[2]))
-                    : 0.0f;
-                WOWVR_INFO("Pick result: flags 0x%08X, %.1f-yard ray -> kind %d, object %08X%08X; "
-                           "mouseover %08X%08X", flags, length, kind,
-                           (kind != 0 && result != nullptr) ? result[1] : 0u,
-                           (kind != 0 && result != nullptr) ? result[0] : 0u,
-                           mouseover[1], mouseover[0]);
-            }
-            return kind;
         }
 
         bool InstallDetour(uintptr_t rva, const uint8_t* expected, size_t length,
@@ -684,15 +533,6 @@ namespace wowvr
             g_screenToRayOriginal = reinterpret_cast<ScreenToRayFn>(rayTrampoline);
         }
 
-        // Diagnostic only; failure to install it changes nothing.
-        void* pickTrampoline = nullptr;
-        if (rayOk && InstallDetour(kPickTraceRva, kPickTraceEntry, sizeof(kPickTraceEntry),
-                                   reinterpret_cast<const void*>(&PickTraceDetour),
-                                   &pickTrampoline, "pick trace (diagnostic)"))
-        {
-            g_pickTraceOriginal = reinterpret_cast<PickTraceFn>(pickTrampoline);
-        }
-
         if (!projectOk || !rayOk)
         {
             g_installFailed = true;
@@ -723,14 +563,13 @@ namespace wowvr
     void WorldPointer::LogStatus() const
     {
         WOWVR_INFO("World pointing: %s; %llu pointer rays (last at u %.3f v %.3f, %.1f deg "
-                   "off the camera's axis, %llu started past geometry behind the character), "
+                   "off the camera's axis), "
                    "%llu projections, %llu on the panel, %llu on the camera-object fallback "
                    "basis.",
                    g_installed ? (g_state.active ? "active" : "installed, idle")
                                : (g_installFailed ? "not installed" : "pending"),
                    g_rayCalls, g_lastRayU, g_lastRayV, g_lastRayOffAxisDegrees,
-                   g_rayStartsMoved, g_projectCalls, g_projectOnPanel, g_basisFallbacks);
-        g_rayStartsMoved = 0;
+                   g_projectCalls, g_projectOnPanel, g_basisFallbacks);
         g_basisFallbacks = 0;
         g_rayCalls = 0;
         g_projectCalls = 0;

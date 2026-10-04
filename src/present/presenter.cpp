@@ -1,5 +1,6 @@
 #include "present/presenter.h"
 
+#include "core/image_dump.h"
 #include "core/log.h"
 
 #include <windows.h>
@@ -8,9 +9,12 @@
 #include <cstring>
 #include <iterator>
 #include <thread>
+#include <vector>
 
 #include <d3d11.h>
 #include <dxgi.h>
+
+#include <openvr.h>
 
 namespace wowvr
 {
@@ -317,6 +321,18 @@ namespace wowvr
                 m_stagingTexture[eye] = nullptr;
             }
         }
+        if (m_overlayTexture != nullptr)
+        {
+            m_overlayTexture->Release();
+            m_overlayTexture = nullptr;
+        }
+        if (m_overlayStaging != nullptr)
+        {
+            m_overlayStaging->Release();
+            m_overlayStaging = nullptr;
+        }
+        m_overlayWidth = 0;
+        m_overlayHeight = 0;
         m_adopted = false;
     }
 
@@ -337,6 +353,141 @@ namespace wowvr
 
         m_width = 0;
         m_height = 0;
+    }
+
+    bool Presenter::UploadOverlay(const void* pixels, uint32_t sourceRowPitch, uint32_t width,
+                                  uint32_t height)
+    {
+        if (m_device == nullptr || m_context == nullptr || pixels == nullptr || width == 0
+            || height == 0)
+        {
+            return false;
+        }
+
+        if (m_overlayTexture == nullptr || m_overlayWidth != width || m_overlayHeight != height)
+        {
+            if (m_overlayTexture != nullptr) { m_overlayTexture->Release(); m_overlayTexture = nullptr; }
+            if (m_overlayStaging != nullptr) { m_overlayStaging->Release(); m_overlayStaging = nullptr; }
+
+            D3D11_TEXTURE2D_DESC desc = {};
+            desc.Width = width;
+            desc.Height = height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;   // D3DFMT_A8R8G8B8 byte for byte
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            const HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_overlayTexture);
+            if (FAILED(hr))
+            {
+                m_overlayTexture = nullptr;
+                WOWVR_ERROR("Could not create the %ux%u interface overlay texture (0x%08lx).",
+                            width, height, hr);
+                return false;
+            }
+
+            D3D11_TEXTURE2D_DESC stagingDesc = desc;
+            stagingDesc.Usage = D3D11_USAGE_STAGING;
+            stagingDesc.BindFlags = 0;
+            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(m_device->CreateTexture2D(&stagingDesc, nullptr, &m_overlayStaging)))
+            {
+                m_overlayStaging = nullptr;
+            }
+            m_overlayWidth = width;
+            m_overlayHeight = height;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (m_overlayStaging != nullptr
+            && SUCCEEDED(m_context->Map(m_overlayStaging, 0, D3D11_MAP_WRITE, 0, &mapped)))
+        {
+            CopyRowsParallel(mapped.pData, mapped.RowPitch, pixels, sourceRowPitch,
+                             width * 4, height);
+            m_context->Unmap(m_overlayStaging, 0);
+            m_context->CopyResource(m_overlayTexture, m_overlayStaging);
+            return true;
+        }
+
+        m_context->UpdateSubresource(m_overlayTexture, 0, nullptr, pixels, sourceRowPitch, 0);
+        return true;
+    }
+
+    bool Presenter::DumpCompositorMirror(const wchar_t* path)
+    {
+        if (m_device == nullptr || m_context == nullptr || vr::VRCompositor() == nullptr)
+        {
+            return false;
+        }
+        ID3D11ShaderResourceView* view = nullptr;
+        const vr::EVRCompositorError error = vr::VRCompositor()->GetMirrorTextureD3D11(
+            vr::Eye_Left, m_device, reinterpret_cast<void**>(&view));
+        if (error != vr::VRCompositorError_None || view == nullptr)
+        {
+            WOWVR_WARN("Compositor mirror unavailable (%d).", static_cast<int>(error));
+            return false;
+        }
+
+        bool written = false;
+        ID3D11Resource* resource = nullptr;
+        view->GetResource(&resource);
+        ID3D11Texture2D* texture = nullptr;
+        if (resource != nullptr
+            && SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                                                  reinterpret_cast<void**>(&texture))))
+        {
+            D3D11_TEXTURE2D_DESC desc = {};
+            texture->GetDesc(&desc);
+            D3D11_TEXTURE2D_DESC stagingDesc = desc;
+            stagingDesc.Usage = D3D11_USAGE_STAGING;
+            stagingDesc.BindFlags = 0;
+            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            stagingDesc.MiscFlags = 0;
+            stagingDesc.MipLevels = 1;
+            stagingDesc.ArraySize = 1;
+            stagingDesc.SampleDesc.Count = 1;
+            ID3D11Texture2D* staging = nullptr;
+            if (SUCCEEDED(m_device->CreateTexture2D(&stagingDesc, nullptr, &staging)))
+            {
+                m_context->CopySubresourceRegion(staging, 0, 0, 0, 0, texture, 0, nullptr);
+                D3D11_MAPPED_SUBRESOURCE mapped = {};
+                if (SUCCEEDED(m_context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
+                {
+                    // RGBA formats are swizzled to the BGRA the BMP writer expects.
+                    const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+                        || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                        || desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+                    std::vector<uint8_t> pixels(static_cast<size_t>(desc.Width) * desc.Height * 4);
+                    for (uint32_t y = 0; y < desc.Height; ++y)
+                    {
+                        const uint8_t* row = static_cast<const uint8_t*>(mapped.pData)
+                                             + static_cast<size_t>(y) * mapped.RowPitch;
+                        uint8_t* out = pixels.data() + static_cast<size_t>(y) * desc.Width * 4;
+                        for (uint32_t x = 0; x < desc.Width; ++x)
+                        {
+                            out[x * 4 + 0] = row[x * 4 + (rgba ? 2 : 0)];
+                            out[x * 4 + 1] = row[x * 4 + 1];
+                            out[x * 4 + 2] = row[x * 4 + (rgba ? 0 : 2)];
+                            out[x * 4 + 3] = row[x * 4 + 3];
+                        }
+                    }
+                    m_context->Unmap(staging, 0);
+                    written = SaveBgraBmp(path, pixels.data(), desc.Width, desc.Height,
+                                          desc.Width * 4);
+                    WOWVR_INFO("Compositor mirror %ux%u (format %d) written.", desc.Width,
+                               desc.Height, static_cast<int>(desc.Format));
+                }
+                staging->Release();
+            }
+            texture->Release();
+        }
+        if (resource != nullptr)
+        {
+            resource->Release();
+        }
+        vr::VRCompositor()->ReleaseMirrorTextureD3D11(view);
+        return written;
     }
 
     bool Presenter::Upload(int eye, const void* pixels, uint32_t sourceRowPitch)

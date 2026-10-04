@@ -79,6 +79,7 @@ namespace wowvr
 
     void ProjectionPatch::SetSceneAspect(float aspect)
     {
+        ++m_generation;
         if (aspect > 0.01f)
         {
             m_sceneAspect = aspect;
@@ -276,6 +277,9 @@ namespace wowvr
         m_headOffsetNeutral.x = dx * m_neutralInverse.m[0][0] + dy * m_neutralInverse.m[1][0] + dz * m_neutralInverse.m[2][0];
         m_headOffsetNeutral.y = dx * m_neutralInverse.m[0][1] + dy * m_neutralInverse.m[1][1] + dz * m_neutralInverse.m[2][1];
         m_headOffsetNeutral.z = -(dx * m_neutralInverse.m[0][2] + dy * m_neutralInverse.m[1][2] + dz * m_neutralInverse.m[2][2]);
+
+        // A new pose (and with it the eye tangents and offsets for this frame).
+        ++m_generation;
     }
 
     // The head rotation with whatever the game's own camera has already been turned by taken
@@ -380,6 +384,21 @@ namespace wowvr
         return result;
     }
 
+    Vec3 ProjectionPatch::BodyToStage(const Vec3& body, bool isPoint) const
+    {
+        // neutral = (stage - neutralPosition) * m_neutralInverse, body = neutral with z
+        // negated; so stage = (body with z negated) * m_neutralInverse^T (+ position).
+        const Vec3 neutral = { body.x, body.y, -body.z };
+        Vec3 stage = Mat4TransformDirection(neutral, Mat4Transpose(m_neutralInverse));
+        if (isPoint)
+        {
+            stage.x += m_neutralPosition.x;
+            stage.y += m_neutralPosition.y;
+            stage.z += m_neutralPosition.z;
+        }
+        return stage;
+    }
+
     Mat4 ProjectionPatch::GameViewToBody() const
     {
         // m_headRotation is a pure rotation, so its transpose is its inverse.
@@ -457,6 +476,28 @@ namespace wowvr
 
     bool ProjectionPatch::TryPatch(const float* uploaded, float* outLeft, float* outRight)
     {
+        // The same accepted upload again with nothing else changed: same answer, same
+        // side effects (the scene camera it records), none of the arithmetic.
+        if (m_patchMemo.valid && m_patchMemo.generation == m_generation
+            && m_patchMemo.infinite == m_infiniteDistance
+            && memcmp(uploaded, m_patchMemo.input, sizeof(m_patchMemo.input)) == 0)
+        {
+            const Decoded& decoded = m_patchMemoDecoded;
+            m_lastAspect = decoded.verticalScale / decoded.horizontalScale;
+            m_lastNear = decoded.nearPlane;
+            m_lastFar = decoded.farPlane;
+            m_sceneMatrix = decoded.projection;
+            m_haveSceneMatrix = true;
+            m_sceneNear = decoded.nearPlane;
+            m_sceneFar = decoded.farPlane;
+            m_sceneVerticalScale = decoded.verticalScale;
+            memcpy(outLeft, m_patchMemo.left, sizeof(m_patchMemo.left));
+            memcpy(outRight, m_patchMemo.right, sizeof(m_patchMemo.right));
+            ++m_patched;
+            ++m_patchMemoHits;
+            return true;
+        }
+
         Decoded decoded;
         if (!Decode(uploaded, decoded))
         {
@@ -620,6 +661,14 @@ namespace wowvr
             const Mat4 finalMatrix = decoded.wasTransposed ? Mat4Transpose(replacement) : replacement;
             MatrixTo(finalMatrix, eye == EyeLeft ? outLeft : outRight);
         }
+
+        m_patchMemo.valid = true;
+        m_patchMemo.generation = m_generation;
+        m_patchMemo.infinite = m_infiniteDistance;
+        memcpy(m_patchMemo.input, uploaded, sizeof(m_patchMemo.input));
+        memcpy(m_patchMemo.left, outLeft, sizeof(m_patchMemo.left));
+        memcpy(m_patchMemo.right, outRight, sizeof(m_patchMemo.right));
+        m_patchMemoDecoded = decoded;
 
         ++m_patched;
         return true;
@@ -948,39 +997,55 @@ namespace wowvr
             return false;
         }
 
-        Mat4 inverseScene;
-        if (!Mat4Inverse(m_sceneMatrix, inverseScene))
+        if (m_combinedMemo.valid && m_combinedMemo.generation == m_generation
+            && m_combinedMemo.infinite == m_infiniteDistance
+            && memcmp(uploaded, m_combinedMemo.input, sizeof(m_combinedMemo.input)) == 0
+            && memcmp(&m_combinedMemoScene, &m_sceneMatrix, sizeof(Mat4)) == 0
+            && (m_combinedMemo.rigidChecked || !m_requireRigidResidual))
+        {
+            memcpy(outLeft, m_combinedMemo.left, sizeof(m_combinedMemo.left));
+            memcpy(outRight, m_combinedMemo.right, sizeof(m_combinedMemo.right));
+            ++m_patched;
+            ++m_combinedPatched;
+            ++m_combinedMemoHits;
+            return true;
+        }
+
+        const Mat4* inverseScenePtr = InverseScene();
+        if (inverseScenePtr == nullptr)
         {
             return false;
         }
+        const Mat4& inverseScene = *inverseScenePtr;
 
         // The upload may be either way round; whichever orientation leaves an affine
-        // residual is the right reading.
+        // residual is the right reading. That residual IS the world-view below, so it is
+        // kept rather than multiplied out a second time.
         const Mat4 asUploaded = MatrixFrom(uploaded);
-        const Mat4 transposed = Mat4Transpose(asUploaded);
 
-        Mat4 combined;
+        Mat4 worldView = Mat4Multiply(asUploaded, inverseScene);
         bool wasTransposed = false;
 
-        if (Mat4IsAffine(Mat4Multiply(asUploaded, inverseScene), 1.0e-3f))
+        if (!Mat4IsAffine(worldView, 1.0e-3f))
         {
-            combined = asUploaded;
-        }
-        else if (Mat4IsAffine(Mat4Multiply(transposed, inverseScene), 1.0e-3f))
-        {
-            combined = transposed;
+            worldView = Mat4Multiply(Mat4Transpose(asUploaded), inverseScene);
+            if (!Mat4IsAffine(worldView, 1.0e-3f))
+            {
+                ++m_combinedNotAffine;
+                return false;
+            }
             wasTransposed = true;
-        }
-        else
-        {
-            ++m_combinedNotAffine;
-            return false;
         }
 
         // Everything the game baked in ahead of the projection: world, view, and any
         // per-object placement. It is kept exactly as-is.
-        const Mat4 worldView = Mat4Multiply(combined, inverseScene);
-        NoteWorldView(worldView);
+        //
+        // The camera vote it feeds is statistics for the log and the camera finder;
+        // one residual in sixteen tells it the same thing at a sixteenth of the cost.
+        if ((++m_noteCalls & 15u) == 0)
+        {
+            NoteWorldView(worldView);
+        }
 
         // NOTE: rejecting an identity residual here (which is what the camera register
         // itself produces, since P * inverse(P) = I) was tried and is NOT correct as a
@@ -997,16 +1062,57 @@ namespace wowvr
 
         for (int eye = 0; eye < EyeCount; ++eye)
         {
-            const Mat4 eyeProjection = BuildEyeProjection(eye, m_sceneNear, m_sceneFar,
-                                                          m_sceneMatrix);
+            const Mat4& eyeProjection = CachedEyeProjection(eye, m_sceneNear, m_sceneFar,
+                                                            m_sceneMatrix);
             const Mat4 result = Mat4Multiply(worldView, eyeProjection);
             MatrixTo(wasTransposed ? Mat4Transpose(result) : result,
                      eye == EyeLeft ? outLeft : outRight);
         }
 
+        m_combinedMemo.valid = true;
+        m_combinedMemo.generation = m_generation;
+        m_combinedMemo.infinite = m_infiniteDistance;
+        m_combinedMemo.rigidChecked = m_requireRigidResidual;
+        memcpy(m_combinedMemo.input, uploaded, sizeof(m_combinedMemo.input));
+        memcpy(m_combinedMemo.left, outLeft, sizeof(m_combinedMemo.left));
+        memcpy(m_combinedMemo.right, outRight, sizeof(m_combinedMemo.right));
+        m_combinedMemoScene = m_sceneMatrix;
+
         ++m_patched;
         ++m_combinedPatched;
         return true;
+    }
+
+    const Mat4* ProjectionPatch::InverseScene()
+    {
+        if (!m_inverseSceneValid
+            || memcmp(&m_inverseSceneSource, &m_sceneMatrix, sizeof(Mat4)) != 0)
+        {
+            m_inverseSceneSource = m_sceneMatrix;
+            m_inverseSceneOk = Mat4Inverse(m_sceneMatrix, m_inverseScene);
+            m_inverseSceneValid = true;
+        }
+        return m_inverseSceneOk ? &m_inverseScene : nullptr;
+    }
+
+    const Mat4& ProjectionPatch::CachedEyeProjection(int eye, float nearPlane, float farPlane,
+                                                     const Mat4& original)
+    {
+        EyeCacheEntry& entry = m_eyeCache[eye & 1][m_infiniteDistance ? 1 : 0];
+        const float depth[4] = { original.m[2][2], original.m[3][2], original.m[2][3],
+                                 original.m[3][3] };
+        if (entry.generation != m_generation || entry.infinite != m_infiniteDistance
+            || entry.nearPlane != nearPlane || entry.farPlane != farPlane
+            || memcmp(entry.depth, depth, sizeof(depth)) != 0)
+        {
+            entry.matrix = BuildEyeProjection(eye, nearPlane, farPlane, original);
+            entry.generation = m_generation;
+            entry.infinite = m_infiniteDistance;
+            entry.nearPlane = nearPlane;
+            entry.farPlane = farPlane;
+            memcpy(entry.depth, depth, sizeof(depth));
+        }
+        return entry.matrix;
     }
 
     bool ProjectionPatch::TryPatchInverseDerived(const float* uploaded,
@@ -1073,6 +1179,9 @@ namespace wowvr
         WOWVR_INFO("Combined transform path: %llu offered, %llu rewritten, %llu skipped for "
                    "no scene camera yet, %llu rejected as not affine",
                    m_combinedTried, m_combinedPatched, m_combinedNoScene, m_combinedNotAffine);
+        WOWVR_INFO("Patch cache: %llu projection and %llu combined results reused unchanged "
+                   "(second eye of a draw, repeated uploads).", m_patchMemoHits,
+                   m_combinedMemoHits);
 
         WOWVR_INFO("Projection patch: %llu patched, %llu left alone. Last seen aspect %.4f "
                    "(scene aspect %.4f), near %.3f, far %.1f",

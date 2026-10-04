@@ -354,6 +354,91 @@ namespace wowvr
         return true;
     }
 
+    bool VrSession::ShowInterfaceOverlay(void* d3d11Texture, const float trackingToOverlay[3][4],
+                                         float widthMetres, float curvature, bool premultiplied)
+    {
+        if (!m_active || d3d11Texture == nullptr || m_overlayCreateFailed)
+        {
+            return false;
+        }
+        vr::IVROverlay* overlay = vr::VROverlay();
+        if (overlay == nullptr)
+        {
+            return false;
+        }
+
+        if (m_overlayHandle == vr::k_ulOverlayHandleInvalid)
+        {
+            vr::VROverlayHandle_t handle = vr::k_ulOverlayHandleInvalid;
+            const vr::EVROverlayError created =
+                overlay->CreateOverlay("wowvr.interface", "WoWVR Interface", &handle);
+            if (created != vr::VROverlayError_None)
+            {
+                m_overlayCreateFailed = true;
+                WOWVR_ERROR("Could not create the interface overlay (%s); the interface stays "
+                            "in the eye images.", overlay->GetOverlayErrorNameFromEnum(created));
+                return false;
+            }
+            m_overlayHandle = handle;
+            overlay->SetOverlayTexelAspect(handle, 1.0f);
+            WOWVR_INFO("Interface overlay created.");
+        }
+
+        const vr::VROverlayHandle_t handle = m_overlayHandle;
+        overlay->SetOverlayFlag(handle, vr::VROverlayFlags_IsPremultiplied, premultiplied);
+        overlay->SetOverlayWidthInMeters(handle, widthMetres);
+        overlay->SetOverlayCurvature(handle, curvature);
+
+        vr::HmdMatrix34_t pose = {};
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                pose.m[row][column] = trackingToOverlay[row][column];
+            }
+        }
+        overlay->SetOverlayTransformAbsolute(handle, vr::VRCompositor()->GetTrackingSpace(),
+                                             &pose);
+
+        vr::Texture_t texture = {};
+        texture.handle = d3d11Texture;
+        texture.eType = vr::TextureType_DirectX;
+        texture.eColorSpace = vr::ColorSpace_Gamma;
+        const vr::EVROverlayError error = overlay->SetOverlayTexture(handle, &texture);
+        if (static_cast<int>(error) != m_lastOverlayError)
+        {
+            m_lastOverlayError = static_cast<int>(error);
+            if (error != vr::VROverlayError_None)
+            {
+                WOWVR_ERROR("Interface overlay texture update failed (%s).",
+                            overlay->GetOverlayErrorNameFromEnum(error));
+            }
+        }
+
+        if (!m_overlayVisible)
+        {
+            overlay->ShowOverlay(handle);
+            m_overlayVisible = true;
+            WOWVR_INFO("Interface overlay shown: %.2f m wide, curvature %.3f.", widthMetres,
+                       curvature);
+        }
+        return error == vr::VROverlayError_None;
+    }
+
+    void VrSession::HideInterfaceOverlay()
+    {
+        if (!m_overlayVisible || m_overlayHandle == vr::k_ulOverlayHandleInvalid)
+        {
+            return;
+        }
+        if (vr::IVROverlay* overlay = vr::VROverlay())
+        {
+            overlay->HideOverlay(m_overlayHandle);
+        }
+        m_overlayVisible = false;
+        WOWVR_INFO("Interface overlay hidden.");
+    }
+
     void VrSession::PostSubmit()
     {
         if (!m_active)

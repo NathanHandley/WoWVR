@@ -281,6 +281,7 @@ namespace wowvr
             ReadFloat(path, L"Panel", L"MaxArcDegrees", config.panelMaxArcDegrees);
         config.panelWorldPointing =
             ReadBool(path, L"Panel", L"WorldPointing", config.panelWorldPointing);
+        config.panelOverlay = ReadBool(path, L"Panel", L"Overlay", config.panelOverlay);
         config.panelOpacity = ReadFloat(path, L"Panel", L"Opacity", config.panelOpacity);
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);

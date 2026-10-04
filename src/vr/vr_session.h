@@ -82,6 +82,20 @@ namespace wowvr
         bool SubmitEyeD3D12(int eye, void* textureData);
         void PostSubmit();
 
+        // The interface as a SteamVR overlay rather than geometry in the eye images.
+        // The compositor layers overlays on AFTER it has reprojected or motion-smoothed
+        // the scene, so a static interface over a moving world no longer confuses the
+        // motion estimate (the sideways smear), and it is sampled at full resolution.
+        //
+        // 'd3d11Texture' is an ID3D11Texture2D; 'trackingToOverlay' is the overlay's
+        // pose in the tracking space WaitGetPoses reports (row-major 3x4, columns X Y Z
+        // and position); the overlay faces +Z and is centred on that position. Created
+        // on first use. Safe from the presenter thread.
+        bool ShowInterfaceOverlay(void* d3d11Texture, const float trackingToOverlay[3][4],
+                                  float widthMetres, float curvature, bool premultiplied);
+        void HideInterfaceOverlay();
+        bool InterfaceOverlayFailed() const { return m_overlayCreateFailed; }
+
     private:
         bool SubmitTexture(int eye, const vr::Texture_t& texture,
                            const vr::VRTextureBounds_t* bounds,
@@ -101,6 +115,11 @@ namespace wowvr
         // Last compositor error seen, so that a change of state gets logged once
         // rather than every frame, and so recovery is visible rather than silent.
         int m_lastSubmitError = 0;
+
+        unsigned long long m_overlayHandle = 0;   // vr::VROverlayHandle_t
+        bool m_overlayCreateFailed = false;
+        bool m_overlayVisible = false;
+        int m_lastOverlayError = 0;
         unsigned long long m_submitErrorCount = 0;
     };
 

@@ -359,6 +359,13 @@ namespace wowvr
         // and which is widened for culling, so neither lines up with anything.
         bool panelWorldPointing = true;
 
+        // Show the interface as a SteamVR overlay instead of drawing it into the eye
+        // images. The compositor layers overlays on after reprojection and motion
+        // smoothing, so nothing seen through or past the panel smears when frames are
+        // synthesised, and the interface is sampled at full resolution. Costs one
+        // interface-sized readback a frame. Copy presenter only; 0 = in the eye images.
+        bool panelOverlay = true;
+
         float panelOpacity = 1.0f;
 
         // The pointer is drawn at the size the game uses, which is small seen through a

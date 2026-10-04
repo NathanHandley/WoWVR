@@ -50,6 +50,17 @@ namespace wowvr
         // The ID3D11Texture2D to hand to IVRCompositor::Submit.
         void* EyeTexture(int eye) const;
 
+        // The interface overlay's texture: created on first use at the given size (and
+        // recreated if it changes), filled from BGRA pixels the same way the eyes are.
+        bool UploadOverlay(const void* pixels, uint32_t sourceRowPitch, uint32_t width,
+                           uint32_t height);
+        void* OverlayTexture() const { return m_overlayTexture; }
+
+        // Diagnostic: writes the compositor's own final image of the left eye - scene
+        // plus overlays, exactly as the headset shows it - to a BMP. Only from the thread
+        // that owns the context (the inline path; dump frames always run inline).
+        bool DumpCompositorMirror(const wchar_t* path);
+
     private:
         void ReleaseTextures();
 
@@ -57,6 +68,10 @@ namespace wowvr
         ID3D11DeviceContext* m_context = nullptr;
         ID3D11Texture2D* m_eyeTexture[2] = {};
         ID3D11Texture2D* m_stagingTexture[2] = {};  // copy mode only
+        ID3D11Texture2D* m_overlayTexture = nullptr;
+        ID3D11Texture2D* m_overlayStaging = nullptr;
+        uint32_t m_overlayWidth = 0;
+        uint32_t m_overlayHeight = 0;
         bool m_adopted = false;
 
         uint32_t m_width = 0;

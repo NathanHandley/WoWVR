@@ -568,6 +568,10 @@ namespace wowvr
         // maps the mouse through the panel, so it must stand down whenever the
         // interface is anywhere else - a flat frame, a loading screen.
         bool g_panelCompositedLastFrame = false;
+
+        // The interface's readback for the SteamVR overlay (Config::panelOverlay): same
+        // size as the interface texture, pipelined like the eyes.
+        EyeTargets g_uiTarget;
         bool g_dumpMirrorNext = false;
 
         // Where the terrain shader's fog ramp reaches full fog, from its fog constants
@@ -1031,6 +1035,17 @@ namespace wowvr
             uint32_t pitch[EyeCount];
             bool stereo;
             HeadPoseStamp pose;
+
+            // The interface overlay: pixels to upload and show, or hide it.
+            const void* uiPixels;
+            uint32_t uiPitch;
+            uint32_t uiWidth;
+            uint32_t uiHeight;
+            float overlayPose[3][4];
+            float overlayWidth;
+            float overlayCurvature;
+            bool overlayPremultiplied;
+            bool hideOverlay;
         };
 
         PresenterJob g_presenterJob = {};
@@ -1046,6 +1061,25 @@ namespace wowvr
         volatile LONGLONG g_presenterUploadUs = 0;
         volatile LONGLONG g_presenterSubmitUs = 0;
         volatile LONG g_presenterSamples = 0;
+
+        // Uploads and shows the interface overlay, or hides it. On whichever thread owns
+        // the presenter's D3D11 context for this frame.
+        void ApplyInterfaceOverlay(const PresenterJob& job)
+        {
+            if (job.uiPixels != nullptr)
+            {
+                if (g_presenter.UploadOverlay(job.uiPixels, job.uiPitch, job.uiWidth, job.uiHeight))
+                {
+                    Vr().ShowInterfaceOverlay(g_presenter.OverlayTexture(), job.overlayPose,
+                                              job.overlayWidth, job.overlayCurvature,
+                                              job.overlayPremultiplied);
+                }
+            }
+            else if (job.hideOverlay)
+            {
+                Vr().HideInterfaceOverlay();
+            }
+        }
 
         void RunPresenterJob(const PresenterJob& job)
         {
@@ -1069,6 +1103,7 @@ namespace wowvr
                            job.stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
                            &job.pose);
             Vr().PostSubmit();
+            ApplyInterfaceOverlay(job);
             const LARGE_INTEGER submitEnd = Now();
 
             InterlockedExchangeAdd64(&g_presenterUploadUs,
@@ -1136,6 +1171,7 @@ namespace wowvr
             {
                 g_eyeTargets[eye].Unlock();
             }
+            g_uiTarget.Unlock();
         }
 
         // The per-frame version, which must never be able to freeze the game.
@@ -1186,6 +1222,7 @@ namespace wowvr
             {
                 g_eyeTargets[eye].Unlock();
             }
+            g_uiTarget.Unlock();
             return true;
         }
 
@@ -1356,6 +1393,7 @@ namespace wowvr
             {
                 g_eyeTargets[eye].Destroy();
             }
+            g_uiTarget.Destroy();
             g_stereo.Destroy();
             g_uiPanel.Destroy();
 
@@ -1521,6 +1559,12 @@ namespace wowvr
                 stereoReady = g_stereo.Create(device, width, height);
                 stereoReady = g_uiPanel.Create(device, g_backBufferWidth, g_backBufferHeight)
                               && stereoReady;
+                if (g_uiPanel.IsReady()
+                    && g_uiTarget.Create(device, g_uiPanel.Width(), g_uiPanel.Height(),
+                                         EyeTargets::KindCopy))
+                {
+                    g_uiTarget.SetPipelined(Cfg().pipelinedReadback);
+                }
 
                 if (g_realBackBuffer == nullptr)
                 {
@@ -2038,6 +2082,166 @@ namespace wowvr
             staging->Release();
         }
 
+        // The interface goes out as a SteamVR overlay when it is asked for and the frame
+        // is on the copy presenter (whose D3D11 device the overlay texture lives on).
+        bool OverlayModeActive()
+        {
+            return Cfg().panelOverlay && Vr().IsActive() && !Vr().InterfaceOverlayFailed()
+                && g_uiTarget.IsReady() && g_uiPanel.IsReady() && g_presenter.IsReady()
+                && !g_zeroCopyActive && !g_glInteropActive && !g_d3d12Active;
+        }
+
+        // The overlay's pose in tracking space: centred on the middle of the panel's arc,
+        // +Z back toward the cylinder's axis (the viewer), +Y up, +X to the viewer's
+        // right - the same placement the panel geometry and the pointing math use.
+        void BuildInterfaceOverlayPose(float out[3][4])
+        {
+            const PanelShape& shape = g_uiPanel.Shape();
+            const Vec3 outward = { sinf(shape.yaw), 0.0f, cosf(shape.yaw) };
+            const Vec3 middle = { shape.centre.x + outward.x * shape.radius, shape.centre.y,
+                                  shape.centre.z + outward.z * shape.radius };
+            const Vec3 position = Projection().BodyToStage(middle, true);
+            const Vec3 z = Projection().BodyToStage({ -outward.x, 0.0f, -outward.z }, false);
+            const Vec3 y = Projection().BodyToStage({ 0.0f, 1.0f, 0.0f }, false);
+            const Vec3 x = { y.y * z.z - y.z * z.y, y.z * z.x - y.x * z.z, y.x * z.y - y.y * z.x };
+            const Vec3 axes[3] = { x, y, z };
+            for (int column = 0; column < 3; ++column)
+            {
+                out[0][column] = axes[column].x;
+                out[1][column] = axes[column].y;
+                out[2][column] = axes[column].z;
+            }
+            out[0][3] = position.x;
+            out[1][3] = position.y;
+            out[2][3] = position.z;
+        }
+
+        struct ScreenVertex
+        {
+            float x;
+            float y;
+            float z;
+            float rhw;
+            float u;
+            float v;
+        };
+
+        // Draws a texture as a screen-space rectangle on whatever target is bound.
+        void DrawScreenRect(IDirect3DDevice9* device, IDirect3DBaseTexture9* texture, float left,
+                            float top, float right, float bottom)
+        {
+            // Half-pixel offset: D3D9 maps texel centres to pixel corners.
+            left -= 0.5f;
+            top -= 0.5f;
+            right -= 0.5f;
+            bottom -= 0.5f;
+            const ScreenVertex quad[4] = {
+                { left,  top,    0.0f, 1.0f, 0.0f, 0.0f },
+                { right, top,    0.0f, 1.0f, 1.0f, 0.0f },
+                { left,  bottom, 0.0f, 1.0f, 0.0f, 1.0f },
+                { right, bottom, 0.0f, 1.0f, 1.0f, 1.0f },
+            };
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZRHW | D3DFVF_TEX1);
+            device->SetTexture(0, texture);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(ScreenVertex));
+        }
+
+        // Overlay mode: the pointer is drawn into the interface texture itself, so the
+        // overlay shows it. Straight-alpha art over a premultiplied target: colour by
+        // source alpha, and alpha accumulated as premultiplied coverage.
+        void DrawCursorIntoInterface(IDirect3DDevice9* device)
+        {
+            float u = 0.0f;
+            float v = 0.0f;
+            float clientWidth = 0.0f;
+            float clientHeight = 0.0f;
+            const bool havePointer = CursorPanelPosition(u, v, clientWidth, clientHeight);
+            g_lastCursorU = havePointer ? u : -1.0f;
+            g_lastCursorV = havePointer ? v : -1.0f;
+            if (g_activeCursor == nullptr || !havePointer || !(clientWidth > 0.0f))
+            {
+                return;
+            }
+
+            const float width = static_cast<float>(g_uiPanel.Width());
+            const float height = static_cast<float>(g_uiPanel.Height());
+            g_originalSetRenderTarget(device, 0, g_uiPanel.Surface());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            D3DVIEWPORT9 viewport = {};
+            viewport.Width = g_uiPanel.Width();
+            viewport.Height = g_uiPanel.Height();
+            viewport.MaxZ = 1.0f;
+            g_originalSetViewport(device, &viewport);
+
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+            g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+
+            // Texture pixels per window pixel, times the size knob.
+            const float scale = (width / clientWidth) * Cfg().cursorScale;
+            const float left = u * width - g_activeCursor->hotspotX * scale;
+            const float top = v * height - g_activeCursor->hotspotY * scale;
+            DrawScreenRect(device, g_activeCursor->texture, left, top,
+                           left + g_activeCursor->width * scale,
+                           top + g_activeCursor->height * scale);
+            ++g_cursorDrawn;
+        }
+
+        // Overlay mode: the eye image no longer contains the interface, so the desktop
+        // mirror lays it over the copied eye flat, at window size.
+        void DrawInterfaceOnMirror(IDirect3DDevice9* device)
+        {
+            IDirect3DStateBlock9* saved = nullptr;
+            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &saved)))
+            {
+                saved = nullptr;
+            }
+            g_originalSetRenderTarget(device, 0, g_realBackBuffer);
+            g_originalSetDepthStencilSurface(device, nullptr);
+            D3DVIEWPORT9 viewport = {};
+            viewport.Width = g_backBufferWidth;
+            viewport.Height = g_backBufferHeight;
+            viewport.MaxZ = 1.0f;
+            g_originalSetViewport(device, &viewport);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND,
+                                     Cfg().premultipliedUi ? D3DBLEND_ONE : D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            DrawScreenRect(device, g_uiPanel.Texture(), 0.0f, 0.0f,
+                           static_cast<float>(g_backBufferWidth),
+                           static_cast<float>(g_backBufferHeight));
+            if (saved != nullptr)
+            {
+                saved->Apply();
+                saved->Release();
+            }
+        }
+
         void CompositeUiPanel(IDirect3DDevice9* device)
         {
             // The interface pass is over either way, so the alpha override has to come
@@ -2079,6 +2283,20 @@ namespace wowvr
 
             UpdateCursorConfinement();
             g_activeCursor = CurrentCursorArt(device);
+
+            // As a SteamVR overlay the panel is not drawn into the eyes at all; only the
+            // pointer has to be put into the interface image the overlay shows.
+            if (OverlayModeActive())
+            {
+                DrawCursorIntoInterface(device);
+                if (savedState != nullptr)
+                {
+                    savedState->Apply();
+                    savedState->Release();
+                }
+                g_originalSetRenderTarget(device, 0, g_realBackBuffer);
+                return;
+            }
 
             // The curved sheet as one triangle strip of upright slices. Enough slices
             // that the chord sag is far below a pixel: at the default 1.6 m radius and
@@ -2489,8 +2707,36 @@ namespace wowvr
 
             }
 
+            // The interface for the overlay: captured from this frame's interface texture
+            // (pointer included) and read back alongside the eyes.
+            const bool overlayFrame = !zeroCopy && OverlayModeActive() && g_panelCompositedLastFrame
+                && g_uiTarget.CaptureRegion(device, g_uiPanel.Surface(), nullptr);
+
             const LARGE_INTEGER uploadStart = Now();
             double lockMs = 0.0;
+
+            bool uiLocked = false;
+            if (overlayFrame)
+            {
+                const LARGE_INTEGER uiLockStart = Now();
+                uiLocked = g_uiTarget.Lock(dumpThisFrame);
+                lockMs += ElapsedMs(uiLockStart, Now());
+            }
+            PresenterJob overlayJob = {};
+            if (uiLocked)
+            {
+                overlayJob.uiPixels = g_uiTarget.LockedPixels();
+                overlayJob.uiPitch = g_uiTarget.LockedPitch();
+                overlayJob.uiWidth = g_uiTarget.Width();
+                overlayJob.uiHeight = g_uiTarget.Height();
+                BuildInterfaceOverlayPose(overlayJob.overlayPose);
+                overlayJob.overlayWidth = g_uiPanel.Shape().radius * g_uiPanel.Shape().arc;
+                overlayJob.overlayCurvature = g_uiPanel.Shape().arc / 6.28318530718f;
+                overlayJob.overlayPremultiplied = Cfg().premultipliedUi;
+            }
+            // Hidden whenever the interface is not going out as an overlay this frame
+            // and is not merely between captures: switched off, or a path without one.
+            overlayJob.hideOverlay = !uiLocked && !(OverlayModeActive() && overlayFrame);
 
             if (g_zeroCopyActive)
             {
@@ -2643,6 +2889,16 @@ namespace wowvr
                     g_presenterJob.stereo = stereo;
                     g_presenterJob.pose =
                         (renderPose != nullptr) ? *renderPose : HeadPoseStamp{};
+                    g_presenterJob.uiPixels = overlayJob.uiPixels;
+                    g_presenterJob.uiPitch = overlayJob.uiPitch;
+                    g_presenterJob.uiWidth = overlayJob.uiWidth;
+                    g_presenterJob.uiHeight = overlayJob.uiHeight;
+                    memcpy(g_presenterJob.overlayPose, overlayJob.overlayPose,
+                           sizeof(overlayJob.overlayPose));
+                    g_presenterJob.overlayWidth = overlayJob.overlayWidth;
+                    g_presenterJob.overlayCurvature = overlayJob.overlayCurvature;
+                    g_presenterJob.overlayPremultiplied = overlayJob.overlayPremultiplied;
+                    g_presenterJob.hideOverlay = overlayJob.hideOverlay;
                     ResetEvent(g_presenterDoneEvent);
                     SetEvent(g_presenterJobEvent);
                 }
@@ -2654,7 +2910,17 @@ namespace wowvr
                                    stereo ? g_presenter.EyeTexture(EyeRight) : leftTexture,
                                    renderPose);
                     Vr().PostSubmit();
+                    ApplyInterfaceOverlay(overlayJob);
+                    g_uiTarget.Unlock();
+                    if (dumpThisFrame)
+                    {
+                        g_presenter.DumpCompositorMirror(ModuleFile(L"WoWVR_compositor.bmp").c_str());
+                    }
                 }
+            }
+            if ((g_d3d12Active || g_glInteropActive) && overlayJob.hideOverlay)
+            {
+                Vr().HideInterfaceOverlay();
             }
             const LARGE_INTEGER submitEnd = Now();
 
@@ -2780,6 +3046,12 @@ namespace wowvr
                 }
             }
 
+            if (Cfg().desktopMirror && g_stereoHasContent && g_stereo.IsReady()
+                && OverlayModeActive() && g_panelCompositedLastFrame)
+            {
+                DrawInterfaceOnMirror(device);
+            }
+
             if (g_dumpMirrorNext)
             {
                 g_dumpMirrorNext = false;
@@ -2850,6 +3122,7 @@ namespace wowvr
             {
                 LoadConfig();
                 LogSetLevel(Cfg().logLevel);
+                Projection().InvalidateCaches();
                 WOWVR_INFO("F12: WoWVR.ini reloaded.");
             }
         }
