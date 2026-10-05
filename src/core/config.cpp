@@ -98,10 +98,12 @@ namespace wowvr
             L"; Seconds the Ctrl+Alt+F1 command-list hint shows at launch (0 = never).\r\n"
             L"LaunchHintSeconds=10\r\n"
             L"; In the world, a canvas this many times bigger each way around the same-sized\r\n"
-            L"; interface: more room for the mouse, chat, lifebars. 1 = off.\r\n"
+            L"; interface: more room for the mouse, chat, lifebars. 1 = off. While\r\n"
+            L"; Nameplates3D=1 the minimum is 1.25 (lower values are raised to 1.25).\r\n"
             L"CanvasScale=2\r\n"
             L"; 1 draws lifebars (V key) over each unit in 3D instead of on the interface.\r\n"
-            L"; Needs CanvasScale above 1.\r\n"
+            L"; This needs room outside the interface, so it raises CanvasScale to at least\r\n"
+            L"; 1.25. 0 puts lifebars back on the interface and allows CanvasScale=1.\r\n"
             L"Nameplates3D=1\r\n"
             L"\r\n"
             L"[Mirror]\r\n"
@@ -310,6 +312,12 @@ namespace wowvr
         if (!(config.panelCanvasScale >= 1.0f)) { config.panelCanvasScale = 1.0f; }
         if (config.panelCanvasScale > 3.0f) { config.panelCanvasScale = 3.0f; }
         config.nameplates3d = ReadBool(path, L"Panel", L"Nameplates3D", config.nameplates3d);
+        // 3D lifebars are drawn by the client into a hidden strip of the extra canvas
+        // below the interface; under 1.25 there is no room for it.
+        if (config.nameplates3d && config.panelCanvasScale < 1.25f)
+        {
+            config.panelCanvasScale = 1.25f;
+        }
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
         config.premultipliedUi =

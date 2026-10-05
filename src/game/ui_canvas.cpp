@@ -43,6 +43,29 @@ namespace wowvr
         // new base and the layout is rebuilt from it.
         const char* const kApplyLua =
             "if InCombatLockdown() then return end "
+            // Bags placed as if UIParent were the whole screen. MoveAnything's replacement
+            // for the bag layout anchors bags GetScreenWidth() from UIParent's LEFT edge,
+            // which on the wider canvas is past its right edge. Every bag frame's SetPoint
+            // is hooked, so whoever places a bag, the correction happens in that same call,
+            // before the bag is ever drawn. WOWVR_FIXBAG moves a bag only when it reaches
+            // past UIParent's right edge, and by exactly the extra width, so its own
+            // SetPoint (which comes back through the hook) changes nothing more. The whole
+            // set is also checked on every pass of this script as a backstop.
+            "if not WOWVR_FIXBAG then "
+            "  WOWVR_FIXBAG=function(c) "
+            "    if WOWVR_FIXING or not c:IsShown() then return end "
+            "    local u=UIParent local d=GetScreenWidth()-u:GetWidth() if d<1 then return end "
+            "    local p,r,rp,x,y=c:GetPoint(1) "
+            "    if p~='BOTTOMLEFT' or r~=u or rp~='BOTTOMLEFT' or not x then return end "
+            "    local k=u:GetEffectiveScale()/c:GetEffectiveScale() "
+            "    if x+c:GetWidth()>u:GetWidth()*k+1 then "
+            "      WOWVR_FIXING=1 c:SetPoint(p,r,rp,x-d*k,y) WOWVR_FIXING=nil end end "
+            "  WOWVR_FIXBAGS=function() for i=1,(NUM_CONTAINER_FRAMES or 13) do "
+            "    local c=_G['ContainerFrame'..i] if c then WOWVR_FIXBAG(c) end end end "
+            "  for i=1,(NUM_CONTAINER_FRAMES or 13) do local c=_G['ContainerFrame'..i] "
+            "    if c then hooksecurefunc(c,'SetPoint',WOWVR_FIXBAG) "
+            "      c:HookScript('OnShow',WOWVR_FIXBAG) end end end "
+            "WOWVR_FIXBAGS() "
             "local f=%.4f "
             "local u=UIParent "
             "local s=u:GetScale() "
@@ -58,7 +81,8 @@ namespace wowvr
             "u:ClearAllPoints() "
             "u:SetPoint('CENTER',WorldFrame,'CENTER') "
             "u:SetWidth(W/base) u:SetHeight(H/base) "
-            "WOWVR_CANVAS_BASE=base WOWVR_CANVAS_F=f WOWVR_CANVAS_SCALE=u:GetScale()";
+            "WOWVR_CANVAS_BASE=base WOWVR_CANVAS_F=f WOWVR_CANVAS_SCALE=u:GetScale() "
+            "if updateContainerFrameAnchors then updateContainerFrameAnchors() end";
 
         const char* const kRestoreLua =
             "if InCombatLockdown() or not WOWVR_CANVAS_SCALE then return end "
@@ -165,7 +189,7 @@ namespace wowvr
 
         if (wanted > 1.0f)
         {
-            char code[1400];
+            char code[4096];
             sprintf_s(code, kApplyLua, wanted);
             if (Run(code))
             {

@@ -23,7 +23,8 @@ In the world the interface sits on a canvas twice as wide and tall as the screen
 frames, lifebars and chat bubbles.
 
 Lifebars (the V key) are drawn over each unit in the world at its own distance rather than on the
-interface (`[Panel] Nameplates3D`, needs `CanvasScale` above 1). They can't be clicked to target.
+interface (`[Panel] Nameplates3D`; while it's on, `CanvasScale` is at least 1.25). They can't be clicked to
+target.
 
 ALT + CTRL + PAGE UP / PAGE DOWN pushes the interface farther away / pulls it closer (hold to keep
 moving; the distance is saved to WoWVR.ini)

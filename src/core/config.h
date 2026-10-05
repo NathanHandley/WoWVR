@@ -401,7 +401,8 @@ namespace wowvr
         // Lifebars (nameplates, the V key) drawn over each unit in the world, at the
         // unit's own distance, instead of on the interface. Needs CanvasScale above 1:
         // the client draws them into a hidden strip along the bottom of the extra
-        // canvas, which is cut out and laid over the units.
+        // canvas, which is cut out and laid over the units. While on, CanvasScale is
+        // raised to at least 1.25 (LoadConfig).
         bool nameplates3d = true;
 
         // The pointer is drawn at the size the game uses, which is small seen through a
