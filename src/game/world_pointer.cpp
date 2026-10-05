@@ -1,8 +1,10 @@
 #include "game/world_pointer.h"
 
 #include "core/log.h"
+#include "game/ui_canvas.h"
 
 #include <windows.h>
+#include <intrin.h>
 
 #include <cmath>
 #include <cstdint>
@@ -57,6 +59,13 @@ namespace wowvr
         const uintptr_t kCamNear = 0x38u;
         const uintptr_t kCamFar = 0x3Cu;
 
+        // Where 0x00715720 (world-anchored frames: nameplates, chat bubbles) returns
+        // to after calling GetScreenCoordinates at 0x0071574A.
+        const uintptr_t kWorldAnchorReturnRva = 0x0071574Fu - kPublishedImageBase;
+        // Where the chat bubble update (0x0056C340) returns to after its own call at
+        // 0x0056C3BE. Bubbles hang off WorldFrame too, and are placed the same way.
+        const uintptr_t kChatBubbleReturnRva = 0x0056C3C3u - kPublishedImageBase;
+
         typedef void(__cdecl* ScreenToRayFn)(float nx, float ny, float* start, float* end);
 
         // thiscall mirrored as fastcall with a dummy edx: the callee pops its three
@@ -78,6 +87,24 @@ namespace wowvr
             pointing::Frame frame;
         };
         State g_state;
+
+        // Lifebars in the world: the strip layout and this frame's plates.
+        struct PlateStrip
+        {
+            bool on = false;
+            float topV = 0.0f;
+            float cellU = 0.0f;
+            float cellV = 0.0f;
+            int columns = 0;
+            int rows = 0;
+            float anchorV = 0.5f;
+        };
+        PlateStrip g_strip;
+        const int kMaxPlates = 64;
+        WorldPlate g_plates[kMaxPlates];
+        Vec3 g_plateWorld[kMaxPlates];
+        int g_plateCount = 0;
+        unsigned long long g_platesDropped = 0;
 
         // Diagnostics, all on the one thread.
         unsigned long long g_rayCalls = 0;
@@ -385,6 +412,54 @@ namespace wowvr
                 return 0u;
             }
 
+            // Lifebars in the world: this one goes to a strip cell; where its unit really
+            // is gets remembered for the 3D pass. The same point asked for twice in a
+            // frame keeps its cell.
+            const void* caller = _ReturnAddress();
+            const bool plateCall =
+                caller == reinterpret_cast<void*>(ImageBase() + kWorldAnchorReturnRva);
+            if (plateCall && g_strip.on)
+            {
+                // The client asks for every lifebar candidate before applying its own
+                // range limit (about 41 yards, 0x0072B2DB on), so units far beyond it
+                // come through here too. They would never show; they must not take cells
+                // a real lifebar needs.
+                if (distanceYards > 60.0f)
+                {
+                    return 0u;
+                }
+                int slot = -1;
+                for (int i = 0; i < g_plateCount; ++i)
+                {
+                    if (g_plateWorld[i].x == target.x && g_plateWorld[i].y == target.y
+                        && g_plateWorld[i].z == target.z)
+                    {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot < 0)
+                {
+                    if (g_plateCount >= kMaxPlates || g_plateCount >= g_strip.columns * g_strip.rows)
+                    {
+                        ++g_platesDropped;
+                        return 0u;
+                    }
+                    slot = g_plateCount++;
+                    g_plateWorld[slot] = target;
+                    WorldPlate& plate = g_plates[slot];
+                    Vec3 body;
+                    pointing::WorldToBody(g_state.frame, camera, target, body);
+                    plate.body = body;
+                    plate.distanceMetres = distanceYards / g_state.frame.unitsPerMetre;
+                    plate.slotU = (static_cast<float>(slot % g_strip.columns) + 0.5f) * g_strip.cellU;
+                    plate.slotV = g_strip.topV
+                                + (static_cast<float>(slot / g_strip.columns) + g_strip.anchorV) * g_strip.cellV;
+                }
+                u = g_plates[slot].slotU;
+                v = g_plates[slot].slotV;
+            }
+
             // The panel IS the screen: u across it, v down it. The client's scaling
             // from there on is reproduced as-is (0x004F6E22 onwards).
             const float x01 = u;
@@ -394,8 +469,26 @@ namespace wowvr
             if (frameRect[1] < 0.0f) { x -= frameRect[1]; }
             if (frameRect[0] < 0.0f) { y -= frameRect[0]; }
 
-            out[0] = x;
-            out[1] = y;
+
+            // Frames anchored to a world position - lifebars (nameplates), placed by
+            // 0x00715720, and chat bubbles, by 0x0056C340 - hand this point to their
+            // frame without allowing for WorldFrame's scale. On the stretched interface canvas
+            // (game/ui_canvas.h) WorldFrame is scaled down by the canvas factor, so they
+            // would land that much closer to the corner; scaled up here, they sit where
+            // the point really is. Only for those two callers: picking, world text and the rest
+            // want the true point. The on-screen test below stays on the true point.
+            float placeX = x;
+            float placeY = y;
+            const float canvas = Canvas().PanelScale();
+            if (canvas > 1.0f
+                && (caller == reinterpret_cast<void*>(ImageBase() + kWorldAnchorReturnRva)
+                    || caller == reinterpret_cast<void*>(ImageBase() + kChatBubbleReturnRva)))
+            {
+                placeX = x * canvas;
+                placeY = y * canvas;
+            }
+            out[0] = placeX;
+            out[1] = placeY;
             // Depth: the client hands back the camera-space depth here. Distance from
             // the head along the line actually looked down is the same quantity for a
             // headset, and stays meaningful for things beside or behind the camera.
@@ -555,6 +648,38 @@ namespace wowvr
                          && g_worldToScreenOriginal != nullptr;
     }
 
+    void WorldPointer::SetPlateStrip(bool on, float stripTopV, float cellU, float cellV,
+                                     int columns, int rows, float anchorV)
+    {
+        g_strip.anchorV = anchorV;
+        g_strip.on = on && columns > 0 && rows > 0 && cellU > 0.0f && cellV > 0.0f;
+        g_strip.topV = stripTopV;
+        g_strip.cellU = cellU;
+        g_strip.cellV = cellV;
+        g_strip.columns = columns;
+        g_strip.rows = rows;
+    }
+
+    bool WorldPointer::PlateStripOn() const
+    {
+        return g_strip.on && g_state.active;
+    }
+
+    int WorldPointer::PlateCount() const
+    {
+        return g_plateCount;
+    }
+
+    const WorldPlate& WorldPointer::Plate(int index) const
+    {
+        return g_plates[index];
+    }
+
+    void WorldPointer::BeginPlateFrame()
+    {
+        g_plateCount = 0;
+    }
+
     void WorldPointer::Deactivate()
     {
         g_state.active = false;
@@ -603,6 +728,17 @@ namespace wowvr
             direction = ViewToWorldDirection(
                 camera, Mat4TransformDirection(body, frame.bodyToGameView));
             return true;
+        }
+
+        void WorldToBody(const Frame& frame, const CameraBasis& camera, const Vec3& world,
+                         Vec3& body)
+        {
+            const Vec3 relative = { world.x - camera.position.x, world.y - camera.position.y,
+                                    world.z - camera.position.z };
+            const Vec3 viewYards = WorldToViewDirection(camera, relative);
+            const Vec3 bodyYards = Mat4TransformDirection(viewYards, frame.gameViewToBody);
+            const float upm = frame.unitsPerMetre;
+            body = { bodyYards.x / upm, bodyYards.y / upm, bodyYards.z / upm };
         }
 
         bool WorldToPanel(const Frame& frame, const CameraBasis& camera, const Vec3& world,

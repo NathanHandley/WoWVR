@@ -391,6 +391,19 @@ namespace wowvr
         // headset. 0 never shows it.
         float launchHintSeconds = 10.0f;
 
+        // How much bigger the interface canvas is in the headset, in each direction,
+        // without anything on it getting bigger: action bars, minimap, chat and unit
+        // frames stay exactly where and as big as they were, and the space around them
+        // is new room for the mouse, dragged frames, lifebars and chat bubbles. 1 is
+        // off. Costs interface sharpness (fewer pixels per degree), not frame rate.
+        float panelCanvasScale = 2.0f;
+
+        // Lifebars (nameplates, the V key) drawn over each unit in the world, at the
+        // unit's own distance, instead of on the interface. Needs CanvasScale above 1:
+        // the client draws them into a hidden strip along the bottom of the extra
+        // canvas, which is cut out and laid over the units.
+        bool nameplates3d = true;
+
         // The pointer is drawn at the size the game uses, which is small seen through a
         // headset. This multiplies it without touching where it actually points.
         float cursorScale = 1.5f;

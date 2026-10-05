@@ -13,6 +13,7 @@
 #include "game/view_distance.h"
 #include "game/portrait_fix.h"
 #include "ui/help_card.h"
+#include "game/ui_canvas.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
@@ -1033,6 +1034,24 @@ namespace wowvr
         };
         FramePacing g_pacing;
 
+        // Lifebars in the world (Nameplates3D): the strip's layout and the texture it is
+        // cut into. See DrawWorldPlates.
+        IDirect3DTexture9* g_plateTexture = nullptr;
+        IDirect3DSurface9* g_plateSurface = nullptr;
+        uint32_t g_plateTextureWidth = 0;
+        uint32_t g_plateTextureHeight = 0;
+        RECT g_plateStripRect = {};
+        bool g_plateStripActive = false;
+        float g_plateCellU = 0.0f;
+        float g_plateCellV = 0.0f;
+        float g_plateStripTopV = 0.0f;
+        float g_plateStripHeightV = 0.0f;
+        unsigned long long g_platesDrawn = 0;
+        // How far down its cell a lifebar's anchor is put. The client hangs the lifebar
+        // below its anchor (measured: name and bar span about the next 45 px at 1.5x),
+        // so near the top leaves room under it for a cast bar.
+        const float kPlateAnchorV = 0.15f;
+
         // The adaptive half-rate governor's inputs and state. 'Work' is a frame's
         // Present-to-Present interval minus the time spent idle in WaitGetPoses, i.e.
         // how long the frame would take if the compositor never held it back. That
@@ -1441,6 +1460,14 @@ namespace wowvr
                 Vr().LogCompositorStats();
             }
             Vr().RefreshDisplayFrequency();
+            WOWVR_INFO("Lifebars in the world: strip %s (%ld rows of cells %.0fx%.0f px), %llu "
+                       "lifebar cards drawn since the last report.",
+                       g_plateStripActive ? "on" : "off",
+                       g_plateStripActive ? static_cast<long>(g_plateStripHeightV / (g_plateCellV > 0 ? g_plateCellV : 1)) : 0L,
+                       g_plateCellU * static_cast<float>(g_uiPanel.Width()),
+                       g_plateCellV * static_cast<float>(g_uiPanel.Height()), g_platesDrawn);
+            g_platesDrawn = 0;
+
             WOWVR_INFO("Frame rate mode: %s, %llu switches so far.",
                        Vr().HalfRate() ? "half rate" : "full rate", g_halfRate.switches);
 
@@ -1587,6 +1614,8 @@ namespace wowvr
             g_drawsStrayBackBuffer = 0;
         }
 
+        void ReleasePlateTexture();
+
         void ReleaseFrameResources()
         {
             // The presenter thread may still be uploading into textures about to
@@ -1609,6 +1638,7 @@ namespace wowvr
             g_uiTarget.Destroy();
             g_stereo.Destroy();
             g_uiPanel.Destroy();
+            ReleasePlateTexture();
 
             if (g_frameSyncQuery != nullptr)
             {
@@ -1808,6 +1838,275 @@ namespace wowvr
             float u;
             float v;
         };
+
+        // Lifebars in the world (Nameplates3D). The client draws each one into a cell of
+        // a strip along the bottom of the interface image (game/world_pointer); at the
+        // end of the interface pass that strip is copied here and cleared from the
+        // interface, and each cell is drawn over its unit in both eyes.
+
+        // DEBUG ("platedump"): the interface image and the lifebar strip, as BMPs.
+        bool g_plateDumpNext = false;
+
+        void DumpSurfaceBmp(IDirect3DDevice9* device, IDirect3DSurface9* surface, const wchar_t* name)
+        {
+            D3DSURFACE_DESC desc = {};
+            if (surface == nullptr || FAILED(surface->GetDesc(&desc)))
+            {
+                return;
+            }
+            IDirect3DSurface9* copy = nullptr;
+            IDirect3DSurface9* staging = nullptr;
+            HRESULT hr = device->CreateRenderTarget(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
+                                                    D3DMULTISAMPLE_NONE, 0, FALSE, &copy, nullptr);
+            if (SUCCEEDED(hr)) { hr = device->StretchRect(surface, nullptr, copy, nullptr, D3DTEXF_NONE); }
+            if (SUCCEEDED(hr))
+            {
+                hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
+                                                         D3DPOOL_SYSTEMMEM, &staging, nullptr);
+            }
+            if (SUCCEEDED(hr)) { hr = device->GetRenderTargetData(copy, staging); }
+            D3DLOCKED_RECT locked = {};
+            if (SUCCEEDED(hr) && SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+            {
+                SaveBgraBmp(ModuleFile(name).c_str(), locked.pBits, desc.Width, desc.Height,
+                            static_cast<uint32_t>(locked.Pitch));
+                staging->UnlockRect();
+                WOWVR_INFO("platedump: %ls written (%ux%u).", name, desc.Width, desc.Height);
+            }
+            else
+            {
+                WOWVR_WARN("platedump: %ls failed (0x%08lx).", name, hr);
+            }
+            if (staging != nullptr) { staging->Release(); }
+            if (copy != nullptr) { copy->Release(); }
+        }
+
+        void ReleasePlateTexture()
+        {
+            if (g_plateSurface != nullptr) { g_plateSurface->Release(); g_plateSurface = nullptr; }
+            if (g_plateTexture != nullptr) { g_plateTexture->Release(); g_plateTexture = nullptr; }
+            g_plateTextureWidth = 0;
+            g_plateTextureHeight = 0;
+        }
+
+        // The strip's layout for this frame, from the canvas: it lives in the band of
+        // extra canvas below the client's interface, so nothing anyone placed is lost.
+        void UpdatePlateStrip()
+        {
+            g_plateStripActive = false;
+            const float canvas = Canvas().PanelScale();
+            const uint32_t width = g_uiPanel.Width();
+            const uint32_t height = g_uiPanel.Height();
+            if (!Cfg().nameplates3d || !(canvas > 1.05f) || width == 0 || height == 0)
+            {
+                Pointer().SetPlateStrip(false, 0.0f, 0.0f, 0.0f, 0, 0, 0.0f);
+                return;
+            }
+            // Lifebars hang off WorldFrame, drawn at 1/canvas: their cell shrinks with it.
+            const float cellPixelsX = floorf(330.0f / canvas);
+            const float cellPixelsY = floorf(150.0f / canvas);
+            const float bandPixels = static_cast<float>(height) * (1.0f - 1.0f / canvas) * 0.5f;
+            int rows = static_cast<int>((bandPixels - 4.0f) / cellPixelsY);
+            if (rows > 3) { rows = 3; }
+            const int columns = static_cast<int>(static_cast<float>(width) / cellPixelsX);
+            if (rows < 1 || columns < 1)
+            {
+                Pointer().SetPlateStrip(false, 0.0f, 0.0f, 0.0f, 0, 0, 0.0f);
+                return;
+            }
+            const float stripPixels = cellPixelsY * static_cast<float>(rows);
+            g_plateStripRect.left = 0;
+            g_plateStripRect.right = static_cast<LONG>(width);
+            g_plateStripRect.bottom = static_cast<LONG>(height);
+            g_plateStripRect.top = static_cast<LONG>(static_cast<float>(height) - stripPixels);
+            g_plateCellU = cellPixelsX / static_cast<float>(width);
+            g_plateCellV = cellPixelsY / static_cast<float>(height);
+            g_plateStripTopV = static_cast<float>(g_plateStripRect.top) / static_cast<float>(height);
+            g_plateStripHeightV = stripPixels / static_cast<float>(height);
+            Pointer().SetPlateStrip(true, g_plateStripTopV, g_plateCellU, g_plateCellV, columns, rows,
+                                    kPlateAnchorV);
+            g_plateStripActive = Pointer().PlateStripOn();
+        }
+
+        // End of the interface pass: the strip, out of the interface and into its own
+        // texture. Cleared even when no lifebar was placed, so the band is never shown.
+        bool CapturePlateStrip(IDirect3DDevice9* device)
+        {
+            if (!g_plateStripActive || !g_uiPanel.IsReady())
+            {
+                return false;
+            }
+            const uint32_t width = static_cast<uint32_t>(g_plateStripRect.right - g_plateStripRect.left);
+            const uint32_t height = static_cast<uint32_t>(g_plateStripRect.bottom - g_plateStripRect.top);
+            if (g_plateTexture == nullptr || g_plateTextureWidth != width || g_plateTextureHeight != height)
+            {
+                ReleasePlateTexture();
+                if (FAILED(device->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
+                                                 D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_plateTexture,
+                                                 nullptr))
+                    || FAILED(g_plateTexture->GetSurfaceLevel(0, &g_plateSurface)))
+                {
+                    ReleasePlateTexture();
+                    return false;
+                }
+                g_plateTextureWidth = width;
+                g_plateTextureHeight = height;
+            }
+            IDirect3DSurface9* panel = g_uiPanel.Surface();
+            if (g_plateDumpNext)
+            {
+                DumpSurfaceBmp(device, panel, L"WoWVR_platedump_interface.bmp");
+            }
+            const bool copied = Pointer().PlateCount() > 0
+                && SUCCEEDED(device->StretchRect(panel, &g_plateStripRect, g_plateSurface, nullptr,
+                                                 D3DTEXF_NONE));
+            device->ColorFill(panel, &g_plateStripRect, D3DCOLOR_ARGB(0, 0, 0, 0));
+            if (g_plateDumpNext)
+            {
+                g_plateDumpNext = false;
+                DumpSurfaceBmp(device, g_plateSurface, L"WoWVR_platedump_strip.bmp");
+                WOWVR_INFO("platedump: %d lifebars this frame; first slot u %.3f v %.3f, body "
+                           "(%.2f %.2f %.2f) %.1f m.", Pointer().PlateCount(),
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).slotU : -1.0f,
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).slotV : -1.0f,
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).body.x : 0.0f,
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).body.y : 0.0f,
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).body.z : 0.0f,
+                           Pointer().PlateCount() > 0 ? Pointer().Plate(0).distanceMetres : 0.0f);
+            }
+            return copied;
+        }
+
+        // Each captured lifebar as a small upright card over its unit, facing the head,
+        // in both eyes. The same angular size it had on the interface, so it reads the
+        // same at any distance; the depth is the unit's own. No depth test - the client's
+        // lifebars show through walls too. Furthest first.
+        void DrawWorldPlates(IDirect3DDevice9* device)
+        {
+            const int count = Pointer().PlateCount();
+            if (count <= 0 || g_plateTexture == nullptr)
+            {
+                return;
+            }
+            int order[64];
+            int n = 0;
+            for (int i = 0; i < count && n < 64; ++i) { order[n++] = i; }
+            for (int i = 1; i < n; ++i)
+            {
+                const int key = order[i];
+                int j = i - 1;
+                while (j >= 0 && Pointer().Plate(order[j]).distanceMetres
+                                     < Pointer().Plate(key).distanceMetres)
+                {
+                    order[j + 1] = order[j];
+                    --j;
+                }
+                order[j + 1] = key;
+            }
+
+            const PanelShape& shape = g_uiPanel.Shape();
+            const Vec3 head = Projection().HeadOffsetMetres();
+            const float cellWidthPixels = g_plateCellU * static_cast<float>(g_uiPanel.Width());
+            const float cellHeightPixels = g_plateCellV * static_cast<float>(g_uiPanel.Height());
+
+            static PanelVertex quads[64 * 6];
+            int vertices = 0;
+            for (int k = 0; k < n; ++k)
+            {
+                const WorldPlate& plate = Pointer().Plate(order[k]);
+                Vec3 toHead = { head.x - plate.body.x, 0.0f, head.z - plate.body.z };
+                const float flat = sqrtf(toHead.x * toHead.x + toHead.z * toHead.z);
+                if (!(flat > 1.0e-3f))
+                {
+                    continue;
+                }
+                toHead.x /= flat;
+                toHead.z /= flat;
+                const Vec3 right = { -toHead.z, 0.0f, toHead.x };
+                // Metres per texel at the unit's distance, for the panel's angular size.
+                const float perPixel = shape.metresPerPixel * plate.distanceMetres
+                                     / (shape.radius > 0.1f ? shape.radius : 0.1f);
+                const float halfW = 0.5f * cellWidthPixels * perPixel;
+                // The anchor row of the cell sits on the unit's point; the rest of the
+                // cell hangs below it, as the lifebar hangs below its anchor.
+                const float above = kPlateAnchorV * cellHeightPixels * perPixel;
+                const float below = (1.0f - kPlateAnchorV) * cellHeightPixels * perPixel;
+                const float cellTopV = plate.slotV - kPlateAnchorV * g_plateCellV;
+                const float u0 = plate.slotU - 0.5f * g_plateCellU;
+                const float u1 = plate.slotU + 0.5f * g_plateCellU;
+                const float v0 = (cellTopV - g_plateStripTopV) / g_plateStripHeightV;
+                const float v1 = (cellTopV + g_plateCellV - g_plateStripTopV) / g_plateStripHeightV;
+                const Vec3 c = plate.body;
+                const PanelVertex tl = { c.x - right.x * halfW, c.y + above, c.z - right.z * halfW, u0, v0 };
+                const PanelVertex tr = { c.x + right.x * halfW, c.y + above, c.z + right.z * halfW, u1, v0 };
+                const PanelVertex bl = { c.x - right.x * halfW, c.y - below, c.z - right.z * halfW, u0, v1 };
+                const PanelVertex br = { c.x + right.x * halfW, c.y - below, c.z + right.z * halfW, u1, v1 };
+                quads[vertices++] = tl; quads[vertices++] = tr; quads[vertices++] = bl;
+                quads[vertices++] = tr; quads[vertices++] = br; quads[vertices++] = bl;
+            }
+            if (vertices == 0)
+            {
+                return;
+            }
+
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZ | D3DFVF_TEX1);
+            device->SetTexture(0, g_plateTexture);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND,
+                                     Cfg().premultipliedUi ? D3DBLEND_ONE : D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            const Mat4 identity = Mat4Identity();
+            g_originalSetTransform(device, D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&identity));
+
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                D3DVIEWPORT9 viewport = {};
+                viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
+                viewport.Width = g_stereo.EyeWidth();
+                viewport.Height = g_stereo.EyeHeight();
+                viewport.MaxZ = 1.0f;
+                g_originalSetViewport(device, &viewport);
+
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+                const Mat4 projection = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                                0.05f, 2000.0f);
+                g_originalSetTransform(device, D3DTS_PROJECTION,
+                                       reinterpret_cast<const D3DMATRIX*>(&projection));
+                const Vec3 openVrOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
+                const Vec3 eyeOffset = { openVrOffset.x, openVrOffset.y, -openVrOffset.z };
+                const Mat4 world = UiPanel::BodyToEye(Projection().HeadRotation(),
+                                                      Projection().HeadOffsetMetres(), eyeOffset);
+                g_originalSetTransform(device, D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&world));
+                g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, static_cast<UINT>(vertices / 3),
+                                          quads, sizeof(PanelVertex));
+            }
+            g_platesDrawn += static_cast<unsigned long long>(vertices / 6);
+        }
 
         // Upright slices the curved interface sheet is drawn with.
         const int kPanelSlices = 96;
@@ -2426,7 +2725,7 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
 
             // Texture pixels per window pixel, times the size knob.
-            const float scale = (width / clientWidth) * Cfg().cursorScale;
+            const float scale = (width / clientWidth) * Cfg().cursorScale / Canvas().PanelScale();
             const float left = u * width - g_activeCursor->hotspotX * scale;
             const float top = v * height - g_activeCursor->hotspotY * scale;
             DrawScreenRect(device, g_activeCursor->texture, left, top,
@@ -2491,8 +2790,8 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
             g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
 
-            const float cardWidth = static_cast<float>(textCard.Width());
-            const float cardHeight = static_cast<float>(textCard.Height());
+            const float cardWidth = static_cast<float>(textCard.Width()) / Canvas().PanelScale();
+            const float cardHeight = static_cast<float>(textCard.Height()) / Canvas().PanelScale();
             if (left < 0.0f)
             {
                 left = floorf((width - cardWidth) * 0.5f);
@@ -2546,9 +2845,15 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_SRCBLEND,
                                      Cfg().premultipliedUi ? D3DBLEND_ONE : D3DBLEND_SRCALPHA);
             g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            DrawScreenRect(device, g_uiPanel.Texture(), 0.0f, 0.0f,
-                           static_cast<float>(g_backBufferWidth),
-                           static_cast<float>(g_backBufferHeight));
+            // On a stretched canvas (game/ui_canvas.h) the interface is drawn smaller in
+            // the middle of its image; magnified about the centre here, the desktop shows
+            // it at its usual size, the extra canvas running off the window's edges.
+            const float canvas = Canvas().PanelScale();
+            const float w = static_cast<float>(g_backBufferWidth);
+            const float h = static_cast<float>(g_backBufferHeight);
+            const float grow = (canvas - 1.0f) * 0.5f;
+            DrawScreenRect(device, g_uiPanel.Texture(), -w * grow, -h * grow,
+                           w * (1.0f + grow), h * (1.0f + grow));
             if (saved != nullptr)
             {
                 saved->Apply();
@@ -2598,10 +2903,15 @@ namespace wowvr
             UpdateCursorConfinement();
             g_activeCursor = CurrentCursorArt(device);
 
+            // The lifebars' strip, out of the interface before anything reads it.
+            CapturePlateStrip(device);
+
             // As a SteamVR overlay the panel is not drawn into the eyes at all; only the
             // pointer has to be put into the interface image the overlay shows.
             if (OverlayModeActive())
             {
+                // Into the eyes (the overlay goes on top of them in the compositor).
+                DrawWorldPlates(device);
                 DrawHelpIntoInterface(device);
                 DrawCursorIntoInterface(device);
                 if (savedState != nullptr)
@@ -2612,6 +2922,11 @@ namespace wowvr
                 g_originalSetRenderTarget(device, 0, g_realBackBuffer);
                 return;
             }
+
+            // Lifebars first, so the interface sheet lies over them.
+            DrawWorldPlates(device);
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
 
             // Into the interface image before the sheet samples it; then back onto the
             // stereo target the sheet is drawn into.
@@ -2729,7 +3044,7 @@ namespace wowvr
                     // Metres per game pixel, so the pointer covers the same fraction of
                     // the interface here as it does on the desktop. Scale is on a knob
                     // because a 32-pixel cursor at true size is small through a headset.
-                    const float scale = Cfg().cursorScale;
+                    const float scale = Cfg().cursorScale / Canvas().PanelScale();
                     const float pixel = shape.metresPerPixel
                                       * (static_cast<float>(g_uiPanel.Width()) / clientWidth)
                                       * scale;
@@ -3670,6 +3985,11 @@ namespace wowvr
                 {
                     Projection().UpdateFromHeadPose(Vr().HeadToStage());
 
+                    // The interface canvas first: the geometry below follows whether its
+                    // layout is in force this frame.
+                    Canvas().Install();
+                    Canvas().Update(Cfg().panelCanvasScale);
+
                     // The panel no longer follows the head; it only picks up INI changes
                     // to its size here. It moves when Ctrl+Alt+F8 (or a full recentre)
                     // places it again.
@@ -3694,6 +4014,7 @@ namespace wowvr
                                      g_uiPanel.Shape(), Projection().HeadOffsetMetres(),
                                      Projection().GameViewToBody(),
                                      Cfg().unitsPerMetre * Cfg().worldScale);
+                    UpdatePlateStrip();
 
                     // The persisted camera blocks are deliberately NOT refreshed here.
                     // At this point the client has not updated its camera for the
@@ -3712,6 +4033,7 @@ namespace wowvr
                 // and its own draw distance.
                 Pointer().Deactivate();
                 DrawRange().SetScale(1.0f);
+                Canvas().Update(1.0f);
                 Billboards().Update(false, Mat4Identity());
             }
 
@@ -3752,6 +4074,8 @@ namespace wowvr
             g_stereoHasContent = false;
             g_uiRendered = false;
             g_uiTargetBound = false;
+            // This frame's lifebars have been drawn; the next frame places its own.
+            Pointer().BeginPlateFrame();
 
             // Whether the frame just finished ever had a 3D camera. Used next frame to
             // recognise a loading screen; asking within the frame races the camera
@@ -4283,6 +4607,7 @@ namespace wowvr
                     // only be seen by capturing the eye buffer itself.
                     else if (strncmp(command, "shot", 4) == 0)   { g_dumpNextFrame = true; }
                     else if (strncmp(command, "mirrorshot", 10) == 0) { g_dumpMirrorNext = true; }
+                    else if (strncmp(command, "platedump", 9) == 0) { g_plateDumpNext = true; }
                     // "holdall" must be tested before "hold", or the prefix swallows it.
                     else if (strncmp(command, "holdall", 7) == 0) { Camera().HoldSurvivors(true, 1.57f); }
                     else if (strncmp(command, "aim", 3) == 0)    { Camera().SetHeadingWrite(1, 1.57f); }

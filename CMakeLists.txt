@@ -71,6 +71,8 @@ set(WOWVR_SOURCES
     src/game/view_distance.h
     src/game/portrait_fix.cpp
     src/game/portrait_fix.h
+    src/game/ui_canvas.cpp
+    src/game/ui_canvas.h
     src/ui/help_card.cpp
     src/ui/help_card.h
     src/game/world_pointer.cpp

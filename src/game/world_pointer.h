@@ -34,6 +34,15 @@ namespace wowvr
     //
     // Installed once VR is running; when inactive (no panel, VR off, WorldPointing=0)
     // both detours hand the call straight to the client's own code.
+    // A lifebar (nameplate) the client placed this frame, for drawing in the world.
+    struct WorldPlate
+    {
+        Vec3 body;              // the point it hangs from, metres, body frame
+        float distanceMetres;   // from the head
+        float slotU;            // where in the interface image its anchor was put: the
+        float slotV;            //   cell's centre across, anchorV of the way down (0..1)
+    };
+
     class WorldPointer
     {
     public:
@@ -53,6 +62,21 @@ namespace wowvr
         void Deactivate();
 
         void LogStatus() const;
+
+        // Lifebars in the world. While on, every lifebar the client places is sent to its
+        // own cell of a strip of the interface image (rows of 'columns' cells, each
+        // cellU x cellV of the image, starting at stripTopV) instead of to where its unit
+        // is, and the unit's position is remembered here. The caller cuts the strip out
+        // of the interface, clears it, and draws each cell over its unit in 3D.
+        // anchorV: how far down its cell a lifebar's anchor goes (the client hangs the
+        // lifebar below its anchor point).
+        void SetPlateStrip(bool on, float stripTopV, float cellU, float cellV, int columns,
+                           int rows, float anchorV);
+        bool PlateStripOn() const;
+        int PlateCount() const;
+        const WorldPlate& Plate(int index) const;
+        // Once a frame, after the frame's plates have been drawn.
+        void BeginPlateFrame();
     };
 
     WorldPointer& Pointer();
@@ -91,5 +115,9 @@ namespace wowvr
         // cylinder in front of the head.
         bool WorldToPanel(const Frame& frame, const CameraBasis& camera, const Vec3& world,
                           float& u, float& v, float& distanceYards);
+
+        // A world point in the body frame, metres.
+        void WorldToBody(const Frame& frame, const CameraBasis& camera, const Vec3& world,
+                         Vec3& body);
     }
 }

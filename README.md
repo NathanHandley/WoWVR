@@ -18,6 +18,13 @@ corner for the first 10 seconds; `[Panel] LaunchHintSeconds` changes that, 0 tur
 
 ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
 
+In the world the interface sits on a canvas twice as wide and tall as the screen (`[Panel] CanvasScale`,
+1 = off): everything stays where and as big as it was, with room around it for the mouse, dragged
+frames, lifebars and chat bubbles.
+
+Lifebars (the V key) are drawn over each unit in the world at its own distance rather than on the
+interface (`[Panel] Nameplates3D`, needs `CanvasScale` above 1). They can't be clicked to target.
+
 ALT + CTRL + PAGE UP / PAGE DOWN pushes the interface farther away / pulls it closer (hold to keep
 moving; the distance is saved to WoWVR.ini)
 

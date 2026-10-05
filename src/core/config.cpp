@@ -97,6 +97,12 @@ namespace wowvr
             L"Opacity=1.0\r\n"
             L"; Seconds the Ctrl+Alt+F1 command-list hint shows at launch (0 = never).\r\n"
             L"LaunchHintSeconds=10\r\n"
+            L"; In the world, a canvas this many times bigger each way around the same-sized\r\n"
+            L"; interface: more room for the mouse, chat, lifebars. 1 = off.\r\n"
+            L"CanvasScale=2\r\n"
+            L"; 1 draws lifebars (V key) over each unit in 3D instead of on the interface.\r\n"
+            L"; Needs CanvasScale above 1.\r\n"
+            L"Nameplates3D=1\r\n"
             L"\r\n"
             L"[Mirror]\r\n"
             L"; Keep drawing the game to the desktop window as well as the headset.\r\n"
@@ -299,6 +305,11 @@ namespace wowvr
         config.launchHintSeconds =
             ReadFloat(path, L"Panel", L"LaunchHintSeconds", config.launchHintSeconds);
         if (!(config.launchHintSeconds >= 0.0f)) { config.launchHintSeconds = 0.0f; }
+        config.panelCanvasScale =
+            ReadFloat(path, L"Panel", L"CanvasScale", config.panelCanvasScale);
+        if (!(config.panelCanvasScale >= 1.0f)) { config.panelCanvasScale = 1.0f; }
+        if (config.panelCanvasScale > 3.0f) { config.panelCanvasScale = 3.0f; }
+        config.nameplates3d = ReadBool(path, L"Panel", L"Nameplates3D", config.nameplates3d);
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
         config.premultipliedUi =

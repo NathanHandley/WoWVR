@@ -93,6 +93,10 @@ namespace wowvr
         Mat4 PanelToEye(const Mat4& headRotation, const Vec3& headOffsetMetres,
                         const Vec3& eyeOffsetMetres) const;
 
+        // The same correction for anything placed directly in the body frame.
+        static Mat4 BodyToEye(const Mat4& headRotation, const Vec3& headOffsetMetres,
+                              const Vec3& eyeOffsetMetres);
+
     private:
         IDirect3DTexture9* m_texture = nullptr;
         IDirect3DSurface9* m_surface = nullptr;

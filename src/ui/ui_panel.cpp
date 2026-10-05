@@ -1,5 +1,7 @@
 #include "ui/ui_panel.h"
 
+#include "game/ui_canvas.h"
+
 #include "core/config.h"
 #include "core/log.h"
 
@@ -103,10 +105,27 @@ namespace wowvr
             arcDegrees = maxArcDegrees;
         }
 
+        // The interface canvas: the same screen stretched over more angle, the
+        // interface on it drawn smaller to match (game/ui_canvas.h). The cap above
+        // applies to the ordinary-size area, so that keeps its exact shape.
+        const float canvas = Canvas().PanelScale();
+        arcDegrees *= canvas;
+        if (arcDegrees > 330.0f) { arcDegrees = 330.0f; }
+
         m_shape.radius = radius;
         m_shape.arc = arcDegrees * kDegreesToRadians;
         m_shape.metresPerPixel = (m_shape.radius * m_shape.arc) / widthPixels;
         m_shape.heightMetres = heightPixels * m_shape.metresPerPixel;
+    }
+
+    Mat4 UiPanel::BodyToEye(const Mat4& headRotation, const Vec3& headOffsetMetres,
+                            const Vec3& eyeOffsetMetres)
+    {
+        const Mat4 displace = Mat4Translation(-headOffsetMetres.x, -headOffsetMetres.y,
+                                              -headOffsetMetres.z);
+        const Mat4 viewToEye = Mat4Translation(-eyeOffsetMetres.x, -eyeOffsetMetres.y,
+                                               -eyeOffsetMetres.z);
+        return Mat4Multiply(Mat4Multiply(displace, headRotation), viewToEye);
     }
 
     Mat4 UiPanel::PanelToEye(const Mat4& headRotation, const Vec3& headOffsetMetres,
