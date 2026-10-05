@@ -13,6 +13,9 @@ is patched on disk.
 
 ## Commands
 
+The mouse is kept inside the game window while it has focus (`[Panel] ConfineCursor=1`), so stray
+clicks can't land on the desktop; alt-tab releases it.
+
 ALT + CTRL + F1 shows or hides a list of all the WoWVR commands (a reminder of this shows in the
 corner for the first 10 seconds; `[Panel] LaunchHintSeconds` changes that, 0 turns it off)
 

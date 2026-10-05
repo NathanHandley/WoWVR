@@ -412,8 +412,9 @@ namespace wowvr
         // Keeps the mouse inside the game window while the game has focus. Wearing the
         // headset you cannot see the pointer leave, and once it has, the panel stops
         // drawing it and clicks land in whatever is behind. Released on focus loss, so
-        // alt-tab still works.
-        bool confineCursor = false;
+        // alt-tab still works. On by default: clicking the desktop by accident is the
+        // usual result of leaving it off.
+        bool confineCursor = true;
 
         // Treat the interface panel as premultiplied alpha: blend the alpha channel on
         // its own factors while the interface renders, and composite the panel without

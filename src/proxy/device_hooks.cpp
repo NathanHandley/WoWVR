@@ -2189,11 +2189,14 @@ namespace wowvr
             screen.right = topLeft.x + (client.right - client.left);
             screen.bottom = topLeft.y + (client.bottom - client.top);
 
-            // Only when it changes: the window can be moved, and re-clipping every
-            // frame regardless would be a syscall per frame for nothing.
-            if (g_cursorConfined
-                && screen.left == g_confinedTo.left && screen.top == g_confinedTo.top
-                && screen.right == g_confinedTo.right && screen.bottom == g_confinedTo.bottom)
+            // Only when it differs from the clip Windows actually holds. The window can
+            // move, and Windows itself drops a clip on some events (the secure desktop,
+            // Ctrl+Alt+Del, another program's ClipCursor), which a cached flag alone would
+            // never notice.
+            RECT current = {};
+            if (g_cursorConfined && GetClipCursor(&current)
+                && current.left == screen.left && current.top == screen.top
+                && current.right == screen.right && current.bottom == screen.bottom)
             {
                 return;
             }
@@ -3897,6 +3900,13 @@ namespace wowvr
             Report().EndFrame();
 
             PollHotkeys();
+
+            // Every frame, so focus changes release the pointer even on frames without an
+            // interface pass (loading screens), and a dropped clip is put back promptly.
+            if (Cfg().enabled)
+            {
+                UpdateCursorConfinement();
+            }
 
             if (Cfg().enabled)
             {
