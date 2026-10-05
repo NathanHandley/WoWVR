@@ -11,6 +11,7 @@
 #include "game/sound_listener.h"
 #include "game/billboard_facing.h"
 #include "game/view_distance.h"
+#include "game/portrait_fix.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
@@ -6359,8 +6360,9 @@ namespace wowvr
                                            HANDLE* sharedHandle)
         {
             CountPool(CensusTexture, pool);
-            return g_originalCreateTexture(device, width, height, levels, usage, format,
-                                           pool, texture, sharedHandle);
+            const HRESULT hr = g_originalCreateTexture(device, width, height, levels, usage, format,
+                                                       pool, texture, sharedHandle);
+            return hr;
         }
 
         HRESULT WINAPI HookedCreateVertexBuffer(IDirect3DDevice9* device, UINT length, DWORD usage,
@@ -7013,6 +7015,12 @@ namespace wowvr
                                           D3DPRESENT_PARAMETERS* parameters,
                                           IDirect3DDevice9** returnedDevice)
         {
+            // Before the device exists: the client tests for render-to-texture portraits
+            // once, early, and remembers the answer.
+            if (Cfg().enabled)
+            {
+                Portraits().Install();
+            }
             const HRESULT hr = g_originalCreateDevice(d3d9, adapter, deviceType, focusWindow,
                                                       behaviourFlags, parameters, returnedDevice);
 

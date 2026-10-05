@@ -69,6 +69,8 @@ set(WOWVR_SOURCES
     src/game/billboard_facing.h
     src/game/view_distance.cpp
     src/game/view_distance.h
+    src/game/portrait_fix.cpp
+    src/game/portrait_fix.h
     src/game/world_pointer.cpp
     src/game/world_pointer.h
     src/present/d3d12_present.cpp
