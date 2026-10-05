@@ -13,7 +13,8 @@ is patched on disk.
 
 ## Commands
 
-ALT + CTRL + F1 shows or hides a list of all the WoWVR commands
+ALT + CTRL + F1 shows or hides a list of all the WoWVR commands (a reminder of this shows in the
+corner for the first 10 seconds; `[Panel] LaunchHintSeconds` changes that, 0 turns it off)
 
 ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
 

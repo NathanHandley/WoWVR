@@ -95,6 +95,8 @@ namespace wowvr
             L"; puts nameplates where your head sees the creature through the sheet.\r\n"
             L"WorldPointing=1\r\n"
             L"Opacity=1.0\r\n"
+            L"; Seconds the Ctrl+Alt+F1 command-list hint shows at launch (0 = never).\r\n"
+            L"LaunchHintSeconds=10\r\n"
             L"\r\n"
             L"[Mirror]\r\n"
             L"; Keep drawing the game to the desktop window as well as the headset.\r\n"
@@ -294,6 +296,9 @@ namespace wowvr
             ReadBool(path, L"Panel", L"WorldPointing", config.panelWorldPointing);
         config.panelOverlay = ReadBool(path, L"Panel", L"Overlay", config.panelOverlay);
         config.panelOpacity = ReadFloat(path, L"Panel", L"Opacity", config.panelOpacity);
+        config.launchHintSeconds =
+            ReadFloat(path, L"Panel", L"LaunchHintSeconds", config.launchHintSeconds);
+        if (!(config.launchHintSeconds >= 0.0f)) { config.launchHintSeconds = 0.0f; }
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
         config.premultipliedUi =

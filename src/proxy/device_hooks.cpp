@@ -2341,7 +2341,7 @@ namespace wowvr
 
         // Draws a texture as a screen-space rectangle on whatever target is bound.
         void DrawScreenRect(IDirect3DDevice9* device, IDirect3DBaseTexture9* texture, float left,
-                            float top, float right, float bottom)
+                            float top, float right, float bottom, DWORD alphaFactor = 0xFF)
         {
             // Half-pixel offset: D3D9 maps texel centres to pixel corners.
             left -= 0.5f;
@@ -2369,8 +2369,19 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
             device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            if (alphaFactor >= 0xFF)
+            {
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            }
+            else
+            {
+                // Fading: the texture's alpha scaled by a constant.
+                g_originalSetRenderState(device, D3DRS_TEXTUREFACTOR, alphaFactor << 24);
+                device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+                device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+            }
             device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
             device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
             device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -2427,14 +2438,37 @@ namespace wowvr
         // The Ctrl+Alt+F1 command list, drawn into the interface image (centred, above the
         // game's interface and below the pointer) so it appears wherever the interface
         // does. Leaves the interface surface bound.
-        void DrawHelpIntoInterface(IDirect3DDevice9* device)
+        // The launch hint's clock: started the first time the interface is actually
+        // composited for the headset, so it is not spent while SteamVR is still coming up.
+        DWORD g_launchHintStart = 0;
+        bool g_launchHintStarted = false;
+
+        // How visible the launch hint is right now: 0 gone, 255 fully shown, fading out
+        // over its last second.
+        DWORD LaunchHintAlpha()
         {
-            if (!Help().Visible())
+            const float seconds = Cfg().launchHintSeconds;
+            if (!(seconds > 0.0f) || !g_launchHintStarted || Help().Visible())
             {
-                return;
+                return 0;
             }
-            IDirect3DTexture9* card = Help().Texture(device);
-            if (card == nullptr)
+            const float elapsed = static_cast<float>(GetTickCount() - g_launchHintStart) / 1000.0f;
+            if (elapsed >= seconds)
+            {
+                return 0;
+            }
+            const float left = seconds - elapsed;
+            const float fade = (left < 1.0f) ? left : 1.0f;
+            return static_cast<DWORD>(fade * 255.0f);
+        }
+
+        // Draws a text card into the interface image at (left, top), or centred when
+        // left is negative. Leaves the interface surface bound.
+        void DrawCardIntoInterface(IDirect3DDevice9* device, TextCard& textCard, float left,
+                                   float top, DWORD alpha)
+        {
+            IDirect3DTexture9* card = textCard.Texture(device);
+            if (card == nullptr || alpha == 0)
             {
                 return;
             }
@@ -2457,11 +2491,38 @@ namespace wowvr
             g_originalSetRenderState(device, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
             g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
 
-            const float cardWidth = static_cast<float>(Help().Width());
-            const float cardHeight = static_cast<float>(Help().Height());
-            const float left = floorf((width - cardWidth) * 0.5f);
-            const float top = floorf((height - cardHeight) * 0.4f);
-            DrawScreenRect(device, card, left, top, left + cardWidth, top + cardHeight);
+            const float cardWidth = static_cast<float>(textCard.Width());
+            const float cardHeight = static_cast<float>(textCard.Height());
+            if (left < 0.0f)
+            {
+                left = floorf((width - cardWidth) * 0.5f);
+                top = floorf((height - cardHeight) * 0.4f);
+            }
+            DrawScreenRect(device, card, left, top, left + cardWidth, top + cardHeight, alpha);
+        }
+
+        // The Ctrl+Alt+F1 list (centred) and the launch hint (top-left corner), whichever
+        // is showing. True if anything was drawn.
+        bool DrawHelpIntoInterface(IDirect3DDevice9* device)
+        {
+            if (!g_launchHintStarted && Vr().IsActive())
+            {
+                g_launchHintStarted = true;
+                g_launchHintStart = GetTickCount();
+            }
+            bool drew = false;
+            if (Help().Visible())
+            {
+                DrawCardIntoInterface(device, Help(), -1.0f, -1.0f, 0xFF);
+                drew = true;
+            }
+            const DWORD hint = LaunchHintAlpha();
+            if (hint > 0)
+            {
+                DrawCardIntoInterface(device, LaunchHintCard(), 24.0f, 24.0f, hint);
+                drew = true;
+            }
+            return drew;
         }
 
         // Overlay mode: the eye image no longer contains the interface, so the desktop
@@ -2554,9 +2615,8 @@ namespace wowvr
 
             // Into the interface image before the sheet samples it; then back onto the
             // stereo target the sheet is drawn into.
-            if (Help().Visible())
+            if (DrawHelpIntoInterface(device))
             {
-                DrawHelpIntoInterface(device);
                 g_originalSetRenderTarget(device, 0, g_stereo.Color());
                 g_originalSetDepthStencilSurface(device, nullptr);
             }

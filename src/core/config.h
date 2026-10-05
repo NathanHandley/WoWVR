@@ -386,6 +386,11 @@ namespace wowvr
 
         float panelOpacity = 1.0f;
 
+        // Seconds the "Ctrl+Alt+F1: WoWVR command list" hint stays in the interface's
+        // top-left corner, counted from the moment the interface first appears in the
+        // headset. 0 never shows it.
+        float launchHintSeconds = 10.0f;
+
         // The pointer is drawn at the size the game uses, which is small seen through a
         // headset. This multiplies it without touching where it actually points.
         float cursorScale = 1.5f;

@@ -31,9 +31,14 @@ namespace wowvr
             { L"Ctrl+Alt+C",        L"Calibrate the camera" },
         };
 
+        const HelpLine kHintLines[] = {
+            { L"Ctrl+Alt+F1", L"WoWVR command list" },
+        };
+
         const int kFontHeight = 30;
         const int kTitleHeight = 36;
-        const int kPadding = 28;
+        const int kListPadding = 28;
+        const int kHintPadding = 16;
         const int kLineGap = 12;
         const int kColumnGap = 40;
 
@@ -45,7 +50,7 @@ namespace wowvr
         const uint32_t kTitleRgb = 0xFFFFFF;
     }
 
-    IDirect3DTexture9* HelpCard::Texture(IDirect3DDevice9* device)
+    IDirect3DTexture9* TextCard::Texture(IDirect3DDevice9* device)
     {
         if (device == nullptr)
         {
@@ -78,8 +83,12 @@ namespace wowvr
         HFONT title = CreateFontW(-kTitleHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                   ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        const wchar_t* const kTitle = L"WoWVR commands";
-        const int count = static_cast<int>(sizeof(kLines) / sizeof(kLines[0]));
+        const bool list = m_kind == CommandList;
+        const wchar_t* const kTitle = list ? L"WoWVR commands" : nullptr;
+        const HelpLine* const kLinesUsed = list ? kLines : kHintLines;
+        const int count = list ? static_cast<int>(sizeof(kLines) / sizeof(kLines[0]))
+                               : static_cast<int>(sizeof(kHintLines) / sizeof(kHintLines[0]));
+        const int kPadding = list ? kListPadding : kHintPadding;
 
         // Measure: the widest key, the widest description, the title.
         int keyWidth = 0;
@@ -88,22 +97,26 @@ namespace wowvr
         SelectObject(dc, bold);
         for (int i = 0; i < count; ++i)
         {
-            GetTextExtentPoint32W(dc, kLines[i].keys, static_cast<int>(wcslen(kLines[i].keys)), &size);
+            GetTextExtentPoint32W(dc, kLinesUsed[i].keys, static_cast<int>(wcslen(kLinesUsed[i].keys)), &size);
             if (size.cx > keyWidth) { keyWidth = size.cx; }
         }
         SelectObject(dc, body);
         for (int i = 0; i < count; ++i)
         {
-            GetTextExtentPoint32W(dc, kLines[i].what, static_cast<int>(wcslen(kLines[i].what)), &size);
+            GetTextExtentPoint32W(dc, kLinesUsed[i].what, static_cast<int>(wcslen(kLinesUsed[i].what)), &size);
             if (size.cx > textWidth) { textWidth = size.cx; }
         }
-        SelectObject(dc, title);
-        GetTextExtentPoint32W(dc, kTitle, static_cast<int>(wcslen(kTitle)), &size);
-        const int titleWidth = size.cx;
+        int titleWidth = 0;
+        if (kTitle != nullptr)
+        {
+            SelectObject(dc, title);
+            GetTextExtentPoint32W(dc, kTitle, static_cast<int>(wcslen(kTitle)), &size);
+            titleWidth = size.cx;
+        }
 
         int width = kPadding * 2 + keyWidth + kColumnGap + textWidth;
         if (width < kPadding * 2 + titleWidth) { width = kPadding * 2 + titleWidth; }
-        const int titleBlock = kTitleHeight + kLineGap * 2;
+        const int titleBlock = (kTitle != nullptr) ? kTitleHeight + kLineGap * 2 : 0;
         const int height = kPadding * 2 + titleBlock + count * (kFontHeight + kLineGap) - kLineGap;
 
         // One 32-bit DIB per colour of text would be wasteful; instead the text is drawn
@@ -131,19 +144,22 @@ namespace wowvr
         // Coverage is drawn in three channels at once: red for the title, green for the
         // keys, blue for the descriptions. Each glyph only lands in its own channel.
         memset(bits, 0, static_cast<size_t>(width) * height * 4);
-        SelectObject(dc, title);
-        SetTextColor(dc, RGB(255, 0, 0));
-        TextOutW(dc, kPadding, kPadding, kTitle, static_cast<int>(wcslen(kTitle)));
+        if (kTitle != nullptr)
+        {
+            SelectObject(dc, title);
+            SetTextColor(dc, RGB(255, 0, 0));
+            TextOutW(dc, kPadding, kPadding, kTitle, static_cast<int>(wcslen(kTitle)));
+        }
         for (int i = 0; i < count; ++i)
         {
             const int y = kPadding + titleBlock + i * (kFontHeight + kLineGap);
             SelectObject(dc, bold);
             SetTextColor(dc, RGB(0, 255, 0));
-            TextOutW(dc, kPadding, y, kLines[i].keys, static_cast<int>(wcslen(kLines[i].keys)));
+            TextOutW(dc, kPadding, y, kLinesUsed[i].keys, static_cast<int>(wcslen(kLinesUsed[i].keys)));
             SelectObject(dc, body);
             SetTextColor(dc, RGB(0, 0, 255));
-            TextOutW(dc, kPadding + keyWidth + kColumnGap, y, kLines[i].what,
-                     static_cast<int>(wcslen(kLines[i].what)));
+            TextOutW(dc, kPadding + keyWidth + kColumnGap, y, kLinesUsed[i].what,
+                     static_cast<int>(wcslen(kLinesUsed[i].what)));
         }
         GdiFlush();
 
@@ -151,7 +167,7 @@ namespace wowvr
         // over it in its own colour by its coverage. Straight alpha.
         std::vector<uint32_t> pixels(static_cast<size_t>(width) * height);
         const uint32_t* coverage = static_cast<const uint32_t*>(bits);
-        const int separatorY = kPadding + kTitleHeight + kLineGap;
+        const int separatorY = (kTitle != nullptr) ? kPadding + kTitleHeight + kLineGap : -1;
         for (int y = 0; y < height; ++y)
         {
             for (int x = 0; x < width; ++x)
@@ -220,6 +236,12 @@ namespace wowvr
     HelpCard& Help()
     {
         static HelpCard instance;
+        return instance;
+    }
+
+    TextCard& LaunchHintCard()
+    {
+        static TextCard instance(TextCard::LaunchHint);
         return instance;
     }
 }
