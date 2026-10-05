@@ -13,6 +13,8 @@ is patched on disk.
 
 ## Commands
 
+ALT + CTRL + F1 shows or hides a list of all the WoWVR commands
+
 ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
 
 ALT + CTRL + PAGE UP / PAGE DOWN pushes the interface farther away / pulls it closer (hold to keep

@@ -12,6 +12,7 @@
 #include "game/billboard_facing.h"
 #include "game/view_distance.h"
 #include "game/portrait_fix.h"
+#include "ui/help_card.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
@@ -2423,6 +2424,46 @@ namespace wowvr
             ++g_cursorDrawn;
         }
 
+        // The Ctrl+Alt+F1 command list, drawn into the interface image (centred, above the
+        // game's interface and below the pointer) so it appears wherever the interface
+        // does. Leaves the interface surface bound.
+        void DrawHelpIntoInterface(IDirect3DDevice9* device)
+        {
+            if (!Help().Visible())
+            {
+                return;
+            }
+            IDirect3DTexture9* card = Help().Texture(device);
+            if (card == nullptr)
+            {
+                return;
+            }
+
+            const float width = static_cast<float>(g_uiPanel.Width());
+            const float height = static_cast<float>(g_uiPanel.Height());
+            g_originalSetRenderTarget(device, 0, g_uiPanel.Surface());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            D3DVIEWPORT9 viewport = {};
+            viewport.Width = g_uiPanel.Width();
+            viewport.Height = g_uiPanel.Height();
+            viewport.MaxZ = 1.0f;
+            g_originalSetViewport(device, &viewport);
+
+            // Straight-alpha art over the premultiplied interface, as for the pointer.
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+            g_originalSetRenderState(device, D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+
+            const float cardWidth = static_cast<float>(Help().Width());
+            const float cardHeight = static_cast<float>(Help().Height());
+            const float left = floorf((width - cardWidth) * 0.5f);
+            const float top = floorf((height - cardHeight) * 0.4f);
+            DrawScreenRect(device, card, left, top, left + cardWidth, top + cardHeight);
+        }
+
         // Overlay mode: the eye image no longer contains the interface, so the desktop
         // mirror lays it over the copied eye flat, at window size.
         void DrawInterfaceOnMirror(IDirect3DDevice9* device)
@@ -2500,6 +2541,7 @@ namespace wowvr
             // pointer has to be put into the interface image the overlay shows.
             if (OverlayModeActive())
             {
+                DrawHelpIntoInterface(device);
                 DrawCursorIntoInterface(device);
                 if (savedState != nullptr)
                 {
@@ -2508,6 +2550,15 @@ namespace wowvr
                 }
                 g_originalSetRenderTarget(device, 0, g_realBackBuffer);
                 return;
+            }
+
+            // Into the interface image before the sheet samples it; then back onto the
+            // stereo target the sheet is drawn into.
+            if (Help().Visible())
+            {
+                DrawHelpIntoInterface(device);
+                g_originalSetRenderTarget(device, 0, g_stereo.Color());
+                g_originalSetDepthStencilSurface(device, nullptr);
             }
 
             // The curved sheet as one triangle strip of upright slices. Enough slices
@@ -3330,6 +3381,12 @@ namespace wowvr
                 WOWVR_INFO("F8: interface panel placed in front of the head (yaw %.1f deg, "
                            "eye height %+.2f m).", -Projection().HeadYaw() * 57.29578f,
                            Projection().HeadOffsetMetres().y);
+            }
+
+            if (HotkeyPressed(Hotkey::Help))
+            {
+                Help().Toggle();
+                WOWVR_INFO("Ctrl+Alt+F1: command list %s.", Help().Visible() ? "shown" : "hidden");
             }
 
             // Pushing the interface out or pulling it in. Its angular size is set by

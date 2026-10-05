@@ -13,6 +13,7 @@ namespace wowvr
         RecenterUi,    // Ctrl+Alt+F8  - bring the UI panel in front of the head again
         PanelFarther,  // Ctrl+Alt+PageUp   - push the UI panel away (repeats while held)
         PanelNearer,   // Ctrl+Alt+PageDown - pull the UI panel in (repeats while held)
+        Help,          // Ctrl+Alt+F1  - show/hide the list of these commands
         Count
     };
 

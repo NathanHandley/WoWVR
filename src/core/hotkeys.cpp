@@ -24,6 +24,7 @@ namespace wowvr
             { VK_F8,    false, 0 },
             { VK_PRIOR, false, 0 },
             { VK_NEXT,  false, 0 },
+            { VK_F1,    false, 0 },
         };
     }
 
