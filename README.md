@@ -15,6 +15,9 @@ is patched on disk.
 
 ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
 
+ALT + CTRL + PAGE UP / PAGE DOWN pushes the interface farther away / pulls it closer (hold to keep
+moving; the distance is saved to WoWVR.ini)
+
 ALT + CTRL + F8 recenters only the interface: it turns to face where you are looking (left/right
 only) with its middle at eye height
 

@@ -3332,6 +3332,20 @@ namespace wowvr
                            Projection().HeadOffsetMetres().y);
             }
 
+            // Pushing the interface out or pulling it in. Its angular size is set by
+            // PixelsPerDegree, not by the distance, so it looks the same size at any
+            // depth - only how far your eyes have to converge on it changes.
+            const bool farther = HotkeyRepeated(Hotkey::PanelFarther);
+            const bool nearer = HotkeyRepeated(Hotkey::PanelNearer);
+            if (farther != nearer)
+            {
+                const float distance =
+                    SetPanelDistance(Cfg().panelDistance + (farther ? 0.1f : -0.1f));
+                g_uiPanel.RefreshGeometry();
+                WOWVR_INFO("Ctrl+Alt+%s: interface panel distance %.2f m (saved).",
+                           farther ? "PageUp" : "PageDown", distance);
+            }
+
             if (HotkeyPressed(Hotkey::ReloadConfig))
             {
                 LoadConfig();

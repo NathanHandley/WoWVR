@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <cstdlib>
+#include <cwchar>
 #include <iterator>
 #include <string>
 
@@ -83,7 +84,8 @@ namespace wowvr
             L"[Panel]\r\n"
             L"; The interface, on a curved sheet around you that stays where it is put.\r\n"
             L"; Ctrl+Alt+F8 brings it back in front of you (left/right only, centred at\r\n"
-            L"; eye height). Distance is the curve's radius in metres. PixelsPerDegree\r\n"
+            L"; eye height). Distance is the curve's radius in metres; Ctrl+Alt+PageUp and\r\n"
+            L"; PageDown push it out and pull it in while playing (saved here). PixelsPerDegree\r\n"
             L"; sets how big elements look: raise the game's resolution (and lower its\r\n"
             L"; UI scale to match) and the sheet grows instead of everything shrinking.\r\n"
             L"Distance=1.6\r\n"
@@ -345,5 +347,19 @@ namespace wowvr
     const Config& Cfg()
     {
         return g_config;
+    }
+
+    float SetPanelDistance(float metres)
+    {
+        if (!(metres >= 0.3f)) { metres = 0.3f; }
+        if (metres > 5.0f) { metres = 5.0f; }
+        // Rounded to the centimetre so repeated steps do not drift.
+        metres = static_cast<float>(static_cast<int>(metres * 100.0f + 0.5f)) / 100.0f;
+        g_config.panelDistance = metres;
+
+        wchar_t text[32];
+        swprintf_s(text, L"%.2f", metres);
+        WritePrivateProfileStringW(L"Panel", L"Distance", text, ModuleFile(L"WoWVR.ini").c_str());
+        return metres;
     }
 }

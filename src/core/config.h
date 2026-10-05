@@ -492,4 +492,9 @@ namespace wowvr
     void LoadConfig();
 
     const Config& Cfg();
+
+    // Changes [Panel] Distance for this session and writes it back to WoWVR.ini, so a
+    // distance chosen in the headset survives a restart. Clamped to the same limits
+    // the loader applies. Returns the value now in force.
+    float SetPanelDistance(float metres);
 }

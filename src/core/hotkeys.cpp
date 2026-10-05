@@ -10,14 +10,20 @@ namespace wowvr
         {
             int virtualKey;
             bool wasDown;
+            DWORD nextRepeat;
         };
 
+        const DWORD kRepeatDelayMs = 400;
+        const DWORD kRepeatIntervalMs = 90;
+
         HotkeyBinding g_bindings[static_cast<int>(Hotkey::Count)] = {
-            { VK_F9,  false },
-            { VK_F10, false },
-            { VK_F11, false },
-            { VK_F12, false },
-            { VK_F8,  false },
+            { VK_F9,    false, 0 },
+            { VK_F10,   false, 0 },
+            { VK_F11,   false, 0 },
+            { VK_F12,   false, 0 },
+            { VK_F8,    false, 0 },
+            { VK_PRIOR, false, 0 },
+            { VK_NEXT,  false, 0 },
         };
     }
 
@@ -43,5 +49,29 @@ namespace wowvr
         const bool pressed = isDown && !binding.wasDown;
         binding.wasDown = isDown;
         return pressed;
+    }
+
+    bool HotkeyRepeated(Hotkey key)
+    {
+        const int index = static_cast<int>(key);
+        if (index < 0 || index >= static_cast<int>(Hotkey::Count))
+        {
+            return false;
+        }
+
+        const DWORD now = GetTickCount();
+        if (HotkeyPressed(key))
+        {
+            g_bindings[index].nextRepeat = now + kRepeatDelayMs;
+            return true;
+        }
+
+        HotkeyBinding& binding = g_bindings[index];
+        if (binding.wasDown && static_cast<LONG>(now - binding.nextRepeat) >= 0)
+        {
+            binding.nextRepeat = now + kRepeatIntervalMs;
+            return true;
+        }
+        return false;
     }
 }
