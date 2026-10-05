@@ -77,6 +77,15 @@ namespace wowvr
         // into Vulkan with a fraction of the per-draw CPU cost, and does the driver
         // work on its own thread. Falls back to the system library if it will not load.
         std::wstring d3d9Library;
+
+        // When the game cannot keep up with the headset's refresh rate, ask SteamVR to
+        // run it at exactly half rate (ForceInterleavedReprojectionOn) and let motion
+        // smoothing / reprojection supply every other frame. A game running at, say, 70
+        // fps on a 90 Hz headset has its frames shown once or twice in an uneven pattern,
+        // which reads as chunky; an even 45 with smoothing reads as fluid. Switches back
+        // to full rate once the frame work fits again, with hysteresis so it does not
+        // flap at the boundary.
+        bool adaptiveHalfRate = true;
         float ipdOverride = 0.0f;       // metres; 0 = whatever the headset reports
         float worldScale = 1.0f;        // >1 makes the world feel larger
 

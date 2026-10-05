@@ -452,6 +452,34 @@ namespace wowvr
         vr::VRCompositor()->PostPresentHandoff();
     }
 
+    void VrSession::SetHalfRate(bool on)
+    {
+        if (!m_active || vr::VRCompositor() == nullptr || on == m_halfRate)
+        {
+            return;
+        }
+        vr::VRCompositor()->ForceInterleavedReprojectionOn(on);
+        m_halfRate = on;
+    }
+
+    void VrSession::RefreshDisplayFrequency()
+    {
+        if (!m_active || g_system == nullptr)
+        {
+            return;
+        }
+        vr::ETrackedPropertyError propertyError = vr::TrackedProp_Success;
+        const float frequency = g_system->GetFloatTrackedDeviceProperty(
+            vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float, &propertyError);
+        if (propertyError == vr::TrackedProp_Success && frequency > 1.0f
+            && frequency != m_displayFrequency)
+        {
+            WOWVR_INFO("Headset refresh rate is now %.0f Hz (was %.0f).", frequency,
+                       m_displayFrequency);
+            m_displayFrequency = frequency;
+        }
+    }
+
     void VrSession::LogCompositorStats()
     {
         if (!m_active || vr::VRCompositor() == nullptr)

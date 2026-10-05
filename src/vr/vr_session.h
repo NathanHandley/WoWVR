@@ -88,6 +88,15 @@ namespace wowvr
         // is inside the compositor.
         void LogCompositorStats();
 
+        // Asks the compositor to run the application at half the display rate (true) or
+        // at full rate (false). Only while no other thread is inside the compositor.
+        void SetHalfRate(bool on);
+        bool HalfRate() const { return m_halfRate; }
+
+        // Re-reads the display's refresh rate, which can be changed in SteamVR while the
+        // game runs. IVRSystem only.
+        void RefreshDisplayFrequency();
+
         // The interface as a SteamVR overlay rather than geometry in the eye images.
         // The compositor layers overlays on AFTER it has reprojected or motion-smoothed
         // the scene, so a static interface over a moving world no longer confuses the
@@ -108,6 +117,7 @@ namespace wowvr
                            const HeadPoseStamp* renderPose = nullptr);
 
         bool m_active = false;
+        bool m_halfRate = false;
         int m_trackingSpace = 1;   // vr::ETrackingUniverseOrigin, read once at start
         uint32_t m_renderWidth = 0;
         uint32_t m_renderHeight = 0;

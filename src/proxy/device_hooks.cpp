@@ -592,6 +592,21 @@ namespace wowvr
         unsigned long long g_drawsToStereo = 0;
         unsigned long long g_drawsToUi = 0;
         unsigned long long g_drawsOffscreen = 0;
+
+        // Diagnostic: which offscreen targets those draws went to, by surface.
+        struct OffscreenTarget
+        {
+            IDirect3DSurface9* surface;
+            uint32_t width;
+            uint32_t height;
+            uint32_t format;
+            unsigned long long draws;
+            unsigned long long binds;
+        };
+        const int kOffscreenTargets = 12;
+        OffscreenTarget g_offscreenTargets[kOffscreenTargets] = {};
+        int g_offscreenTargetCount = 0;
+        int g_currentOffscreenTarget = -1;
         unsigned long long g_drawsStrayBackBuffer = 0;
         int g_lastPeriodCount = 0;
         unsigned long long g_skySliceDraws = 0;
@@ -1015,6 +1030,23 @@ namespace wowvr
             double sumWorkerWaitMs = 0.0;
         };
         FramePacing g_pacing;
+
+        // The adaptive half-rate governor's inputs and state. 'Work' is a frame's
+        // Present-to-Present interval minus the time spent idle in WaitGetPoses, i.e.
+        // how long the frame would take if the compositor never held it back. That
+        // stays meaningful while throttled, which is what lets it decide to go back.
+        struct HalfRateGovernor
+        {
+            double lastIdleMs = 0.0;      // WaitGetPoses idle of the previous frame
+            unsigned window = 0;
+            unsigned late = 0;            // frames whose work missed the full-rate budget
+            unsigned nearlyLate = 0;      // ... or came within 10% of it
+            double lastSwitchSeconds = 0.0;
+            unsigned long long switches = 0;
+        };
+        HalfRateGovernor g_halfRate;
+        volatile LONGLONG g_presenterLastPoseWaitUs = 0;
+
         LARGE_INTEGER g_qpcFrequency = {};
 
         // The HMD pose this frame and last frame were rendered with. The pipelined
@@ -1141,8 +1173,9 @@ namespace wowvr
             // one - skipping it while a submit was slow is what once left every
             // later Submit blocking for half a second.
             Vr().WaitForFrame();
-            InterlockedExchangeAdd64(&g_presenterPoseWaitUs,
-                                     static_cast<LONGLONG>(ElapsedMs(submitEnd, Now()) * 1000.0));
+            const LONGLONG poseWaitUs = static_cast<LONGLONG>(ElapsedMs(submitEnd, Now()) * 1000.0);
+            InterlockedExchangeAdd64(&g_presenterPoseWaitUs, poseWaitUs);
+            InterlockedExchange64(&g_presenterLastPoseWaitUs, poseWaitUs);
             const LARGE_INTEGER posesReady = Now();
             SetEvent(g_presenterSubmittedEvent);
             ApplyInterfaceOverlay(job);
@@ -1291,6 +1324,78 @@ namespace wowvr
             return true;
         }
 
+        // Decided per frame from the frame's work; applied by ApplyHalfRateDecision at
+        // the one point in the frame where the compositor is free.
+        int g_halfRateWanted = -1;   // -1 no change, 0 full rate, 1 half rate
+
+        void UpdateHalfRateGovernor(double workMs)
+        {
+            if (!Cfg().adaptiveHalfRate || !Vr().IsActive() || !(workMs > 0.0))
+            {
+                if (Vr().HalfRate()) { g_halfRateWanted = 0; }
+                return;
+            }
+            const double hz = Vr().DisplayFrequency() > 1.0f ? Vr().DisplayFrequency() : 90.0;
+            const double budget = 1000.0 / hz;
+            ++g_halfRate.window;
+            if (workMs > budget) { ++g_halfRate.late; }
+            if (workMs > budget * 0.9) { ++g_halfRate.nearlyLate; }
+
+            const double now = static_cast<double>(Now().QuadPart)
+                               / static_cast<double>(g_qpcFrequency.QuadPart);
+            const bool settled = now - g_halfRate.lastSwitchSeconds > 3.0;
+            if (!Vr().HalfRate())
+            {
+                // A second's worth of frames, a third of them late: the cadence is
+                // already uneven enough to feel.
+                if (g_halfRate.window >= static_cast<unsigned>(hz))
+                {
+                    if (settled && g_halfRate.late * 3 >= g_halfRate.window)
+                    {
+                        g_halfRateWanted = 1;
+                    }
+                    g_halfRate.window = g_halfRate.late = g_halfRate.nearlyLate = 0;
+                }
+            }
+            else
+            {
+                // Back to full rate only after three seconds (at half rate) in which
+                // almost no frame even came close to the full-rate budget.
+                if (g_halfRate.window >= static_cast<unsigned>(hz * 1.5))
+                {
+                    if (settled && g_halfRate.nearlyLate * 50 <= g_halfRate.window)
+                    {
+                        g_halfRateWanted = 0;
+                    }
+                    g_halfRate.window = g_halfRate.late = g_halfRate.nearlyLate = 0;
+                }
+            }
+        }
+
+        void ApplyHalfRateDecision()
+        {
+            if (g_halfRateWanted < 0)
+            {
+                return;
+            }
+            const bool on = g_halfRateWanted == 1;
+            g_halfRateWanted = -1;
+            if (on == Vr().HalfRate())
+            {
+                return;
+            }
+            Vr().SetHalfRate(on);
+            g_halfRate.lastSwitchSeconds = static_cast<double>(Now().QuadPart)
+                                           / static_cast<double>(g_qpcFrequency.QuadPart);
+            g_halfRate.window = g_halfRate.late = g_halfRate.nearlyLate = 0;
+            ++g_halfRate.switches;
+            WOWVR_INFO("Frame rate: %s (headset %.0f Hz, worst frame interval this report window %.2f ms).",
+                       on ? "the game cannot keep up - running at half rate with SteamVR "
+                            "filling in every other frame"
+                          : "the game keeps up again - back to full rate",
+                       Vr().DisplayFrequency(), g_pacing.maxIntervalMs);
+        }
+
         void ReportFrameTimings()
         {
             if (g_timers.samples == 0)
@@ -1309,6 +1414,7 @@ namespace wowvr
                        Vr().RenderWidth(), Vr().RenderHeight());
 
             g_timers = FrameTimers();
+
 
             if (g_pacing.samples > 0)
             {
@@ -1332,6 +1438,9 @@ namespace wowvr
             {
                 Vr().LogCompositorStats();
             }
+            Vr().RefreshDisplayFrequency();
+            WOWVR_INFO("Frame rate mode: %s, %llu switches so far.",
+                       Vr().HalfRate() ? "half rate" : "full rate", g_halfRate.switches);
 
             const LONG presenterSamples = g_presenterSamples;
             if (presenterSamples > 0)
@@ -1461,6 +1570,18 @@ namespace wowvr
             g_drawsToStereo = 0;
             g_drawsToUi = 0;
             g_drawsOffscreen = 0;
+            for (int i = 0; i < g_offscreenTargetCount; ++i)
+            {
+                const OffscreenTarget& t = g_offscreenTargets[i];
+                if (t.draws > 0 || t.binds > 0)
+                {
+                    WOWVR_INFO("  offscreen target %p %ux%u fmt=%u: %llu draws, %llu binds",
+                               static_cast<void*>(t.surface), t.width, t.height, t.format,
+                               t.draws, t.binds);
+                }
+                g_offscreenTargets[i].draws = 0;
+                g_offscreenTargets[i].binds = 0;
+            }
             g_drawsStrayBackBuffer = 0;
         }
 
@@ -3350,6 +3471,7 @@ namespace wowvr
                     g_pacing.sumIntervalMs += interval;
                     ++g_pacing.samples;
                     if (interval > g_pacing.maxIntervalMs) { g_pacing.maxIntervalMs = interval; }
+                    UpdateHalfRateGovernor(interval - g_halfRate.lastIdleMs);
                     if (interval > 10.0) { ++g_pacing.over10; }
                     if (interval > 20.0) { ++g_pacing.over20; }
                     if (interval > 50.0) { ++g_pacing.over50; }
@@ -3376,13 +3498,24 @@ namespace wowvr
                 const LARGE_INTEGER poseWaitStart = Now();
                 const bool posted = g_presenterJobPostedThisFrame;
                 g_presenterJobPostedThisFrame = false;
+                bool posesFresh = false;
                 if (posted)
                 {
-                    TryWaitPresenterDone(false, true);
+                    posesFresh = TryWaitPresenterDone(false, true);
+                    g_halfRate.lastIdleMs = posesFresh
+                        ? static_cast<double>(g_presenterLastPoseWaitUs) / 1000.0 : 0.0;
                 }
                 else if (TryWaitPresenterDone(false))
                 {
+                    const LARGE_INTEGER idleStart = Now();
                     Vr().WaitForFrame();
+                    posesFresh = true;
+                    g_halfRate.lastIdleMs = ElapsedMs(idleStart, Now());
+                }
+                // The worker is past WaitGetPoses (or idle), so the compositor is free.
+                if (posesFresh)
+                {
+                    ApplyHalfRateDecision();
                 }
                 const double poseWaitMs = ElapsedMs(poseWaitStart, Now());
                 g_timers.waitMs += poseWaitMs;
@@ -4794,7 +4927,14 @@ namespace wowvr
                 ProbeForCombinedTransforms();
             }
 
-            if (!g_renderingToBackBuffer)      { ++g_drawsOffscreen; }
+            if (!g_renderingToBackBuffer)
+            {
+                ++g_drawsOffscreen;
+                if (g_currentOffscreenTarget >= 0)
+                {
+                    ++g_offscreenTargets[g_currentOffscreenTarget].draws;
+                }
+            }
             else if (g_uiPassStarted)          { ++g_drawsToUi; }
             else if (g_stereoRedirected)
             {
@@ -5694,6 +5834,7 @@ namespace wowvr
             return g_originalSetDepthStencilSurface(device, surface);
         }
 
+
         HRESULT WINAPI HookedSetVertexShaderConstantF(IDirect3DDevice9* device, UINT startRegister,
                                                       const float* data, UINT vector4Count)
         {
@@ -6408,6 +6549,31 @@ namespace wowvr
                 // patch uses it to stay off the shadow map and the post-process
                 // passes, which reuse the same constant register as the scene camera.
                 g_renderingToBackBuffer = (width == g_backBufferWidth && height == g_backBufferHeight);
+                g_currentOffscreenTarget = -1;
+                if (!g_renderingToBackBuffer && surface != nullptr)
+                {
+                    for (int i = 0; i < g_offscreenTargetCount; ++i)
+                    {
+                        if (g_offscreenTargets[i].surface == surface)
+                        {
+                            g_currentOffscreenTarget = i;
+                            break;
+                        }
+                    }
+                    if (g_currentOffscreenTarget < 0 && g_offscreenTargetCount < kOffscreenTargets)
+                    {
+                        OffscreenTarget& entry = g_offscreenTargets[g_offscreenTargetCount];
+                        entry.surface = surface;
+                        entry.width = width;
+                        entry.height = height;
+                        entry.format = format;
+                        g_currentOffscreenTarget = g_offscreenTargetCount++;
+                    }
+                    if (g_currentOffscreenTarget >= 0)
+                    {
+                        ++g_offscreenTargets[g_currentOffscreenTarget].binds;
+                    }
+                }
                 const bool nowShadow = (surface != nullptr && width == height && width >= 512);
 
                 // Leaving the shadow map is the moment its contents are complete, so
@@ -6541,6 +6707,7 @@ namespace wowvr
             return hr;
         }
 
+
         HRESULT WINAPI HookedDrawIndexedPrimitive(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
                                                   INT baseVertexIndex, UINT minVertexIndex,
                                                   UINT numVertices, UINT startIndex, UINT primitiveCount)
@@ -6586,7 +6753,7 @@ namespace wowvr
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawIndexedPrimitive(device, type, baseVertexIndex, minVertexIndex,
-                                                      numVertices, startIndex, primitiveCount);
+                                            numVertices, startIndex, primitiveCount);
             }
 
             g_duplicatingDraw = true;
