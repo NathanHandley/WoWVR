@@ -795,6 +795,12 @@ namespace wowvr
 
         // A head turn stood in for, so the orbit correction can be measured on the desktop.
         float g_fakeHeadYaw = 0.0f;
+        // "headsweep <amplitude rad> <period s>": the fake yaw swung as a sine every frame,
+        // because a real head is never still and the command file is only read every 15
+        // frames - too coarse to stand in for one. "headsweep 0" stops it.
+        float g_sweepAmplitude = 0.0f;
+        float g_sweepPeriod = 2.0f;
+        LARGE_INTEGER g_sweepStart = {};
         bool g_compensateOrbit = true;
         bool g_aimEnabled = true;
         bool g_pitchTrace = false;
@@ -1893,27 +1899,61 @@ namespace wowvr
 
         // The strip's layout for this frame, from the canvas: it lives in the band of
         // extra canvas below the client's interface, so nothing anyone placed is lost.
+        // Why 3D lifebars are or are not in use, logged whenever the answer changes, so a
+        // machine where they fall back to the interface says why.
+        const char* g_plateStripReason = "";
+
+        void SetPlateStripReason(const char* reason)
+        {
+            if (strcmp(reason, g_plateStripReason) != 0)
+            {
+                g_plateStripReason = reason;
+                WOWVR_INFO("Lifebars in the world: %s", reason);
+            }
+        }
+
         void UpdatePlateStrip()
         {
             g_plateStripActive = false;
             const float canvas = Canvas().PanelScale();
             const uint32_t width = g_uiPanel.Width();
             const uint32_t height = g_uiPanel.Height();
-            if (!Cfg().nameplates3d || !(canvas > 1.05f) || width == 0 || height == 0)
+            if (!Cfg().nameplates3d)
             {
                 Pointer().SetPlateStrip(false, 0.0f, 0.0f, 0.0f, 0, 0, 0.0f);
+                SetPlateStripReason("off in WoWVR.ini (Nameplates3D=0).");
                 return;
             }
-            // Lifebars hang off WorldFrame, drawn at 1/canvas: their cell shrinks with it.
-            const float cellPixelsX = floorf(330.0f / canvas);
-            const float cellPixelsY = floorf(150.0f / canvas);
+            if (!(canvas > 1.05f) || width == 0 || height == 0)
+            {
+                Pointer().SetPlateStrip(false, 0.0f, 0.0f, 0.0f, 0, 0, 0.0f);
+                SetPlateStripReason("waiting - the larger interface canvas is not in force (not in "
+                                    "the world yet, or it could not be applied).");
+                return;
+            }
+            // A lifebar's size in pixels follows the game's screen height (the interface is
+            // laid out on a 768-unit-tall screen) and shrinks with WorldFrame by the canvas
+            // factor. The cell sizes were measured at a 1395-pixel-tall screen; at any other
+            // resolution they scale the same way, or a 1080p screen would find no room at all.
+            const float pixelScale = static_cast<float>(height) / 1395.0f / canvas;
+            const float cellPixelsX = floorf(330.0f * pixelScale);
+            float cellPixelsY = floorf(150.0f * pixelScale);
             const float bandPixels = static_cast<float>(height) * (1.0f - 1.0f / canvas) * 0.5f;
             int rows = static_cast<int>((bandPixels - 4.0f) / cellPixelsY);
+            if (rows < 1 && bandPixels - 4.0f >= cellPixelsY * 0.7f)
+            {
+                // Not quite a full cell of room: a shorter cell still holds the name and the
+                // bar (they take the top half of it), so use what there is.
+                rows = 1;
+                cellPixelsY = floorf(bandPixels - 4.0f);
+            }
             if (rows > 3) { rows = 3; }
             const int columns = static_cast<int>(static_cast<float>(width) / cellPixelsX);
             if (rows < 1 || columns < 1)
             {
                 Pointer().SetPlateStrip(false, 0.0f, 0.0f, 0.0f, 0, 0, 0.0f);
+                SetPlateStripReason("not enough room below the interface at this resolution and "
+                                    "CanvasScale - raise CanvasScale. Lifebars stay on the interface.");
                 return;
             }
             const float stripPixels = cellPixelsY * static_cast<float>(rows);
@@ -1928,6 +1968,9 @@ namespace wowvr
             Pointer().SetPlateStrip(true, g_plateStripTopV, g_plateCellU, g_plateCellV, columns, rows,
                                     kPlateAnchorV);
             g_plateStripActive = Pointer().PlateStripOn();
+            SetPlateStripReason(g_plateStripActive
+                                    ? "in use (lifebars drawn over units in 3D)."
+                                    : "waiting for world pointing to be active.");
         }
 
         // End of the interface pass: the strip, out of the interface and into its own
@@ -4743,6 +4786,14 @@ namespace wowvr
             // is the one channel that cannot be swallowed by whatever currently has
             // keyboard focus - which is exactly how the first attempt at driving this
             // went wrong.
+            if (g_sweepAmplitude != 0.0f)
+            {
+                const double t = ElapsedMs(g_sweepStart, Now()) / 1000.0;
+                g_fakeHeadYaw = g_sweepAmplitude
+                    * static_cast<float>(sin(6.283185307 * t / g_sweepPeriod));
+                Projection().SetFakeHeadYaw(g_fakeHeadYaw);
+            }
+
             if ((g_frameCount % 15) == 0)
             {
                 const std::wstring commandFile = ModuleFile(L"WoWVR_cmd.txt");
@@ -4837,6 +4888,24 @@ namespace wowvr
                     // itself rather than an imitation of it. Only the HMD pose plumbing is
                     // bypassed, and that is independently known to work. It is what makes
                     // head-driven culling testable with the headset sitting still on a desk.
+                    else if (strncmp(command, "headsweep ", 10) == 0)
+                    {
+                        float amplitude = 0.0f;
+                        float period = 2.0f;
+                        if (sscanf_s(command + 10, "%f %f", &amplitude, &period) >= 1)
+                        {
+                            g_sweepAmplitude = amplitude;
+                            g_sweepPeriod = period > 0.1f ? period : 2.0f;
+                            g_sweepStart = Now();
+                            if (amplitude == 0.0f)
+                            {
+                                g_fakeHeadYaw = 0.0f;
+                                Projection().SetFakeHeadYaw(0.0f);
+                            }
+                            WOWVR_INFO("Head sweep: +/-%.3f rad every %.1f s.",
+                                       g_sweepAmplitude, g_sweepPeriod);
+                        }
+                    }
                     else if (strncmp(command, "head ", 5) == 0)
                     {
                         g_fakeHeadYaw = static_cast<float>(atof(command + 5));

@@ -301,7 +301,20 @@ namespace wowvr
         // and 3 each changed nothing; the interior then held at forced 45, 60 and
         // 90; and the forced-150 outdoor terrain void was identical with site 2 on
         // either feed, so it is not a terrain reader.
-        unsigned cullMasterShadowFeeds = 4;
+        //
+        // 16 = site 4 (the portal-rectangle function at 0x00790AF0) as well, found at
+        // the Goldshire smithy door: it builds each doorway's volume from the
+        // opening's unturned screen rectangle and the master corners, so a rotated
+        // master put the volume above the door by the full head pitch and the ground
+        // outside vanished whenever the head looked up.
+        //
+        // 8 = site 3 (the push at 0x007B3A35) as well, found at the same door: it
+        // feeds the next level of the portal walk (the volume through the doorway
+        // into a building beyond). Live, that volume swung by the head yaw - 17
+        // degrees of head turn moved it 17 degrees and the third-level volume was
+        // never built, so the house outside lost whole groups at the far end of a
+        // head turn. Its call stack sits inside the portal walk, not terrain.
+        unsigned cullMasterShadowFeeds = 28;
 
         // Draws every group of a WMO the walk already accepted, by answering "inside"
         // for the map-object family of the shared bounds test.

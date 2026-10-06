@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace wowvr
@@ -78,30 +79,70 @@ namespace wowvr
         float g_masterShadow[kMasterCornerFloats] = {};
 
         // The fixed-address read sites of the master corner array, from a byte scan
-        // of .text for values in [0x00CDB108, 0x00CDB168). Each entry is the address
-        // of the four-byte displacement itself plus the one opcode byte in front of
-        // it, verified before any write. Excluded on purpose: the builder function at
-        // 0x00795688-0x00795A4E (it read-modify-WRITES the corners), the
-        // zero-initialiser at 0x009CE2D4, the fill-argument push at 0x0079A79B (the
-        // master is that call's destination), and the eax-indexed FPU reader at
-        // 0x00790B9C-0x00790C80 (its base address legally indexes other volumes, so a
-        // displacement swap would corrupt those accesses too).
+        // of .text for values in [0x00CDB108, 0x00CDB168). Each operand is the address
+        // of a four-byte displacement, the byte in front of it and the master address
+        // it holds, all verified before any write. Excluded on purpose: the builder
+        // function at 0x00795688-0x00795A4E (it read-modify-WRITES the corners), the
+        // zero-initialiser at 0x009CE2D4 and the fill-argument push at 0x0079A79B (the
+        // master is that call's destination).
+        struct MasterFeedOperand
+        {
+            uint32_t dispAddress;    // published address of the disp32 operand
+            uint8_t before;          // the byte immediately before it
+            uint32_t master;         // the published master address it holds
+        };
         struct MasterFeedSite
         {
-            uintptr_t dispRva;   // address of the disp32 operand, image-relative
-            uint8_t opcode;      // the byte immediately before it
+            const MasterFeedOperand* operands;
+            int count;
             const char* name;
         };
+
+        const MasterFeedOperand kFeedCopyOut[] = { { 0x0078FAEEu, 0xBEu, 0x00CDB108u } };
+        const MasterFeedOperand kFeedViewSource[] = { { 0x0079A8B2u, 0x68u, 0x00CDB108u } };
+        const MasterFeedOperand kFeedConsumer[] = { { 0x007AC467u, 0x68u, 0x00CDB108u } };
+        const MasterFeedOperand kFeedWmoSide[] = { { 0x007B3A36u, 0x68u, 0x00CDB108u } };
+
+        // 0x00790AF0, the portal derivation: it takes an opening's SCREEN rectangle
+        // (projected by the client's own, unturned camera), interpolates the master's
+        // near and far quads at that rectangle's edges and hands the eight results to
+        // SetCorners. Each read is [eax + master + k] with eax stepping 0 then 0x30 -
+        // the near quad, then the far one - so every access stays inside the master
+        // and maps onto the shadow at the same offset. (It was once excluded on the
+        // belief that eax could index other volumes; disassembled, it cannot.)
+        //
+        // Fed the head-rotated master it built every doorway's volume turned by the
+        // head: at the Goldshire smithy door, with the head 20 degrees up, the volume
+        // sat 20.1 degrees above the door, so the ground outside never drew and the
+        // sky showed through where it should have been.
+        const MasterFeedOperand kFeedPortalRect[] =
+        {
+            { 0x00790B9Cu, 0x80u, 0x00CDB120u }, { 0x00790BA2u, 0xA0u, 0x00CDB114u },
+            { 0x00790BA8u, 0x80u, 0x00CDB124u }, { 0x00790BAEu, 0xA0u, 0x00CDB118u },
+            { 0x00790BB4u, 0x80u, 0x00CDB128u }, { 0x00790BBAu, 0xA0u, 0x00CDB11Cu },
+            { 0x00790BD5u, 0x80u, 0x00CDB114u }, { 0x00790BDEu, 0x80u, 0x00CDB118u },
+            { 0x00790BEDu, 0x80u, 0x00CDB11Cu }, { 0x00790C01u, 0x80u, 0x00CDB114u },
+            { 0x00790C0Au, 0x80u, 0x00CDB118u }, { 0x00790C13u, 0x80u, 0x00CDB11Cu },
+            { 0x00790C1Cu, 0x80u, 0x00CDB12Cu }, { 0x00790C22u, 0xA0u, 0x00CDB108u },
+            { 0x00790C28u, 0x80u, 0x00CDB130u }, { 0x00790C2Eu, 0xA0u, 0x00CDB10Cu },
+            { 0x00790C34u, 0x80u, 0x00CDB134u }, { 0x00790C3Au, 0xA0u, 0x00CDB110u },
+            { 0x00790C4Eu, 0x80u, 0x00CDB108u }, { 0x00790C56u, 0x80u, 0x00CDB10Cu },
+            { 0x00790C5Cu, 0x80u, 0x00CDB110u }, { 0x00790C72u, 0x80u, 0x00CDB108u },
+            { 0x00790C7Au, 0x80u, 0x00CDB10Cu }, { 0x00790C80u, 0x80u, 0x00CDB110u },
+        };
+
         const MasterFeedSite kMasterFeedSites[CullFrustum::kMasterFeedSiteCount] =
         {
-            { 0x0078FAEEu - kPublishedImageBase, 0xBEu,
+            { kFeedCopyOut, 1,
               "0x0078FAED mov esi, master; rep movsd (whole-array copy-out)" },
-            { 0x0079A8B2u - kPublishedImageBase, 0x68u,
+            { kFeedViewSource, 1,
               "0x0079A8B1 push master (SetCorners source for the view array)" },
-            { 0x007AC467u - kPublishedImageBase, 0x68u,
+            { kFeedConsumer, 1,
               "0x007AC466 push master (consumer, function unknown)" },
-            { 0x007B3A36u - kPublishedImageBase, 0x68u,
+            { kFeedWmoSide, 1,
               "0x007B3A35 push master (consumer beside the WMO family)" },
+            { kFeedPortalRect, static_cast<int>(sizeof(kFeedPortalRect) / sizeof(kFeedPortalRect[0])),
+              "0x00790AF0 portal rectangle to corners (24 reads)" },
         };
 
         // The shared AABB-vs-frustum test (section 8.4) and the caller range of its
@@ -740,35 +781,44 @@ namespace wowvr
         }
 
         const MasterFeedSite& feed = kMasterFeedSites[site];
-        uint8_t* operand = reinterpret_cast<uint8_t*>(ImageBase() + feed.dispRva);
-        if (operand[-1] != feed.opcode)
-        {
-            WOWVR_WARN("Master feed %d: 0x%08X does not hold the expected opcode "
-                       "(%02X found, %02X wanted); not the client this was decoded "
-                       "from. Leaving it alone.",
-                       site,
-                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(operand) - 1),
-                       operand[-1], feed.opcode);
-            return false;
-        }
-
-        const uint32_t live =
-            static_cast<uint32_t>(ImageBase() + kMasterCornersRva);
-        const uint32_t shadowAddress =
+        const uint32_t shadowBase =
             static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_masterShadow));
 
-        uint32_t current = 0;
-        memcpy(&current, operand, 4);
-        if (current != live && current != shadowAddress)
+        // Every operand is checked before any is written, so a client this was not
+        // decoded from is left wholly alone rather than half patched.
+        bool alreadyThere = true;
+        for (int i = 0; i < feed.count; ++i)
         {
-            WOWVR_WARN("Master feed %d: the displacement reads 0x%08X, which is "
-                       "neither the live master nor the shadow. Leaving it alone.",
-                       site, current);
-            return false;
+            const MasterFeedOperand& at = feed.operands[i];
+            const uint8_t* operand = reinterpret_cast<const uint8_t*>(
+                ImageBase() + (at.dispAddress - kPublishedImageBase));
+            const uint32_t live =
+                static_cast<uint32_t>(ImageBase() + (at.master - kPublishedImageBase));
+            const uint32_t shadowed = shadowBase + (at.master - 0x00CDB108u);
+            if (operand[-1] != at.before)
+            {
+                WOWVR_WARN("Master feed %d: 0x%08X does not hold the expected byte "
+                           "(%02X found, %02X wanted); not the client this was decoded "
+                           "from. Leaving it alone.",
+                           site, at.dispAddress - 1u, operand[-1], at.before);
+                return false;
+            }
+            uint32_t current = 0;
+            memcpy(&current, operand, 4);
+            if (current != live && current != shadowed)
+            {
+                WOWVR_WARN("Master feed %d: the displacement at 0x%08X reads 0x%08X, "
+                           "which is neither the live master nor the shadow. Leaving "
+                           "it alone.",
+                           site, at.dispAddress, current);
+                return false;
+            }
+            if (current != (shadow ? shadowed : live))
+            {
+                alreadyThere = false;
+            }
         }
-
-        const uint32_t wanted = shadow ? shadowAddress : live;
-        if (current == wanted)
+        if (alreadyThere)
         {
             m_feedShadow[site] = shadow;
             return true;
@@ -785,17 +835,28 @@ namespace wowvr
                    sizeof(g_masterShadow));
         }
 
-        DWORD previous = 0;
-        if (!VirtualProtect(operand, 4, PAGE_EXECUTE_READWRITE, &previous))
+        // One displacement at a time. A reader caught between two of them sees some
+        // corners shadowed and some live for that one call - both are valid corners,
+        // so the worst case is one frame of a slightly turned opening.
+        for (int i = 0; i < feed.count; ++i)
         {
-            WOWVR_WARN("Master feed %d: 0x%08X could not be made writable.",
-                       site,
-                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(operand)));
-            return false;
+            const MasterFeedOperand& at = feed.operands[i];
+            uint8_t* operand = reinterpret_cast<uint8_t*>(
+                ImageBase() + (at.dispAddress - kPublishedImageBase));
+            const uint32_t wanted = shadow
+                ? shadowBase + (at.master - 0x00CDB108u)
+                : static_cast<uint32_t>(ImageBase() + (at.master - kPublishedImageBase));
+            DWORD previous = 0;
+            if (!VirtualProtect(operand, 4, PAGE_EXECUTE_READWRITE, &previous))
+            {
+                WOWVR_WARN("Master feed %d: 0x%08X could not be made writable.",
+                           site, at.dispAddress);
+                return false;
+            }
+            memcpy(operand, &wanted, 4);
+            VirtualProtect(operand, 4, previous, &previous);
+            FlushInstructionCache(GetCurrentProcess(), operand, 4);
         }
-        memcpy(operand, &wanted, 4);
-        VirtualProtect(operand, 4, previous, &previous);
-        FlushInstructionCache(GetCurrentProcess(), operand, 4);
 
         m_feedShadow[site] = shadow;
         WOWVR_INFO("Master feed %d [%s] now reads the %s.",
@@ -1137,6 +1198,25 @@ namespace wowvr
                    shape.widestCorner * 57.2957795f, shape.meanOffAxis * 57.2957795f,
                    shape.nearest, shape.furthest,
                    shape.valid ? "" : " (shape unreadable)");
+
+        // Who asked for it: the client's own return addresses on the stack, published-image
+        // based, our frames left out. A volume's builder is shared by every family, so the
+        // caller above says nothing about which derivation fed it its corners; this does.
+        void* frames[24] = {};
+        const USHORT count = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+        char chain[24 * 11 + 1] = {};
+        size_t used = 0;
+        const uintptr_t base = ImageBase();
+        for (USHORT i = 0; i < count && used + 11 < sizeof(chain); ++i)
+        {
+            const uintptr_t at = reinterpret_cast<uintptr_t>(frames[i]);
+            if (at >= base && at < base + 0x00C00000u)
+            {
+                used += static_cast<size_t>(sprintf_s(chain + used, sizeof(chain) - used, " %08X",
+                    static_cast<unsigned>(at - base + kPublishedImageBase)));
+            }
+        }
+        WOWVR_INFO("    client stack:%s", used > 0 ? chain : " (none)");
     }
 
     void CullFrustum::OnPlanesBuilt(void* view, uintptr_t caller)

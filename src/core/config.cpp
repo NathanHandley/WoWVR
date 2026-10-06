@@ -296,6 +296,15 @@ namespace wowvr
         config.cullMasterShadowFeeds = static_cast<unsigned>(
             ReadInt(path, L"Camera", L"CullMasterShadowFeeds",
                     static_cast<int>(config.cullMasterShadowFeeds)));
+        // 4 and then 20 were shipped defaults before the rest of the portal walk's
+        // read sites (bits 16 and 8) were found, and the write-back above froze them
+        // into existing WoWVR.ini files. Left alone, those files would keep the
+        // doorway bugs the new default fixes.
+        if (config.cullMasterShadowFeeds == 4u || config.cullMasterShadowFeeds == 20u)
+        {
+            config.cullMasterShadowFeeds = 28u;
+            WritePrivateProfileStringW(L"Camera", L"CullMasterShadowFeeds", L"28", path.c_str());
+        }
         config.disableCameraCollision =
             ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
 

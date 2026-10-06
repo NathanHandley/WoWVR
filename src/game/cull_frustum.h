@@ -243,19 +243,19 @@ namespace wowvr
         // The four candidate sites are the byte-verified fixed-address readers found
         // by scanning .text for the array's address (the builder's own read-modify-
         // write references and the zero-initialiser are excluded on purpose, and the
-        // eax-indexed reader at 0x00790B9C is excluded because its base address can
-        // legally index OTHER volumes than the master):
+        // portal-rectangle function at 0x00790AF0 is one site of 24 reads):
         //
         //   0  0x0078FAED  mov esi, master; rep movsd   - copies the master out whole
         //   1  0x0079A8B1  push master                  - SetCorners source, view array
         //   2  0x007AC466  push master                  - consumer, function unknown
         //   3  0x007B3A35  push master                  - consumer beside the WMO family
+        //   4  0x00790AF0  24 x [eax + master + k]      - portal rectangle -> corners
         //
-        // Each is a one-dword displacement patch, verified against both accepted
+        // Each is a set of displacement patches, verified against both accepted
         // values before writing, reversible per site at runtime - because which sites
         // are terrain and which are portal derivation is settled by live bisection,
         // not by argument.
-        static const int kMasterFeedSiteCount = 4;
+        static const int kMasterFeedSiteCount = 5;
         bool SetMasterFeed(int site, bool shadow);
         void SetMasterFeedMask(unsigned shadowMask);
 
