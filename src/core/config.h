@@ -416,6 +416,14 @@ namespace wowvr
         // usual result of leaving it off.
         bool confineCursor = true;
 
+        // Comfort vignette: the edges of the view darken while the view moves without
+        // the head - walking, turning, being carried, dragging the camera with the mouse,
+        // zooming - and never for the head's own movement. Size is how far in from the
+        // edges it reaches: 0 Small, 1 Medium, 2 Large. Ctrl+Alt+V and Ctrl+Alt+N change
+        // both in game (and save them).
+        bool vignette = true;
+        int vignetteSize = 1;
+
         // Treat the interface panel as premultiplied alpha: blend the alpha channel on
         // its own factors while the interface renders, and composite the panel without
         // multiplying by alpha a second time. Off reverts to straight-alpha compositing,
@@ -517,4 +525,9 @@ namespace wowvr
     // distance chosen in the headset survives a restart. Clamped to the same limits
     // the loader applies. Returns the value now in force.
     float SetPanelDistance(float metres);
+
+    // The comfort vignette's two settings, for this session and saved to WoWVR.ini.
+    void SetVignette(bool on);
+    void SetVignetteSize(int size);
+    const wchar_t* VignetteSizeName(int size);
 }

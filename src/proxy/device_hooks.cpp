@@ -14,6 +14,7 @@
 #include "game/portrait_fix.h"
 #include "ui/help_card.h"
 #include "game/ui_canvas.h"
+#include "game/comfort_vignette.h"
 #include "game/world_pointer.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
@@ -1460,6 +1461,7 @@ namespace wowvr
                 Vr().LogCompositorStats();
             }
             Vr().RefreshDisplayFrequency();
+            Vignette().LogStatus();
             WOWVR_INFO("Lifebars in the world: strip %s (%ld rows of cells %.0fx%.0f px), %llu "
                        "lifebar cards drawn since the last report.",
                        g_plateStripActive ? "on" : "off",
@@ -1975,6 +1977,136 @@ namespace wowvr
                            Pointer().PlateCount() > 0 ? Pointer().Plate(0).distanceMetres : 0.0f);
             }
             return copied;
+        }
+
+        // The comfort vignette: a black ring with soft inner edge, laid over each eye on
+        // its own optical axis. Built per size as a texture in tangent space, so its
+        // inner radius is a true angle from the eye's centre of view.
+        IDirect3DTexture9* g_vignetteTexture = nullptr;
+        IDirect3DDevice9* g_vignetteDevice = nullptr;
+        int g_vignetteTextureSize = -1;
+        const float kVignetteReach = 3.0f;   // the quad spans tangents -3..3 (~143 deg)
+
+        IDirect3DTexture9* VignetteTexture(IDirect3DDevice9* device, int size)
+        {
+            if (g_vignetteTexture != nullptr && g_vignetteDevice == device && g_vignetteTextureSize == size)
+            {
+                return g_vignetteTexture;
+            }
+            if (g_vignetteTexture != nullptr && g_vignetteDevice == device)
+            {
+                g_vignetteTexture->Release();
+            }
+            g_vignetteTexture = nullptr;
+            g_vignetteDevice = device;
+            g_vignetteTextureSize = size;
+
+            // Where the darkening starts, in degrees from the centre of view, and how
+            // wide its soft edge is. Larger sizes start closer in.
+            const float innerDegrees = size <= 0 ? 48.0f : (size >= 2 ? 28.0f : 38.0f);
+            const float featherDegrees = 16.0f;
+            const int texels = 256;
+            if (FAILED(device->CreateTexture(texels, texels, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                             &g_vignetteTexture, nullptr)))
+            {
+                g_vignetteTexture = nullptr;
+                return nullptr;
+            }
+            D3DLOCKED_RECT locked = {};
+            if (FAILED(g_vignetteTexture->LockRect(0, &locked, nullptr, 0)))
+            {
+                g_vignetteTexture->Release();
+                g_vignetteTexture = nullptr;
+                return nullptr;
+            }
+            for (int y = 0; y < texels; ++y)
+            {
+                uint32_t* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(locked.pBits)
+                                                             + static_cast<size_t>(y) * locked.Pitch);
+                for (int x = 0; x < texels; ++x)
+                {
+                    const float tx = ((x + 0.5f) / texels * 2.0f - 1.0f) * kVignetteReach;
+                    const float ty = ((y + 0.5f) / texels * 2.0f - 1.0f) * kVignetteReach;
+                    const float degrees = atanf(sqrtf(tx * tx + ty * ty)) * 57.2957795f;
+                    float t = (degrees - innerDegrees) / featherDegrees;
+                    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                    t = t * t * (3.0f - 2.0f * t);   // smoothstep
+                    row[x] = static_cast<uint32_t>(t * 255.0f + 0.5f) << 24;   // black
+                }
+            }
+            g_vignetteTexture->UnlockRect(0);
+            return g_vignetteTexture;
+        }
+
+        void DrawVignette(IDirect3DDevice9* device)
+        {
+            const float amount = Vignette().Amount();
+            if (!(amount > 0.003f))
+            {
+                return;
+            }
+            IDirect3DTexture9* texture = VignetteTexture(device, Cfg().vignetteSize);
+            if (texture == nullptr)
+            {
+                return;
+            }
+            const float r = kVignetteReach;
+            const PanelVertex quad[6] = {
+                { -r,  r, 1.0f, 0.0f, 0.0f }, { r,  r, 1.0f, 1.0f, 0.0f }, { -r, -r, 1.0f, 0.0f, 1.0f },
+                {  r,  r, 1.0f, 1.0f, 0.0f }, { r, -r, 1.0f, 1.0f, 1.0f }, { -r, -r, 1.0f, 0.0f, 1.0f },
+            };
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZ | D3DFVF_TEX1);
+            device->SetTexture(0, texture);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            g_originalSetRenderState(device, D3DRS_TEXTUREFACTOR,
+                                     static_cast<DWORD>(amount * 255.0f + 0.5f) << 24);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            // In the eye's own space: it moves with the head, as a vignette should.
+            const Mat4 identity = Mat4Identity();
+            g_originalSetTransform(device, D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&identity));
+            g_originalSetTransform(device, D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&identity));
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                D3DVIEWPORT9 viewport = {};
+                viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
+                viewport.Width = g_stereo.EyeWidth();
+                viewport.Height = g_stereo.EyeHeight();
+                viewport.MaxZ = 1.0f;
+                g_originalSetViewport(device, &viewport);
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+                const Mat4 projection = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                                0.05f, 10.0f);
+                g_originalSetTransform(device, D3DTS_PROJECTION,
+                                       reinterpret_cast<const D3DMATRIX*>(&projection));
+                g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, 2, quad, sizeof(PanelVertex));
+            }
         }
 
         // Each captured lifebar as a small upright card over its unit, facing the head,
@@ -2915,6 +3047,7 @@ namespace wowvr
             {
                 // Into the eyes (the overlay goes on top of them in the compositor).
                 DrawWorldPlates(device);
+                DrawVignette(device);
                 DrawHelpIntoInterface(device);
                 DrawCursorIntoInterface(device);
                 if (savedState != nullptr)
@@ -2926,8 +3059,9 @@ namespace wowvr
                 return;
             }
 
-            // Lifebars first, so the interface sheet lies over them.
+            // Lifebars first, then the vignette, so the interface sheet lies over both.
             DrawWorldPlates(device);
+            DrawVignette(device);
             g_originalSetRenderTarget(device, 0, g_stereo.Color());
             g_originalSetDepthStencilSurface(device, nullptr);
 
@@ -3761,6 +3895,25 @@ namespace wowvr
                            Projection().HeadOffsetMetres().y);
             }
 
+            if (HotkeyPressed(Hotkey::Vignette))
+            {
+                SetVignette(!Cfg().vignette);
+                if (Cfg().vignette)
+                {
+                    Vignette().Preview(1.0f);
+                }
+                WOWVR_INFO("Ctrl+Alt+V: comfort vignette %s (saved).", Cfg().vignette ? "on" : "off");
+            }
+            if (HotkeyPressed(Hotkey::VignetteSize))
+            {
+                SetVignetteSize((Cfg().vignetteSize + 1) % 3);
+                // A size change is shown even if the vignette is off, so the choice can be
+                // seen; it does not switch the vignette on.
+                Vignette().Preview(1.0f);
+                WOWVR_INFO("Ctrl+Alt+N: comfort vignette size %ls (saved).",
+                           VignetteSizeName(Cfg().vignetteSize));
+            }
+
             if (HotkeyPressed(Hotkey::Help))
             {
                 Help().Toggle();
@@ -3999,6 +4152,14 @@ namespace wowvr
                     // layout is in force this frame.
                     Canvas().Install();
                     Canvas().Update(Cfg().panelCanvasScale);
+                    {
+                        static LARGE_INTEGER last = {};
+                        const LARGE_INTEGER now = Now();
+                        const float seconds = last.QuadPart != 0
+                            ? static_cast<float>(ElapsedMs(last, now) / 1000.0) : 0.011f;
+                        last = now;
+                        Vignette().Update(seconds, Cfg().vignette);
+                    }
 
                     // The panel no longer follows the head; it only picks up INI changes
                     // to its size here. It moves when Ctrl+Alt+F8 (or a full recentre)

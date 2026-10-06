@@ -14,6 +14,8 @@ namespace wowvr
         PanelFarther,  // Ctrl+Alt+PageUp   - push the UI panel away (repeats while held)
         PanelNearer,   // Ctrl+Alt+PageDown - pull the UI panel in (repeats while held)
         Help,          // Ctrl+Alt+F1  - show/hide the list of these commands
+        Vignette,      // Ctrl+Alt+V   - comfort vignette on/off
+        VignetteSize,  // Ctrl+Alt+N   - comfort vignette size: Small, Medium, Large
         Count
     };
 

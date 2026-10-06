@@ -19,6 +19,10 @@ clicks can't land on the desktop; alt-tab releases it.
 ALT + CTRL + F1 shows or hides a list of all the WoWVR commands (a reminder of this shows in the
 corner for the first 10 seconds; `[Panel] LaunchHintSeconds` changes that, 0 turns it off)
 
+ALT + CTRL + V turns the comfort vignette on or off, ALT + CTRL + N cycles its size (Small, Medium,
+Large). It darkens the edges of the view while the view moves without your head - walking, turning,
+dragging the camera, zooming - and is saved to `[Comfort]` in WoWVR.ini.
+
 ALT + CTRL + F11 "recenters" the view (and puts the interface back in front of you)
 
 In the world the interface sits on a canvas twice as wide and tall as the screen (`[Panel] CanvasScale`,

@@ -73,6 +73,8 @@ set(WOWVR_SOURCES
     src/game/portrait_fix.h
     src/game/ui_canvas.cpp
     src/game/ui_canvas.h
+    src/game/comfort_vignette.cpp
+    src/game/comfort_vignette.h
     src/ui/help_card.cpp
     src/ui/help_card.h
     src/game/world_pointer.cpp

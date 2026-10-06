@@ -98,6 +98,15 @@ namespace wowvr
             L"; 1 keeps the mouse inside the game window while the game has focus, so a\r\n"
             L"; click can't land on the desktop. Released while another window has focus.\r\n"
             L"ConfineCursor=1\r\n"
+            L"\r\n"
+            L"[Comfort]\r\n"
+            L"; Darkens the edges of the view while the view moves without your head moving\r\n"
+            L"; (walking, turning, mouse-dragging the camera, zooming). 1 on, 0 off.\r\n"
+            L"; Ctrl+Alt+V toggles it in game.\r\n"
+            L"Vignette=1\r\n"
+            L"; How far in from the edges it reaches: Small, Medium or Large.\r\n"
+            L"; Ctrl+Alt+N cycles it in game.\r\n"
+            L"VignetteSize=Medium\r\n"
             L"; Seconds the Ctrl+Alt+F1 command-list hint shows at launch (0 = never).\r\n"
             L"LaunchHintSeconds=10\r\n"
             L"; In the world, a canvas this many times bigger each way around the same-sized\r\n"
@@ -323,6 +332,13 @@ namespace wowvr
         }
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
+        config.vignette = ReadBool(path, L"Comfort", L"Vignette", config.vignette);
+        {
+            const std::wstring size = ReadString(path, L"Comfort", L"VignetteSize", L"Medium");
+            if (_wcsicmp(size.c_str(), L"Small") == 0 || size == L"0") { config.vignetteSize = 0; }
+            else if (_wcsicmp(size.c_str(), L"Large") == 0 || size == L"2") { config.vignetteSize = 2; }
+            else { config.vignetteSize = 1; }
+        }
         config.premultipliedUi =
             ReadBool(path, L"Panel", L"PremultipliedUi", config.premultipliedUi);
 
@@ -374,6 +390,27 @@ namespace wowvr
     const Config& Cfg()
     {
         return g_config;
+    }
+
+    const wchar_t* VignetteSizeName(int size)
+    {
+        return size <= 0 ? L"Small" : (size >= 2 ? L"Large" : L"Medium");
+    }
+
+    void SetVignette(bool on)
+    {
+        g_config.vignette = on;
+        WritePrivateProfileStringW(L"Comfort", L"Vignette", on ? L"1" : L"0",
+                                   ModuleFile(L"WoWVR.ini").c_str());
+    }
+
+    void SetVignetteSize(int size)
+    {
+        if (size < 0) { size = 0; }
+        if (size > 2) { size = 2; }
+        g_config.vignetteSize = size;
+        WritePrivateProfileStringW(L"Comfort", L"VignetteSize", VignetteSizeName(size),
+                                   ModuleFile(L"WoWVR.ini").c_str());
     }
 
     float SetPanelDistance(float metres)

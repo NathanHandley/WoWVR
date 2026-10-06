@@ -25,6 +25,8 @@ namespace wowvr
             { L"Ctrl+Alt+F11",      L"Recenter view and interface" },
             { L"Ctrl+Alt+Page Up",  L"Push interface away" },
             { L"Ctrl+Alt+Page Down", L"Pull interface closer" },
+            { L"Ctrl+Alt+V",        L"Comfort vignette on/off" },
+            { L"Ctrl+Alt+N",        L"Vignette size" },
             { L"Ctrl+Alt+F12",      L"Reload WoWVR.ini settings" },
             { L"Ctrl+Alt+F10",      L"Save eye screenshots" },
             { L"Ctrl+Alt+F9",       L"Log a frame report" },
