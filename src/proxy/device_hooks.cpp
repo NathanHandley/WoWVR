@@ -2045,8 +2045,9 @@ namespace wowvr
             g_vignetteTextureSize = size;
 
             // Where the darkening starts, in degrees from the centre of view, and how
-            // wide its soft edge is. Larger sizes start closer in.
-            const float innerDegrees = size <= 0 ? 48.0f : (size >= 2 ? 28.0f : 38.0f);
+            // wide its soft edge is. Larger sizes start closer in. Steps of 10 degrees:
+            // Small 38 (was 48, too subtle), Medium 28 (the old Large), Large 18.
+            const float innerDegrees = size <= 0 ? 38.0f : (size >= 2 ? 18.0f : 28.0f);
             const float featherDegrees = 16.0f;
             const int texels = 256;
             if (FAILED(device->CreateTexture(texels, texels, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
