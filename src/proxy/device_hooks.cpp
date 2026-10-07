@@ -13,6 +13,7 @@
 #include "game/view_distance.h"
 #include "game/portrait_fix.h"
 #include "ui/help_card.h"
+#include "game/interior_view.h"
 #include "game/ui_canvas.h"
 #include "game/comfort_vignette.h"
 #include "game/world_pointer.h"
@@ -916,6 +917,10 @@ namespace wowvr
         // Runtime switch, ANDed with the config one at the point of use - reading Cfg() here
         // would run before the ini has been loaded.
         bool g_disableCameraCollision = true;
+
+        // The runtime half of Cfg().interiorFromCharacter: -1 follows the INI, 0/1 are
+        // "interioroff"/"interioron".
+        int g_interiorFromCharacter = -1;
 
         // 0 leaves the client's own value alone.
         float g_cullFovOverride = 0.0f;
@@ -4245,6 +4250,12 @@ namespace wowvr
                         Vignette().Update(seconds, Cfg().vignette);
                     }
 
+                    // Buildings entered from where the character stands, so zooming the
+                    // camera out through a wall does not cull the interior around them.
+                    Interior().Install();
+                    Interior().Update(g_interiorFromCharacter < 0 ? Cfg().interiorFromCharacter
+                                                                  : g_interiorFromCharacter != 0);
+
                     // The panel no longer follows the head; it only picks up INI changes
                     // to its size here. It moves when Ctrl+Alt+F8 (or a full recentre)
                     // places it again.
@@ -4937,6 +4948,14 @@ namespace wowvr
                     // "lua <code>": runs a snippet in the client, in the world only - for
                     // reading what the client itself thinks (cursor position, mouse focus)
                     // when a capture cannot show it.
+                    else if (strncmp(command, "interioroff", 11) == 0)
+                    {
+                        g_interiorFromCharacter = 0;
+                    }
+                    else if (strncmp(command, "interioron", 10) == 0)
+                    {
+                        g_interiorFromCharacter = 1;
+                    }
                     else if (strncmp(command, "drawskip ", 9) == 0)
                     {
                         unsigned mask = 0;

@@ -362,6 +362,13 @@ namespace wowvr
         // the same client gets the client's own behaviour back.
         bool disableCameraCollision = true;
 
+        // Whether the client counts the camera as inside a building from the CHARACTER's
+        // position rather than the camera's. With collision off the camera can zoom out
+        // through a wall or into the hillside above a cave; the client then culls the
+        // whole interior the character is standing in. On, the interior around the
+        // character keeps drawing however far out the camera goes (game/interior_view.h).
+        bool interiorFromCharacter = true;
+
         // Last-resort camera identification: alters candidate addresses to see which
         // one the game rebuilds its projection from. Conclusive, but it writes to
         // memory that may belong to something else, and it has crashed the client.

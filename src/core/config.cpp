@@ -312,6 +312,8 @@ namespace wowvr
         }
         config.disableCameraCollision =
             ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
+        config.interiorFromCharacter =
+            ReadBool(path, L"Camera", L"InteriorFromCharacter", config.interiorFromCharacter);
 
         config.headDrivenSoundListener =
             ReadBool(path, L"Sound", L"HeadDrivenListener", config.headDrivenSoundListener);
