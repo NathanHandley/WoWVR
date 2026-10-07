@@ -2206,15 +2206,33 @@ namespace wowvr
             for (int k = 0; k < n; ++k)
             {
                 const WorldPlate& plate = Pointer().Plate(order[k]);
-                Vec3 toHead = { head.x - plate.body.x, 0.0f, head.z - plate.body.z };
-                const float flat = sqrtf(toHead.x * toHead.x + toHead.z * toHead.z);
-                if (!(flat > 1.0e-3f))
+                // Like the client's own names over units: the card faces the head squarely
+                // (tipping back when seen from above or below, so it never reads skewed),
+                // with the body frame's up as its up - the client's names stand along its
+                // camera's up, which is the body frame's, so the two always agree. Not the
+                // world's up: the client bakes its camera pitch into the scene (up to ~43
+                // degrees zoomed out), so world up is tilted as the headset sees it.
+                Vec3 toHead = { head.x - plate.body.x, head.y - plate.body.y,
+                                head.z - plate.body.z };
+                const float range = sqrtf(toHead.x * toHead.x + toHead.y * toHead.y
+                                          + toHead.z * toHead.z);
+                if (!(range > 1.0e-3f))
                 {
                     continue;
                 }
-                toHead.x /= flat;
-                toHead.z /= flat;
-                const Vec3 right = { -toHead.z, 0.0f, toHead.x };
+                toHead = { toHead.x / range, toHead.y / range, toHead.z / range };
+                const float along = toHead.y;   // body up is (0, 1, 0)
+                Vec3 up = { -toHead.x * along, 1.0f - toHead.y * along, -toHead.z * along };
+                const float upLength = sqrtf(up.x * up.x + up.y * up.y + up.z * up.z);
+                if (!(upLength > 1.0e-3f))
+                {
+                    continue;   // straight above or below: no up to keep
+                }
+                up = { up.x / upLength, up.y / upLength, up.z / upLength };
+                // toHead x up, so the card reads left to right as seen from the head.
+                const Vec3 right = { -(up.y * toHead.z - up.z * toHead.y),
+                                     -(up.z * toHead.x - up.x * toHead.z),
+                                     -(up.x * toHead.y - up.y * toHead.x) };
                 // Metres per texel at the unit's distance, for the panel's angular size.
                 const float perPixel = shape.metresPerPixel * plate.distanceMetres
                                      / (shape.radius > 0.1f ? shape.radius : 0.1f);
@@ -2229,10 +2247,16 @@ namespace wowvr
                 const float v0 = (cellTopV - g_plateStripTopV) / g_plateStripHeightV;
                 const float v1 = (cellTopV + g_plateCellV - g_plateStripTopV) / g_plateStripHeightV;
                 const Vec3 c = plate.body;
-                const PanelVertex tl = { c.x - right.x * halfW, c.y + above, c.z - right.z * halfW, u0, v0 };
-                const PanelVertex tr = { c.x + right.x * halfW, c.y + above, c.z + right.z * halfW, u1, v0 };
-                const PanelVertex bl = { c.x - right.x * halfW, c.y - below, c.z - right.z * halfW, u0, v1 };
-                const PanelVertex br = { c.x + right.x * halfW, c.y - below, c.z + right.z * halfW, u1, v1 };
+                const Vec3 top = { c.x + up.x * above, c.y + up.y * above, c.z + up.z * above };
+                const Vec3 bottom = { c.x - up.x * below, c.y - up.y * below, c.z - up.z * below };
+                const PanelVertex tl = { top.x - right.x * halfW, top.y - right.y * halfW,
+                                         top.z - right.z * halfW, u0, v0 };
+                const PanelVertex tr = { top.x + right.x * halfW, top.y + right.y * halfW,
+                                         top.z + right.z * halfW, u1, v0 };
+                const PanelVertex bl = { bottom.x - right.x * halfW, bottom.y - right.y * halfW,
+                                         bottom.z - right.z * halfW, u0, v1 };
+                const PanelVertex br = { bottom.x + right.x * halfW, bottom.y + right.y * halfW,
+                                         bottom.z + right.z * halfW, u1, v1 };
                 quads[vertices++] = tl; quads[vertices++] = tr; quads[vertices++] = bl;
                 quads[vertices++] = tr; quads[vertices++] = br; quads[vertices++] = bl;
             }
