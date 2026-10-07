@@ -864,6 +864,26 @@ namespace wowvr
         return true;
     }
 
+    void ProjectionPatch::LogCombinedResidual(const float* uploaded) const
+    {
+        if (!m_haveSceneMatrix)
+        {
+            return;
+        }
+        Mat4 inverseScene;
+        if (!Mat4Inverse(m_sceneMatrix, inverseScene))
+        {
+            return;
+        }
+        const Mat4 asUploaded = MatrixFrom(uploaded);
+        const Mat4 a = Mat4Multiply(asUploaded, inverseScene);
+        const Mat4 b = Mat4Multiply(Mat4Transpose(asUploaded), inverseScene);
+        WOWVR_INFO("    residual: as uploaded col3 %.6f %.6f %.6f %.6f t %.1f %.1f %.1f | "
+                   "transposed col3 %.6f %.6f %.6f %.6f t %.1f %.1f %.1f",
+                   a.m[0][3], a.m[1][3], a.m[2][3], a.m[3][3], a.m[3][0], a.m[3][1], a.m[3][2],
+                   b.m[0][3], b.m[1][3], b.m[2][3], b.m[3][3], b.m[3][0], b.m[3][1], b.m[3][2]);
+    }
+
     bool ProjectionPatch::TryPatchCombinedStrict(const float* uploaded,
                                                  float* outLeft, float* outRight)
     {
@@ -987,6 +1007,41 @@ namespace wowvr
         return true;
     }
 
+    namespace
+    {
+        // Whether a residual (an uploaded combined transform times the inverse scene camera)
+        // is affine, and if so its last column put back to exactly 0 0 0 1.
+        //
+        // The bottom-right element has to be judged against the size of the translation. A
+        // shader that takes WORLD coordinates - the water at c0 - carries translations in the
+        // thousands of yards, and single precision then leaves that element a rounding step
+        // off: 0.996094 (1 - 1/256) at about 8,000 yards in Teldrassil. Against a flat 0.001
+        // it passed or failed with the camera's exact position, so while swimming the water
+        // went out with the game's own matrix in about a third of frames - a sheet pinned to
+        // the view in both eyes, flickering. A different camera would show in the first three
+        // elements, which stay strict (they read exactly 0 here).
+        bool ResidualIsAffine(Mat4& residual)
+        {
+            if (std::fabs(residual.m[0][3]) >= 1.0e-3f || std::fabs(residual.m[1][3]) >= 1.0e-3f
+                || std::fabs(residual.m[2][3]) >= 1.0e-3f)
+            {
+                return false;
+            }
+            float reach = std::fabs(residual.m[3][0]);
+            if (std::fabs(residual.m[3][1]) > reach) { reach = std::fabs(residual.m[3][1]); }
+            if (std::fabs(residual.m[3][2]) > reach) { reach = std::fabs(residual.m[3][2]); }
+            if (std::fabs(residual.m[3][3] - 1.0f) >= 1.0e-3f + 2.0e-6f * reach)
+            {
+                return false;
+            }
+            residual.m[0][3] = 0.0f;
+            residual.m[1][3] = 0.0f;
+            residual.m[2][3] = 0.0f;
+            residual.m[3][3] = 1.0f;
+            return true;
+        }
+    }
+
     bool ProjectionPatch::TryPatchCombined(const float* uploaded, float* outLeft, float* outRight)
     {
         ++m_combinedTried;
@@ -1026,10 +1081,10 @@ namespace wowvr
         Mat4 worldView = Mat4Multiply(asUploaded, inverseScene);
         bool wasTransposed = false;
 
-        if (!Mat4IsAffine(worldView, 1.0e-3f))
+        if (!ResidualIsAffine(worldView))
         {
             worldView = Mat4Multiply(Mat4Transpose(asUploaded), inverseScene);
-            if (!Mat4IsAffine(worldView, 1.0e-3f))
+            if (!ResidualIsAffine(worldView))
             {
                 ++m_combinedNotAffine;
                 return false;

@@ -795,6 +795,21 @@ namespace wowvr
 
         // A head turn stood in for, so the orbit correction can be measured on the desktop.
         float g_fakeHeadYaw = 0.0f;
+
+        // "drawlist": every world draw of the next frame logged, one line each, to find
+        // a draw that is not getting the head's transform.
+        int g_drawListFrames = 0;
+        int g_drawListIndex = 0;
+
+        // "drawskip <mask> [vs]": world draws dropped by category, to find which one
+        // something on screen comes from. 1 fixed function, 2 blended shader draws that
+        // do not write depth (particles, ribbons), 4 the sky depth slice, 8 one vertex
+        // shader (the hex pointer given). 0 is off.
+        unsigned g_debugDrawSkip = 0;
+        uintptr_t g_debugDrawSkipShader = 0;
+        int ShaderSlotsInUse();
+        int ShaderSlotCapacity();
+        void ReportShaderMisses();
         // "headsweep <amplitude rad> <period s>": the fake yaw swung as a sine every frame,
         // because a real head is never still and the command file is only read every 15
         // frames - too coarse to stand in for one. "headsweep 0" stops it.
@@ -1518,6 +1533,7 @@ namespace wowvr
                        "sky-slice eye draws %llu",
                        g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
                        g_drawsStrayBackBuffer, g_lastPeriodCount, g_skySliceDraws);
+            ReportShaderMisses();
             // Alongside the draw counts on purpose: the claim this whole approach rests on
             // is that pointing the culling volume somewhere else does not change how much
             // is in it, and these two numbers together are what settles that.
@@ -4269,6 +4285,11 @@ namespace wowvr
             }
 
             ++g_frameCount;
+            if (g_drawListFrames > 0 && --g_drawListFrames == 0)
+            {
+                WOWVR_INFO("Draw list ends: %d world draws; %d of %d shader slots in use.",
+                           g_drawListIndex, ShaderSlotsInUse(), ShaderSlotCapacity());
+            }
             if ((g_frameCount % 120) == 0)
             {
                 // Unconditional, unlike the cost report, so a collapsed frame
@@ -4892,6 +4913,22 @@ namespace wowvr
                     // "lua <code>": runs a snippet in the client, in the world only - for
                     // reading what the client itself thinks (cursor position, mouse focus)
                     // when a capture cannot show it.
+                    else if (strncmp(command, "drawskip ", 9) == 0)
+                    {
+                        unsigned mask = 0;
+                        unsigned long long shader = 0;
+                        const int got = sscanf_s(command + 9, "%u %llx", &mask, &shader);
+                        g_debugDrawSkip = got >= 1 ? mask : 0;
+                        g_debugDrawSkipShader = got >= 2 ? static_cast<uintptr_t>(shader) : 0;
+                        WOWVR_INFO("Draw skip: mask %u, shader %p.", g_debugDrawSkip,
+                                   reinterpret_cast<void*>(g_debugDrawSkipShader));
+                    }
+                    else if (strncmp(command, "drawlist", 8) == 0)
+                    {
+                        g_drawListIndex = 0;
+                        g_drawListFrames = 2;   // the rest of this frame, then one whole one
+                        WOWVR_INFO("Draw list: logging the next frame's world draws.");
+                    }
                     else if (strncmp(command, "lua ", 4) == 0)
                     {
                         WOWVR_INFO("lua: %s", Canvas().RunDebugScript(command + 4)
@@ -5920,6 +5957,12 @@ namespace wowvr
             bool resolved;
             bool hopeless;
 
+            // Draws since the last report whose resolved register did NOT read as the
+            // camera times a placement, so they went out with the game's own matrix -
+            // pinned to the view in both eyes.
+            unsigned misses;
+            unsigned draws;
+
             // The left and right matrices last derived, and the constants they came
             // from. BeginEye runs once per eye with nothing uploaded in between, so the
             // second call always hits this and the recovery is done once per draw
@@ -5933,6 +5976,26 @@ namespace wowvr
         const int kMaxShaderCombined = 96;
         ShaderCombined g_shaderCombined[kMaxShaderCombined];
         int g_shaderCombinedCount = 0;
+
+        int ShaderSlotsInUse() { return g_shaderCombinedCount; }
+
+        void ReportShaderMisses()
+        {
+            for (int i = 0; i < g_shaderCombinedCount; ++i)
+            {
+                ShaderCombined& entry = g_shaderCombined[i];
+                if (entry.misses > 0)
+                {
+                    WOWVR_INFO("  shader %p (combined at c%u): %u of %u draws kept the game's "
+                               "own matrix (not camera x placement).",
+                               static_cast<void*>(entry.shader), entry.startRegister,
+                               entry.misses, entry.draws);
+                }
+                entry.misses = 0;
+                entry.draws = 0;
+            }
+        }
+        int ShaderSlotCapacity() { return kMaxShaderCombined; }
 
         ShaderCombined* FindShaderCombined(IDirect3DVertexShader9* shader)
         {
@@ -5957,6 +6020,8 @@ namespace wowvr
             entry.resolved = false;
             entry.hopeless = false;
             entry.hasCache = false;
+            entry.misses = 0;
+            entry.draws = 0;
             return &entry;
         }
 
@@ -5983,7 +6048,12 @@ namespace wowvr
 
             if (++entry->attempts > 240)
             {
+                // Said once per shader: a world shader that never resolves is drawn with
+                // the client's camera in both eyes - pinned to the view, ignoring the head.
                 entry->hopeless = true;
+                WOWVR_INFO("Shader %p: no combined transform found after 240 world draws; "
+                           "it is drawn with the game's own camera.",
+                           static_cast<void*>(g_currentVertexShader));
                 return;
             }
 
@@ -6040,8 +6110,118 @@ namespace wowvr
                 && !g_uiPassStarted && !g_duplicatingDraw;
         }
 
+        void LogDrawListEntry(IDirect3DDevice9* device)
+        {
+            const ShaderCombined* entry = nullptr;
+            for (int i = 0; i < g_shaderCombinedCount; ++i)
+            {
+                if (g_shaderCombined[i].shader == g_currentVertexShader)
+                {
+                    entry = &g_shaderCombined[i];
+                    break;
+                }
+            }
+            DWORD srcBlend = 0, destBlend = 0, alphaBlend = 0, zWrite = 0, fvf = 0;
+            device->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+            device->GetRenderState(D3DRS_SRCBLEND, &srcBlend);
+            device->GetRenderState(D3DRS_DESTBLEND, &destBlend);
+            device->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+            device->GetFVF(&fvf);
+            IDirect3DBaseTexture9* texture = nullptr;
+            device->GetTexture(0, &texture);
+            WOWVR_INFO("  draw %4d: vs %p %s ps %p fvf 0x%03lX blend %lu %lu/%lu zw %lu tex %p "
+                       "z %.4f-%.4f",
+                       g_drawListIndex++, static_cast<void*>(g_currentVertexShader),
+                       g_currentVertexShader == nullptr ? "(fixed function)"
+                           : entry == nullptr ? "(NOT TRACKED - table full?)"
+                           : entry->resolved ? "(resolved)"
+                           : entry->hopeless ? "(hopeless)" : "(resolving)",
+                       static_cast<void*>(g_currentPixelShader), fvf, alphaBlend, srcBlend,
+                       destBlend, zWrite, static_cast<void*>(texture),
+                       g_gameViewportMinZ, g_gameViewportMaxZ);
+            if (entry != nullptr && entry->resolved)
+            {
+                WOWVR_INFO("             combined at c%u", entry->startRegister);
+            }
+            if (g_currentVertexShader == nullptr)
+            {
+                D3DMATRIX projection = {};
+                D3DMATRIX view = {};
+                D3DMATRIX world = {};
+                device->GetTransform(D3DTS_PROJECTION, &projection);
+                device->GetTransform(D3DTS_VIEW, &view);
+                device->GetTransform(D3DTS_WORLD, &world);
+                WOWVR_INFO("             proj %.3f %.3f %.3f %.3f %.3f %.3f | view r %.3f %.3f %.3f "
+                           "t %.1f %.1f %.1f | world t %.1f %.1f %.1f",
+                           projection._11, projection._22, projection._31, projection._32,
+                           projection._34, projection._44, view._11, view._12, view._13,
+                           view._41, view._42, view._43, world._41, world._42, world._43);
+            }
+            if (texture != nullptr) { texture->Release(); }
+        }
+
+        bool DebugSkipWorldDraw(IDirect3DDevice9* device)
+        {
+            if ((g_debugDrawSkip & 1u) && g_currentVertexShader == nullptr) { return true; }
+            if ((g_debugDrawSkip & 8u) && g_currentVertexShader != nullptr
+                && reinterpret_cast<uintptr_t>(g_currentVertexShader) == g_debugDrawSkipShader)
+            {
+                return true;
+            }
+            if ((g_debugDrawSkip & 4u) && g_gameViewportMinZ >= 0.9985f) { return true; }
+            if ((g_debugDrawSkip & 16u) && g_gameViewportMinZ >= 0.9975f
+                && g_gameViewportMinZ < 0.9985f)
+            {
+                return true;
+            }
+            if ((g_debugDrawSkip & 2u) && g_currentVertexShader != nullptr && g_alphaBlendEnabled)
+            {
+                DWORD zWrite = TRUE;
+                device->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+                if (!zWrite) { return true; }
+            }
+            return false;
+        }
+
+        // A draw that is not being duplicated per eye: the interface pass, offscreen
+        // targets, or the post-process. Kept short - the interface alone is hundreds.
+        void LogDrawListOther(IDirect3DDevice9* device)
+        {
+            static int s_logged = 0;
+            if (g_drawListIndex == 0) { s_logged = 0; }
+            if (!g_renderingToBackBuffer || ++s_logged > 400) { return; }
+            DWORD alphaBlend = 0, zEnable = 0, fvf = 0;
+            device->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+            device->GetRenderState(D3DRS_ZENABLE, &zEnable);
+            device->GetFVF(&fvf);
+            WOWVR_INFO("  other %4d: period %d ui %d backbuffer %d vs %p ps %p fvf 0x%03lX "
+                       "blend %lu ztest %lu",
+                       g_drawListIndex++, g_backBufferDrawPeriod, g_uiPassStarted ? 1 : 0,
+                       g_renderingToBackBuffer ? 1 : 0,
+                       static_cast<void*>(g_currentVertexShader),
+                       static_cast<void*>(g_currentPixelShader), fvf, alphaBlend, zEnable);
+            if (g_currentVertexShader == nullptr)
+            {
+                D3DMATRIX projection = {};
+                D3DMATRIX view = {};
+                D3DMATRIX world = {};
+                device->GetTransform(D3DTS_PROJECTION, &projection);
+                device->GetTransform(D3DTS_VIEW, &view);
+                device->GetTransform(D3DTS_WORLD, &world);
+                WOWVR_INFO("             proj %.3f %.3f %.3f %.3f | %.3f %.3f  view t %.1f %.1f %.1f  "
+                           "world t %.1f %.1f %.1f",
+                           projection._11, projection._22, projection._34, projection._44,
+                           projection._33, projection._43, view._41, view._42, view._43,
+                           world._41, world._42, world._43);
+            }
+        }
+
         void BeginEye(IDirect3DDevice9* device, int eye)
         {
+            if (g_drawListFrames > 0 && eye == EyeLeft)
+            {
+                LogDrawListEntry(device);
+            }
             D3DVIEWPORT9 viewport = {};
             viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
             viewport.Y = 0;
@@ -6154,12 +6334,21 @@ namespace wowvr
                     // the scene into a single plane, so the reuse was plainly not valid.
                     float left[16];
                     float right[16];
+                    if (eye == EyeLeft) { ++entry->draws; }
                     if (Projection().TryPatchCombined(&g_shadowConstants[entry->startRegister][0],
                                                      left, right))
                     {
                         g_originalSetVertexShaderConstantF(
                             device, entry->startRegister,
                             eye == EyeLeft ? left : right, 4);
+                    }
+                    else if (eye == EyeLeft)
+                    {
+                        if (++entry->misses <= 3)
+                        {
+                            Projection().LogCombinedResidual(
+                                &g_shadowConstants[entry->startRegister][0]);
+                        }
                     }
                 }
             }
@@ -7393,6 +7582,11 @@ namespace wowvr
                 return D3D_OK;
             }
 
+            if (g_drawListFrames > 0 && !ShouldDuplicateDraw()) { LogDrawListOther(device); }
+            if (g_debugDrawSkip != 0 && ShouldDuplicateDraw() && DebugSkipWorldDraw(device))
+            {
+                return D3D_OK;
+            }
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
@@ -7457,6 +7651,11 @@ namespace wowvr
 
             g_lastPrimitiveCount = primitiveCount;
 
+            if (g_drawListFrames > 0 && !ShouldDuplicateDraw()) { LogDrawListOther(device); }
+            if (g_debugDrawSkip != 0 && ShouldDuplicateDraw() && DebugSkipWorldDraw(device))
+            {
+                return D3D_OK;
+            }
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawIndexedPrimitive(device, type, baseVertexIndex, minVertexIndex,
@@ -7520,6 +7719,11 @@ namespace wowvr
                 return D3D_OK;
             }
 
+            if (g_drawListFrames > 0 && !ShouldDuplicateDraw()) { LogDrawListOther(device); }
+            if (g_debugDrawSkip != 0 && ShouldDuplicateDraw() && DebugSkipWorldDraw(device))
+            {
+                return D3D_OK;
+            }
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawPrimitiveUP(device, type, primitiveCount, vertexData, stride);
@@ -7584,6 +7788,11 @@ namespace wowvr
                 return D3D_OK;
             }
 
+            if (g_drawListFrames > 0 && !ShouldDuplicateDraw()) { LogDrawListOther(device); }
+            if (g_debugDrawSkip != 0 && ShouldDuplicateDraw() && DebugSkipWorldDraw(device))
+            {
+                return D3D_OK;
+            }
             if (!ShouldDuplicateDraw())
             {
                 return g_originalDrawIndexedPrimitiveUP(device, type, minVertexIndex, numVertices,

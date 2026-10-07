@@ -119,6 +119,10 @@ namespace wowvr
         // constant file, where the plain affine test alone accepts far too much.
         bool TryPatchCombinedStrict(const float* uploaded, float* outLeft, float* outRight);
 
+        // Diagnostic: logs the residual of a combined upload against the scene camera
+        // (its last column, which must read 0 0 0 1, and its translation).
+        void LogCombinedResidual(const float* uploaded) const;
+
         bool HasSceneMatrix() const { return m_haveSceneMatrix; }
 
         // Where the game's camera sits in world coordinates, recovered from the
