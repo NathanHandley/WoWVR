@@ -129,6 +129,15 @@ namespace wowvr
         }
     }
 
+    bool UiCanvas::RunDebugScript(const char* code)
+    {
+        if (!Install() || code == nullptr || !InWorld())
+        {
+            return false;
+        }
+        return Run(code);
+    }
+
     bool UiCanvas::Install()
     {
         if (g_installed)

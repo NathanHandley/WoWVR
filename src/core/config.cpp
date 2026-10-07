@@ -98,6 +98,11 @@ namespace wowvr
             L"; 1 keeps the mouse inside the game window while the game has focus, so a\r\n"
             L"; click can't land on the desktop. Released while another window has focus.\r\n"
             L"ConfineCursor=1\r\n"
+            L"; The resolution the game runs at, e.g. 3200x1800, even one your monitor\r\n"
+            L"; cannot show: the interface in the headset gets sharper. The desktop window\r\n"
+            L"; is shrunk to fit the screen. Set gxResolution in WTF\\Config.wtf to the same\r\n"
+            L"; size. 0x0 = off.\r\n"
+            L"InterfaceResolution=0x0\r\n"
             L"\r\n"
             L"[Comfort]\r\n"
             L"; Darkens the edges of the view while the view moves without your head moving\r\n"
@@ -341,6 +346,17 @@ namespace wowvr
         }
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);
+        {
+            const std::wstring size = ReadString(path, L"Panel", L"InterfaceResolution", L"0x0");
+            unsigned width = 0;
+            unsigned height = 0;
+            if (swscanf_s(size.c_str(), L"%ux%u", &width, &height) == 2
+                && width >= 640 && height >= 480 && width <= 7680 && height <= 4320)
+            {
+                config.interfaceWidth = width;
+                config.interfaceHeight = height;
+            }
+        }
         config.vignette = ReadBool(path, L"Comfort", L"Vignette", config.vignette);
         {
             const std::wstring size = ReadString(path, L"Comfort", L"VignetteSize", L"Medium");

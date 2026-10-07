@@ -429,6 +429,14 @@ namespace wowvr
         // usual result of leaving it off.
         bool confineCursor = true;
 
+        // The resolution the game runs at, even one the monitor cannot show (a 16:9
+        // 3200x1800 on a 1440-tall ultrawide): the interface panel in the headset gets
+        // the extra pixels and sharper text, while the desktop window is shrunk to fit
+        // the screen and shows a scaled copy. 0x0 is off - gxResolution and the monitor
+        // decide, as stock. See game/interface_resolution.h.
+        uint32_t interfaceWidth = 0;
+        uint32_t interfaceHeight = 0;
+
         // Comfort vignette: the edges of the view darken while the view moves without
         // the head - walking, turning, being carried, dragging the camera with the mouse,
         // zooming - and never for the head's own movement. Size is how far in from the

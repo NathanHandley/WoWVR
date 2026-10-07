@@ -33,6 +33,11 @@ Lifebars (the V key) are drawn over each unit in the world at its own distance r
 interface (`[Panel] Nameplates3D`; while it's on, `CanvasScale` is at least 1.25). They can't be clicked to
 target.
 
+For a sharper interface the game can run at a resolution your monitor can't show
+(`[Panel] InterfaceResolution=3200x1800`, with `SET gxResolution "3200x1800"` in `WTF\Config.wtf`).
+The interface keeps its size in the headset and gets the extra pixels; the desktop window is shrunk
+to fit the screen and shows a scaled copy. `0x0` (the default) leaves resolution to the game.
+
 ALT + CTRL + PAGE UP / PAGE DOWN pushes the interface farther away / pulls it closer (hold to keep
 moving; the distance is saved to WoWVR.ini)
 

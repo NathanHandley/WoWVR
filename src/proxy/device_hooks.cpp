@@ -4803,7 +4803,7 @@ namespace wowvr
                                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (handle != INVALID_HANDLE_VALUE)
                 {
-                    char command[32] = {};
+                    char command[512] = {};
                     DWORD read = 0;
                     ReadFile(handle, command, sizeof(command) - 1, &read, nullptr);
                     CloseHandle(handle);
@@ -4889,6 +4889,14 @@ namespace wowvr
                     // itself rather than an imitation of it. Only the HMD pose plumbing is
                     // bypassed, and that is independently known to work. It is what makes
                     // head-driven culling testable with the headset sitting still on a desk.
+                    // "lua <code>": runs a snippet in the client, in the world only - for
+                    // reading what the client itself thinks (cursor position, mouse focus)
+                    // when a capture cannot show it.
+                    else if (strncmp(command, "lua ", 4) == 0)
+                    {
+                        WOWVR_INFO("lua: %s", Canvas().RunDebugScript(command + 4)
+                                                  ? "ran" : "could not run (not in the world?)");
+                    }
                     else if (strncmp(command, "headsweep ", 10) == 0)
                     {
                         float amplitude = 0.0f;

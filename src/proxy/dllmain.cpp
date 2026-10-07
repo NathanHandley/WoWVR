@@ -3,6 +3,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/paths.h"
+#include "game/interface_resolution.h"
 #include "proxy/device_hooks.h"
 #include "proxy/exports.h"
 #include "proxy/real_d3d9.h"
@@ -52,6 +53,7 @@ namespace
         }
 
         PinSelf();
+        wowvr::InstallInterfaceResolution();
         return true;
     }
 

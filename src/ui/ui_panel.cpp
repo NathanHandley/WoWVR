@@ -1,5 +1,6 @@
 #include "ui/ui_panel.h"
 
+#include "game/interface_resolution.h"
 #include "game/ui_canvas.h"
 
 #include "core/config.h"
@@ -97,7 +98,9 @@ namespace wowvr
         const float widthPixels = (m_width > 0) ? static_cast<float>(m_width) : 1920.0f;
         const float heightPixels = (m_height > 0) ? static_cast<float>(m_height) : 1080.0f;
 
-        float arcDegrees = widthPixels / pixelsPerDegree;
+        // Measured in the real window's pixels: a game running bigger than its window
+        // (InterfaceResolution) spends the extra pixels on sharpness, not on size.
+        float arcDegrees = widthPixels / InterfacePixelScale() / pixelsPerDegree;
         if (arcDegrees > maxArcDegrees)
         {
             // Too wide for the cap: the whole panel shrinks, keeping its aspect, rather
