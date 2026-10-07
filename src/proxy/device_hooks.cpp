@@ -115,6 +115,25 @@ namespace wowvr
         DWORD g_srcBlend = D3DBLEND_ONE;
         DWORD g_destBlend = D3DBLEND_ZERO;
         bool g_uiTargetBound = false;
+
+        // One state block for the end-of-frame composite, captured each frame rather than
+        // created each frame: a fresh D3DSBT_ALL block per frame is an allocation per
+        // frame, and if one ever failed the composite still drew and left its sampler,
+        // texture-stage and transform settings on the game's device.
+        IDirect3DStateBlock9* g_compositeState = nullptr;
+
+        // Eye matrices WoWVR has put into the device in place of the game's own: the
+        // projection transform and these constant registers. Put back the moment the game
+        // leaves the world pass (an offscreen target, the interface), so a pass that
+        // reuses the camera without re-uploading it - render-to-texture models, glow,
+        // portraits - is drawn with the game's camera, not the right eye's.
+        uint32_t g_eyeConstantDirty[8] = {};
+        bool g_eyeProjectionDirty = false;
+        float g_gameProjection[16] = {};
+        bool g_haveGameProjection = false;
+
+        // The frame before which a failed VR resource build is not retried.
+        unsigned long long g_resourceRetryFrame = 0;
         bool g_uiAlphaOverrideActive = false;
         unsigned long long g_additiveUiDraws = 0;
 
@@ -811,6 +830,7 @@ namespace wowvr
         int ShaderSlotsInUse();
         int ShaderSlotCapacity();
         void ReportShaderMisses();
+        void ForgetShaderCombined();
         // "headsweep <amplitude rad> <period s>": the fake yaw swung as a sine every frame,
         // because a real head is never still and the command file is only read every 15
         // frames - too coarse to stand in for one. "headsweep 0" stops it.
@@ -1539,6 +1559,36 @@ namespace wowvr
                        g_drawsToStereo, g_drawsToUi, g_drawsOffscreen,
                        g_drawsStrayBackBuffer, g_lastPeriodCount, g_skySliceDraws);
             ReportShaderMisses();
+            {
+                // The client is 32-bit: running out of address space is what makes its
+                // creature, player and spell textures fail to load after a long session.
+                MEMORYSTATUSEX memory = {};
+                memory.dwLength = sizeof(memory);
+                if (GlobalMemoryStatusEx(&memory))
+                {
+                    // Fragmentation matters as much as the total: an allocation needs one
+                    // free run big enough, so the largest is the real early warning.
+                    SIZE_T largestFree = 0;
+                    MEMORY_BASIC_INFORMATION region = {};
+                    for (const uint8_t* at = nullptr;
+                         VirtualQuery(at, &region, sizeof(region)) == sizeof(region);
+                         at = static_cast<const uint8_t*>(region.BaseAddress) + region.RegionSize)
+                    {
+                        if (region.State == MEM_FREE && region.RegionSize > largestFree)
+                        {
+                            largestFree = region.RegionSize;
+                        }
+                        if (region.RegionSize == 0) { break; }
+                    }
+                    const double total = static_cast<double>(memory.ullTotalVirtual) / 1048576.0;
+                    const double used = total - static_cast<double>(memory.ullAvailVirtual) / 1048576.0;
+                    const double largest = static_cast<double>(largestFree) / 1048576.0;
+                    WOWVR_INFO("Address space: %.0f of %.0f MB in use (%.0f%%), largest free "
+                               "block %.0f MB%s.", used, total, 100.0 * used / total, largest,
+                               (used > 0.85 * total || largest < 64.0)
+                                   ? " - NEARLY EXHAUSTED; textures may fail to load" : "");
+                }
+            }
             // Alongside the draw counts on purpose: the claim this whole approach rests on
             // is that pointing the culling volume somewhere else does not change how much
             // is in it, and these two numbers together are what settles that.
@@ -1682,9 +1732,24 @@ namespace wowvr
                 g_realBackBuffer = nullptr;
             }
 
+            if (g_compositeState != nullptr)
+            {
+                g_compositeState->Release();
+                g_compositeState = nullptr;
+            }
+            // Before a Reset no reference to a device surface may remain.
+            if (g_gameDepthSurface != nullptr)
+            {
+                g_gameDepthSurface->Release();
+                g_gameDepthSurface = nullptr;
+            }
+            g_eyeProjectionDirty = false;
+            memset(g_eyeConstantDirty, 0, sizeof(g_eyeConstantDirty));
+
             g_stereoRedirected = false;
             g_haveEyeProjections = false;
             g_resourcesReady = false;
+            g_resourceRetryFrame = 0;   // rebuild straight away after a reset
         }
 
         bool CreateEyeTargets(IDirect3DDevice9* device, uint32_t width, uint32_t height,
@@ -1750,8 +1815,22 @@ namespace wowvr
                 return;
             }
 
+            // After a failed build, not again every frame: each attempt destroys and
+            // recreates every eye, stereo and panel target, and in a 32-bit process that
+            // churn fragments the address space until the failure becomes permanent.
+            if (g_frameCount < g_resourceRetryFrame)
+            {
+                return;
+            }
+
             const uint32_t width = Vr().RenderWidth();
             const uint32_t height = Vr().RenderHeight();
+
+            // A retry after a failed build starts clean: the eye textures about to be
+            // recreated may still be registered with the GL interop or adopted by the
+            // presenter from the last attempt.
+            g_presenter.ReleaseAdoptedTextures();
+            g_glInterop.UnregisterEyeTextures();
 
             // Route choice, best first. On this client only the 9on12 route can go
             // zero-copy: the native driver refuses share handles (D3DERR_INVALIDCALL)
@@ -1831,7 +1910,16 @@ namespace wowvr
                 stereoReady = g_stereo.Create(device, width, height);
                 stereoReady = g_uiPanel.Create(device, g_backBufferWidth, g_backBufferHeight)
                               && stereoReady;
-                if (g_uiPanel.IsReady()
+                // The interface's readback surfaces feed only the SteamVR overlay, which
+                // only runs on the copy route; anywhere else they would be two screen-sized
+                // surfaces of 32-bit address space doing nothing.
+                const bool overlayPossible = Cfg().panelOverlay && !d3d12Route && !sharedRoute
+                                          && !glRoute;
+                if (!overlayPossible)
+                {
+                    g_uiTarget.Destroy();   // a leftover from an earlier copy-route attempt
+                }
+                if (overlayPossible && g_uiPanel.IsReady()
                     && g_uiTarget.Create(device, g_uiPanel.Width(), g_uiPanel.Height(),
                                          EyeTargets::KindCopy))
                 {
@@ -1851,6 +1939,10 @@ namespace wowvr
             }
 
             g_resourcesReady = targetsReady && presenterReady && stereoReady;
+            if (!g_resourcesReady)
+            {
+                g_resourceRetryFrame = g_frameCount + 600;
+            }
 
             if (!g_resourcesReady && !g_resourceFailureLogged)
             {
@@ -2057,9 +2149,9 @@ namespace wowvr
             {
                 return g_vignetteTexture;
             }
-            if (g_vignetteTexture != nullptr && g_vignetteDevice == device)
+            if (g_vignetteTexture != nullptr)
             {
-                g_vignetteTexture->Release();
+                g_vignetteTexture->Release();   // whichever device it belonged to
             }
             g_vignetteTexture = nullptr;
             g_vignetteDevice = device;
@@ -3048,14 +3140,31 @@ namespace wowvr
             return drew;
         }
 
+        // The composite's state block, created once per device and re-captured each frame.
+        // Null if it cannot be had - callers then must not draw.
+        IDirect3DStateBlock9* CaptureCompositeState(IDirect3DDevice9* device)
+        {
+            if (g_compositeState == nullptr
+                && FAILED(device->CreateStateBlock(D3DSBT_ALL, &g_compositeState)))
+            {
+                g_compositeState = nullptr;
+                return nullptr;
+            }
+            if (FAILED(g_compositeState->Capture()))
+            {
+                return nullptr;
+            }
+            return g_compositeState;
+        }
+
         // Overlay mode: the eye image no longer contains the interface, so the desktop
         // mirror lays it over the copied eye flat, at window size.
         void DrawInterfaceOnMirror(IDirect3DDevice9* device)
         {
-            IDirect3DStateBlock9* saved = nullptr;
-            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &saved)))
+            IDirect3DStateBlock9* saved = CaptureCompositeState(device);
+            if (saved == nullptr)
             {
-                saved = nullptr;
+                return;   // nothing could put the game's state back afterwards
             }
             g_originalSetRenderTarget(device, 0, g_realBackBuffer);
             g_originalSetDepthStencilSurface(device, nullptr);
@@ -3078,11 +3187,7 @@ namespace wowvr
             const float grow = (canvas - 1.0f) * 0.5f;
             DrawScreenRect(device, g_uiPanel.Texture(), -w * grow, -h * grow,
                            w * (1.0f + grow), h * (1.0f + grow));
-            if (saved != nullptr)
-            {
-                saved->Apply();
-                saved->Release();
-            }
+            saved->Apply();
         }
 
         void CompositeUiPanel(IDirect3DDevice9* device)
@@ -3112,16 +3217,25 @@ namespace wowvr
             // texture stage states, sampler states, lighting, fog and culling. The game
             // does not reset all of that before its own fixed-function draws, so
             // without putting it back the distant terrain renders untextured and flat.
-            IDirect3DStateBlock9* savedState = nullptr;
-            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &savedState)))
+            IDirect3DStateBlock9* savedState = CaptureCompositeState(device);
+            if (savedState == nullptr)
             {
-                savedState = nullptr;
+                // Drawing anyway would leave the composite's sampler, texture-stage and
+                // transform settings on the game's device - textures it draws next would
+                // be sampled clamped, unfiltered or through the wrong stage. This frame
+                // has no panel instead.
                 if (!g_stateBlockFailureLogged)
                 {
                     WOWVR_WARN("Could not capture device state before compositing the UI "
-                               "panel; the game's own fixed-function draws may be affected.");
+                               "panel; skipping the composite rather than disturbing the "
+                               "game's own drawing.");
                     g_stateBlockFailureLogged = true;
                 }
+                ++g_panelSkipped;
+                g_lastSkipReason = "device state could not be captured";
+                g_panelCompositedLastFrame = false;
+                g_originalSetRenderTarget(device, 0, g_realBackBuffer);
+                return;
             }
 
             UpdateCursorConfinement();
@@ -3139,11 +3253,7 @@ namespace wowvr
                 DrawVignette(device);
                 DrawHelpIntoInterface(device);
                 DrawCursorIntoInterface(device);
-                if (savedState != nullptr)
-                {
-                    savedState->Apply();
-                    savedState->Release();
-                }
+                savedState->Apply();
                 g_originalSetRenderTarget(device, 0, g_realBackBuffer);
                 return;
             }
@@ -3307,11 +3417,7 @@ namespace wowvr
                 }
             }
 
-            if (savedState != nullptr)
-            {
-                savedState->Apply();
-                savedState->Release();
-            }
+            savedState->Apply();
 
             // Release the stereo surface before anyone tries to read it back: D3D9
             // refuses StretchRect and GetRenderTargetData on a target that is still
@@ -3932,7 +4038,23 @@ namespace wowvr
             // Bypasses our own hook deliberately, otherwise this would be redirected
             // straight back into the stereo target.
             g_originalSetRenderTarget(device, 0, g_realBackBuffer);
-            g_originalSetDepthStencilSurface(device, nullptr);
+            // The game's own depth surface, which is what it believes is bound: a pass
+            // early next frame that skips re-binding it must not draw with none. Only if
+            // it pairs with the back buffer (at least as large, same multisampling).
+            IDirect3DSurface9* depth = nullptr;
+            if (g_gameDepthSurface != nullptr && g_realBackBuffer != nullptr)
+            {
+                D3DSURFACE_DESC depthDesc = {};
+                D3DSURFACE_DESC colourDesc = {};
+                if (SUCCEEDED(g_gameDepthSurface->GetDesc(&depthDesc))
+                    && SUCCEEDED(g_realBackBuffer->GetDesc(&colourDesc))
+                    && depthDesc.Width >= colourDesc.Width && depthDesc.Height >= colourDesc.Height
+                    && depthDesc.MultiSampleType == colourDesc.MultiSampleType)
+                {
+                    depth = g_gameDepthSurface;
+                }
+            }
+            g_originalSetDepthStencilSurface(device, depth);
 
             g_stereoRedirected = false;
         }
@@ -5606,6 +5728,28 @@ namespace wowvr
             {
                 WOWVR_ERROR("Device reset failed (0x%08lx).", hr);
             }
+            else
+            {
+                // The back buffer may have changed size (a windowed resize, a resolution
+                // change). Everything that recognises the back buffer by its size - the
+                // redirect, the depth substitution, the interface panel - must use the new
+                // one, or offscreen targets of the old size get treated as the screen.
+                IDirect3DSurface9* backBuffer = nullptr;
+                if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer))
+                    && backBuffer != nullptr)
+                {
+                    D3DSURFACE_DESC desc = {};
+                    if (SUCCEEDED(backBuffer->GetDesc(&desc)) && desc.Width > 0 && desc.Height > 0)
+                    {
+                        g_backBufferWidth = desc.Width;
+                        g_backBufferHeight = desc.Height;
+                        g_backBufferFormat = desc.Format;
+                        Projection().SetSceneAspect(static_cast<float>(desc.Width)
+                                                    / static_cast<float>(desc.Height));
+                    }
+                    backBuffer->Release();
+                }
+            }
 
             // Resources are rebuilt lazily on the next Present.
             return hr;
@@ -5623,6 +5767,13 @@ namespace wowvr
         {
             EnsureFreshCameraCompensation();
 
+            if (state == D3DTS_PROJECTION && matrix != nullptr && !g_duplicatingDraw)
+            {
+                memcpy(g_gameProjection, &matrix->_11, sizeof(g_gameProjection));
+                g_haveGameProjection = true;
+                g_eyeProjectionDirty = false;   // the game's own value is going in
+            }
+
             if (Report().IsActive() && matrix != nullptr)
             {
                 Report().NoteTransform(static_cast<uint32_t>(state), &matrix->_11);
@@ -5639,6 +5790,7 @@ namespace wowvr
                     g_haveFixedProjectionSource = true;
                     g_fixedProjectionIsOrtho = false;
                     g_projectionPatchedThisFrame = true;
+                    g_eyeProjectionDirty = true;
                     return g_originalSetTransform(
                         device, state,
                         reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
@@ -5658,6 +5810,7 @@ namespace wowvr
                     g_haveFixedProjectionSource = true;
                     g_fixedProjectionIsOrtho = false;
                     g_projectionPatchedThisFrame = true;
+                    g_eyeProjectionDirty = true;
                     return g_originalSetTransform(
                         device, state,
                         reinterpret_cast<const D3DMATRIX*>(g_eyeFixedProjection[EyeLeft]));
@@ -5677,6 +5830,67 @@ namespace wowvr
         bool StereoActive()
         {
             return Cfg().stereo && g_stereo.IsReady() && Vr().IsActive() && g_stereoRedirected;
+        }
+
+        // The depth surface for the interface pass. The game believes its own is bound
+        // (D3D9's SetRenderTarget never changes depth), and 3D models in the interface -
+        // character sheet, dressing room - draw and clear depth against it. Ours when the
+        // game's fits the panel; none otherwise (a multisampled one cannot pair with the
+        // single-sample panel).
+        IDirect3DSurface9* InterfaceDepthSurface()
+        {
+            if (g_gameDepthSurface == nullptr || !g_uiPanel.IsReady())
+            {
+                return nullptr;
+            }
+            D3DSURFACE_DESC desc = {};
+            if (FAILED(g_gameDepthSurface->GetDesc(&desc))
+                || desc.Width < g_uiPanel.Width() || desc.Height < g_uiPanel.Height()
+                || desc.MultiSampleType != D3DMULTISAMPLE_NONE)
+            {
+                return nullptr;
+            }
+            return g_gameDepthSurface;
+        }
+
+        void MarkEyeConstants(UINT startRegister, UINT count)
+        {
+            for (UINT r = startRegister; r < startRegister + count && r < kShadowRegisters; ++r)
+            {
+                g_eyeConstantDirty[r >> 5] |= 1u << (r & 31u);
+            }
+        }
+
+        // Puts the game's own camera back wherever an eye camera is standing in for it.
+        // The constants come from the mirror of the game's uploads, the projection from
+        // its last SetTransform; runs of registers go back in one call each.
+        void RestoreGameCameraState(IDirect3DDevice9* device)
+        {
+            if (g_eyeProjectionDirty)
+            {
+                if (g_haveGameProjection)
+                {
+                    g_originalSetTransform(device, D3DTS_PROJECTION,
+                                           reinterpret_cast<const D3DMATRIX*>(g_gameProjection));
+                }
+                g_eyeProjectionDirty = false;
+            }
+            for (UINT word = 0; word < 8; ++word)
+            {
+                uint32_t bits = g_eyeConstantDirty[word];
+                g_eyeConstantDirty[word] = 0;
+                while (bits != 0)
+                {
+                    UINT first = 0;
+                    while (((bits >> first) & 1u) == 0) { ++first; }
+                    UINT last = first;
+                    while (last + 1 < 32 && ((bits >> (last + 1)) & 1u) != 0) { ++last; }
+                    const UINT reg = word * 32 + first;
+                    g_originalSetVertexShaderConstantF(device, reg, &g_shadowConstants[reg][0],
+                                                       last - first + 1);
+                    for (UINT b = first; b <= last; ++b) { bits &= ~(1u << b); }
+                }
+            }
         }
 
         // Duplicated draws only make sense for the pass that is building the player's
@@ -5798,6 +6012,7 @@ namespace wowvr
             }
 
             g_uiPassStarted = true;
+            RestoreGameCameraState(device);
 
             // Give the interface a target of its own, at the game's own resolution.
             // It is laid out for a flat screen and has to be drawn once at that size,
@@ -5808,7 +6023,7 @@ namespace wowvr
                     g_uiPanel.IsReady() ? g_uiPanel.Surface() : g_realBackBuffer;
 
                 g_originalSetRenderTarget(device, 0, uiSurface);
-                g_originalSetDepthStencilSurface(device, nullptr);
+                g_originalSetDepthStencilSurface(device, InterfaceDepthSurface());
                 g_stereoRedirected = false;
 
                 if (g_uiPanel.IsReady())
@@ -6022,6 +6237,26 @@ namespace wowvr
         int g_shaderCombinedCount = 0;
 
         int ShaderSlotsInUse() { return g_shaderCombinedCount; }
+
+        // Keyed by raw shader pointers the game owns: after a reset or a new device those
+        // shaders may be gone and their addresses reused by different ones, which would
+        // inherit a register that is not theirs. Re-resolving is cheap.
+        void ForgetShaderCombined() { g_shaderCombinedCount = 0; }
+
+        // A shader just created at an address the table already knows: the old one was
+        // freed and its address reused, so its entry describes some other shader.
+        void ForgetShaderEntry(IDirect3DVertexShader9* shader)
+        {
+            for (int i = 0; i < g_shaderCombinedCount; ++i)
+            {
+                if (g_shaderCombined[i].shader == shader)
+                {
+                    g_shaderCombined[i] = g_shaderCombined[g_shaderCombinedCount - 1];
+                    --g_shaderCombinedCount;
+                    return;
+                }
+            }
+        }
 
         void ReportShaderMisses()
         {
@@ -6355,6 +6590,7 @@ namespace wowvr
                         g_originalSetVertexShaderConstantF(
                             device, block.startRegister,
                             eye == EyeLeft ? skyLeft : skyRight, 4);
+                        MarkEyeConstants(block.startRegister, 4);
                         continue;
                     }
                 }
@@ -6362,6 +6598,7 @@ namespace wowvr
                 g_originalSetVertexShaderConstantF(
                     device, block.startRegister,
                     eye == EyeLeft ? block.left : block.right, 4);
+                MarkEyeConstants(block.startRegister, 4);
             }
 
             // The current shader's own combined transform, rebuilt from the constants
@@ -6385,6 +6622,7 @@ namespace wowvr
                         g_originalSetVertexShaderConstantF(
                             device, entry->startRegister,
                             eye == EyeLeft ? left : right, 4);
+                        MarkEyeConstants(entry->startRegister, 4);
                     }
                     else if (eye == EyeLeft)
                     {
@@ -6411,6 +6649,7 @@ namespace wowvr
                     g_originalSetTransform(
                         device, D3DTS_PROJECTION,
                         reinterpret_cast<const D3DMATRIX*>(eye == EyeLeft ? left : right));
+                    g_eyeProjectionDirty = true;
                 }
             }
 
@@ -6751,7 +6990,16 @@ namespace wowvr
                     // its shadow map; substituting ours there sent the casters' depth
                     // into the wrong buffer and left the shadow texture empty, which is
                     // why shadows worked in mono and vanished in stereo.
-                    g_gameDepthSurface = surface;
+                    // Held with a reference of our own: it is handed back to the game by
+                    // GetDepthStencilSurface, and a raw pointer outliving the game's
+                    // surface (it recreates it around a Reset) would hand back freed
+                    // memory.
+                    if (g_gameDepthSurface != surface)
+                    {
+                        surface->AddRef();
+                        if (g_gameDepthSurface != nullptr) { g_gameDepthSurface->Release(); }
+                        g_gameDepthSurface = surface;
+                    }
 
                     // Only when the colour target ACTUALLY IS our side-by-side surface.
                     // Keying this off "are we rendering to the back buffer" was wrong:
@@ -6963,6 +7211,7 @@ namespace wowvr
                     }
 
                     memcpy(patched + offset * 4, left, sizeof(left));
+                    MarkEyeConstants(startRegister + offset, 4);
                     if (startRegister + offset < kShadowRegisters)
                     {
                         if (offset == 0) { ++g_substShape[startRegister]; }
@@ -7182,6 +7431,7 @@ namespace wowvr
                             anyPatched = true;
                         }
                         memcpy(patched + offset * 4, left, sizeof(left));
+                    MarkEyeConstants(startRegister + offset, 4);
                         RememberPatchedBlock(startRegister + offset, data + offset * 4,
                                              left, right, true);
                     }
@@ -7225,6 +7475,7 @@ namespace wowvr
                         anyPatched = true;
                     }
                     memcpy(patched + offset * 4, left, sizeof(left));
+                    MarkEyeConstants(startRegister + offset, 4);
                     if (reg < kShadowRegisters) { ++g_substCombined[reg]; }
                     RememberPatchedBlock(reg, data + offset * 4, left, right, true);
                 }
@@ -7394,6 +7645,7 @@ namespace wowvr
                                        Cfg().fogDistanceScale);
                         }
                         DumpShaderBytecode(function, *shader);
+                        ForgetShaderEntry(*shader);
                         return rewrittenHr;
                     }
                     if (g_fogRewriteRefused++ == 0)
@@ -7413,6 +7665,7 @@ namespace wowvr
             if (SUCCEEDED(hr) && shader != nullptr && *shader != nullptr)
             {
                 DumpShaderBytecode(function, *shader);
+                ForgetShaderEntry(*shader);
             }
             return hr;
         }
@@ -7547,6 +7800,39 @@ namespace wowvr
                 if (Report().IsActive())
                 {
                     Report().NoteRenderTarget(surface, width, height, format);
+                }
+
+                // Anywhere but the back buffer, the game draws with the camera it believes
+                // it set - not the eye camera still standing in for it from the last world
+                // draw.
+                if (surface != g_realBackBuffer)
+                {
+                    RestoreGameCameraState(device);
+                }
+
+                // The interface pass is drawn into the panel with its alpha override on.
+                // An offscreen pass in the middle of it (a portrait, a model preview) is
+                // the game's own and gets the game's blending; coming back to the back
+                // buffer goes back into the panel, override and all.
+                if (g_uiPassStarted && g_uiPanel.IsReady() && g_uiRendered)
+                {
+                    // The panel itself counts as the back buffer: GetRenderTarget hands
+                    // it to the game during this pass, so a save/restore around a
+                    // portrait comes back with it.
+                    if (surface != g_realBackBuffer && surface != g_uiPanel.Surface())
+                    {
+                        EndUiAlphaOverride(device);
+                        g_uiTargetBound = false;
+                    }
+                    else
+                    {
+                        const HRESULT uiResult =
+                            g_originalSetRenderTarget(device, 0, g_uiPanel.Surface());
+                        g_originalSetDepthStencilSurface(device, InterfaceDepthSurface());
+                        g_uiTargetBound = true;
+                        ApplyUiAlphaBlend(device);
+                        return uiResult;
+                    }
                 }
 
                 // Whenever the game aims at its back buffer, aim it at the
@@ -8018,6 +8304,23 @@ namespace wowvr
             {
                 WOWVR_INFO("A second D3D9 device appeared; following the newest one.");
                 ReleaseFrameResources();
+                // Everything bound to the old device goes too. A texture holds its
+                // device, and the interop paths hold it outright, so anything kept would
+                // keep the whole old device - and its video memory - alive, and be used
+                // with the new one.
+                ReleaseCursorTextures();
+                g_d3d12Present.Shutdown();
+                g_glInterop.Shutdown();
+                if (g_vignetteTexture != nullptr)
+                {
+                    g_vignetteTexture->Release();
+                    g_vignetteTexture = nullptr;
+                }
+                Help().ReleaseTexture();
+                LaunchHintCard().ReleaseTexture();
+                // Shaders belong to the device: the old ones are gone and their addresses
+                // may be reused by the new device's.
+                ForgetShaderCombined();
             }
 
             if (parameters != nullptr && parameters->BackBufferHeight > 0)

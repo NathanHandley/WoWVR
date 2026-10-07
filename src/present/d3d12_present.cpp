@@ -69,6 +69,19 @@ namespace wowvr
 
     void D3D12Present::Shutdown()
     {
+        // Let the compositor's queued copies finish before the queue and fence go.
+        if (m_fence != nullptr && m_fence->GetCompletedValue() < m_fenceValue)
+        {
+            HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (done != nullptr)
+            {
+                if (SUCCEEDED(m_fence->SetEventOnCompletion(m_fenceValue, done)))
+                {
+                    WaitForSingleObject(done, 1000);
+                }
+                CloseHandle(done);
+            }
+        }
         if (m_fence != nullptr)
         {
             m_fence->Release();

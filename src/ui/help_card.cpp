@@ -66,8 +66,14 @@ namespace wowvr
         {
             return nullptr;
         }
-        // A different device: the old texture belonged to it and goes with it.
-        m_texture = nullptr;
+        // A different device: the old texture belonged to it and goes with it. Released,
+        // not just dropped - a texture holds its device, so leaking one kept the whole
+        // old device (and its video memory) alive.
+        if (m_texture != nullptr)
+        {
+            m_texture->Release();
+            m_texture = nullptr;
+        }
         m_device = device;
         m_failed = true;
 
@@ -233,6 +239,17 @@ namespace wowvr
         m_height = static_cast<uint32_t>(height);
         m_failed = false;
         return m_texture;
+    }
+
+    void TextCard::ReleaseTexture()
+    {
+        if (m_texture != nullptr)
+        {
+            m_texture->Release();
+            m_texture = nullptr;
+        }
+        m_device = nullptr;
+        m_failed = false;
     }
 
     HelpCard& Help()

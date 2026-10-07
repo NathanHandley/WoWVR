@@ -73,9 +73,11 @@ namespace wowvr
         }
 
         // Two system-memory surfaces so the readback can be pipelined: the GPU
-        // fills one while the CPU locks the other. Both exist in every kind and
-        // mode - the second is a few megabytes and lets pipelining toggle live.
-        for (int slot = 0; slot < 2; ++slot)
+        // fills one while the CPU locks the other - only for the copy route, which
+        // reads every frame back. The zero-copy routes need them for screenshots alone
+        // and get them then (ReadBack); held for the whole session they were tens of
+        // megabytes of a 32-bit address space doing nothing.
+        for (int slot = 0; slot < 2 && kind == KindCopy; ++slot)
         {
             hr = device->CreateOffscreenPlainSurface(
                 width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &m_staging[slot], nullptr);
@@ -252,6 +254,15 @@ namespace wowvr
         }
         // Dump-only helper: land in the current write slot without advancing the
         // ring, so a Lock(true) right after reads exactly this frame.
+        // Only the slot this dump lands in (the zero-copy routes never advance the ring).
+        if (m_staging[m_writeIndex] == nullptr
+            && FAILED(device->CreateOffscreenPlainSurface(m_width, m_height, D3DFMT_A8R8G8B8,
+                                                          D3DPOOL_SYSTEMMEM,
+                                                          &m_staging[m_writeIndex], nullptr)))
+        {
+            m_staging[m_writeIndex] = nullptr;
+            return false;
+        }
         if (FAILED(device->GetRenderTargetData(m_scaled, m_staging[m_writeIndex])))
         {
             return false;
@@ -262,7 +273,7 @@ namespace wowvr
 
     bool EyeTargets::Lock(bool newestFrame)
     {
-        if (m_staging[0] == nullptr || m_lockedPixels != nullptr)
+        if ((m_staging[0] == nullptr && m_staging[1] == nullptr) || m_lockedPixels != nullptr)
         {
             return m_lockedPixels != nullptr;
         }
@@ -274,7 +285,7 @@ namespace wowvr
             // this lock returns without draining the current frame.
             index = m_writeIndex ^ 1;
         }
-        if (!m_stagingFilled[index])
+        if (!m_stagingFilled[index] || m_staging[index] == nullptr)
         {
             return false;
         }

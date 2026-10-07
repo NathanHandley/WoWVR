@@ -49,7 +49,12 @@ namespace wowvr
         void SetPipelined(bool on) { m_pipelined = on; }
         bool Pipelined() const { return m_pipelined; }
 
-        bool IsReady() const { return m_scaled != nullptr && m_staging[0] != nullptr; }
+        // The readback surfaces exist up front only for the copy route; the zero-copy
+        // routes are ready with the render target alone.
+        bool IsReady() const
+        {
+            return m_scaled != nullptr && (m_kind != KindCopy || m_staging[0] != nullptr);
+        }
         uint32_t Width() const { return m_width; }
         uint32_t Height() const { return m_height; }
 

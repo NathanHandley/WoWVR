@@ -28,6 +28,9 @@ namespace wowvr
         // Builds the texture on first use, or again if the device has changed.
         IDirect3DTexture9* Texture(IDirect3DDevice9* device);
 
+        // Lets go of the texture (and with it the device it belongs to).
+        void ReleaseTexture();
+
         uint32_t Width() const { return m_width; }
         uint32_t Height() const { return m_height; }
 
