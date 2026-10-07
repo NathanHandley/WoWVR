@@ -12,10 +12,13 @@ namespace wowvr
     // the hillside above a cave, the ray finds no group, and the whole interior - and the
     // character with it - is culled away.
     //
-    // The three loads of the eye in that one function are pointed at a position WoWVR
-    // keeps at the character, a yard above the feet. Only this decision moves: the view
-    // is still rendered from the camera, and every other reader of the eye still reads
-    // the camera.
+    // The walk starts from the camera's groups AND the character's (a yard above the
+    // feet): the three loads of the eye in that function read a position WoWVR sets, and
+    // the one call to it (0x00783381) goes through a wrapper that runs it from the
+    // character, then from the camera (so everything it sets is stock), then appends the
+    // character's groups to the camera's lists with the client's own 0x00792FC0. Only
+    // this decision moves: the view is still rendered from the camera, and every other
+    // reader of the eye still reads the camera.
     class InteriorView
     {
     public:
@@ -24,7 +27,9 @@ namespace wowvr
         bool Install();
 
         // Once a frame from the render thread: where the decision is made from.
-        void Update(bool fromCharacter);
+        // Within cameraReachYards of the character the camera's surroundings are drawn as
+        // well as the character's; beyond it, only the character's.
+        void Update(bool fromCharacter, float cameraReachYards);
 
         bool Installed() const { return m_installed; }
 

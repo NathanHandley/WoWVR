@@ -4254,7 +4254,8 @@ namespace wowvr
                     // camera out through a wall does not cull the interior around them.
                     Interior().Install();
                     Interior().Update(g_interiorFromCharacter < 0 ? Cfg().interiorFromCharacter
-                                                                  : g_interiorFromCharacter != 0);
+                                                                  : g_interiorFromCharacter != 0,
+                                      Cfg().interiorCameraReach);
 
                     // The panel no longer follows the head; it only picks up INI changes
                     // to its size here. It moves when Ctrl+Alt+F8 (or a full recentre)

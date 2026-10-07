@@ -369,6 +369,12 @@ namespace wowvr
         // character keeps drawing however far out the camera goes (game/interior_view.h).
         bool interiorFromCharacter = true;
 
+        // Yards. Within this distance of the character the camera's own surroundings are
+        // drawn as well as the character's; further out (the camera buried in another
+        // tunnel or the hillside) only the character's, so the camera's walls cannot hide
+        // them.
+        float interiorCameraReach = 10.0f;
+
         // Last-resort camera identification: alters candidate addresses to see which
         // one the game rebuilds its projection from. Conclusive, but it writes to
         // memory that may belong to something else, and it has crashed the client.

@@ -314,6 +314,9 @@ namespace wowvr
             ReadBool(path, L"Camera", L"DisableCameraCollision", config.disableCameraCollision);
         config.interiorFromCharacter =
             ReadBool(path, L"Camera", L"InteriorFromCharacter", config.interiorFromCharacter);
+        config.interiorCameraReach =
+            ReadFloat(path, L"Camera", L"InteriorCameraReach", config.interiorCameraReach);
+        if (!(config.interiorCameraReach >= 0.0f)) { config.interiorCameraReach = 0.0f; }
 
         config.headDrivenSoundListener =
             ReadBool(path, L"Sound", L"HeadDrivenListener", config.headDrivenSoundListener);
