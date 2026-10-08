@@ -43,6 +43,9 @@ namespace wowvr
         // Runs a Lua snippet through the client's own entry point, for the "lua" debug
         // command. Only in the world, from the render thread; false if it could not run.
         bool RunDebugScript(const char* code);
+
+    private:
+        void UpdateCanvasLayout(float wanted);
     };
 
     UiCanvas& Canvas();

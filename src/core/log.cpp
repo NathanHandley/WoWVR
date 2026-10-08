@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <share.h>
+#include <string>
 
 namespace wowvr
 {
@@ -71,6 +72,15 @@ namespace wowvr
             //
             // _SH_DENYWR rather than fopen's exclusive default, so the log can be
             // tailed while the game is still running.
+            //
+            // The last three sessions are kept (WoWVR.1.log newest): a fault seen late in
+            // a session is otherwise gone the moment the game is restarted to look at it.
+            const std::wstring path(filePath);
+            const std::wstring stem = path.size() > 4 ? path.substr(0, path.size() - 4) : path;
+            DeleteFileW((stem + L".3.log").c_str());
+            MoveFileW((stem + L".2.log").c_str(), (stem + L".3.log").c_str());
+            MoveFileW((stem + L".1.log").c_str(), (stem + L".2.log").c_str());
+            MoveFileW(filePath, (stem + L".1.log").c_str());
             g_file = _wfsopen(filePath, L"w", _SH_DENYWR);
         }
 

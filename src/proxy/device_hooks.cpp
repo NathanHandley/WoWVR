@@ -87,6 +87,36 @@ namespace wowvr
         GetDepthStencilSurfaceFn g_originalGetDepthStencilSurface = nullptr;
         ClearFn g_originalClear = nullptr;
         SetRenderStateFn g_originalSetRenderState = nullptr;
+        typedef HRESULT (WINAPI *SetTextureStageStateFn)(IDirect3DDevice9*, DWORD,
+                                                         D3DTEXTURESTAGESTATETYPE, DWORD);
+        typedef HRESULT (WINAPI *SetSamplerStateFn)(IDirect3DDevice9*, DWORD,
+                                                    D3DSAMPLERSTATETYPE, DWORD);
+        SetTextureStageStateFn g_originalSetTextureStageState = nullptr;
+        SetSamplerStateFn g_originalSetSamplerState = nullptr;
+
+        // The state integrity probe. The client keeps its own cache of device state and
+        // skips setting anything it believes is already set, so a state WoWVR changes and
+        // fails to put back stays wrong until the game happens to want a different value -
+        // which is what alpha-tested foliage turning into solid blocks and particles into
+        // solid squares, permanently and partway through a session, looks like. Every
+        // state the game sets is recorded here; at the end of WoWVR's work each frame the
+        // device is read back and anything that disagrees is logged with its values.
+        // g_wowvrStateCalls marks WoWVR's own drawing, whose settings are not the game's.
+        const int kProbeRenderStates = 210;
+        const int kProbeStages = 4;
+        const int kProbeStageStates = 33;
+        const int kProbeSamplers = 8;
+        const int kProbeSamplerStates = 14;
+        DWORD g_gameRenderState[kProbeRenderStates] = {};
+        bool g_haveGameRenderState[kProbeRenderStates] = {};
+        DWORD g_gameStageState[kProbeStages][kProbeStageStates] = {};
+        bool g_haveGameStageState[kProbeStages][kProbeStageStates] = {};
+        DWORD g_gameSamplerState[kProbeSamplers][kProbeSamplerStates] = {};
+        bool g_haveGameSamplerState[kProbeSamplers][kProbeSamplerStates] = {};
+        bool g_wowvrStateCalls = false;
+        unsigned g_stateMismatchesLogged = 0;
+        unsigned long long g_stateMismatches = 0;
+        void ProbeGameState(IDirect3DDevice9* device);
 
         // The device is PUREDEVICE, so GetRenderState is unavailable and anything we
         // want to know about device state has to be tracked as it is set.
@@ -354,6 +384,32 @@ namespace wowvr
             memcpy(block->left, left, sizeof(block->left));
             memcpy(block->right, right, sizeof(block->right));
             g_haveEyeProjections = true;
+        }
+
+        // A combined block describes one object's transform, uploaded for that object's
+        // draws, and is only needed until the frame is over. It must not outlive it:
+        // the eye matrices are stamped into its register on every later draw whose
+        // constants happen to equal its source, and nothing else ever removed one. A
+        // single bad one registered late in a session - one ordinary constant block
+        // mistaken for a transform - was stamped over every model's texture constants
+        // from then on, surviving even a graphics restart, until the game was quit.
+        void ExpireCombinedBlocks()
+        {
+            for (int i = g_patchedBlockCount - 1; i >= 0; --i)
+            {
+                if (g_patchedBlocks[i].combined)
+                {
+                    g_patchedBlocks[i] = g_patchedBlocks[g_patchedBlockCount - 1];
+                    --g_patchedBlockCount;
+                }
+            }
+        }
+
+        // After a Reset or on a new device the constants the table was built from are
+        // gone; every camera register is found again from the next uploads.
+        void ForgetCameraBlocks()
+        {
+            g_patchedBlockCount = 0;
         }
 
         // Rebuilds every known camera register against the current head pose. Needed
@@ -4275,9 +4331,12 @@ namespace wowvr
             if (Cfg().enabled)
             {
                 EnsureVrResources(device);
+                g_wowvrStateCalls = true;
                 CompositeUiPanel(device);
                 SubmitFrame(device);
                 FinishStereoFrame(device);
+                g_wowvrStateCalls = false;
+                ProbeGameState(device);
             }
 
             const LARGE_INTEGER presentStart = Now();
@@ -4468,6 +4527,7 @@ namespace wowvr
             g_stereoHasContent = false;
             g_uiRendered = false;
             g_uiTargetBound = false;
+            ExpireCombinedBlocks();
             // This frame's lifebars have been drawn; the next frame places its own.
             Pointer().BeginPlateFrame();
 
@@ -5722,6 +5782,7 @@ namespace wowvr
                        parameters != nullptr ? (parameters->Windowed ? 1 : 0) : -1);
 
             ReleaseFrameResources();
+            ForgetCameraBlocks();
 
             const HRESULT hr = g_originalReset(device, parameters);
             if (FAILED(hr))
@@ -6757,6 +6818,12 @@ namespace wowvr
 
         HRESULT WINAPI HookedSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value)
         {
+            if (!g_wowvrStateCalls && static_cast<int>(state) >= 0
+                && static_cast<int>(state) < kProbeRenderStates)
+            {
+                g_gameRenderState[state] = value;
+                g_haveGameRenderState[state] = true;
+            }
             switch (state)
             {
             case D3DRS_ZENABLE:          g_depthTestEnabled = (value != D3DZB_FALSE); break;
@@ -6789,6 +6856,100 @@ namespace wowvr
                 ApplyUiAlphaBlend(device);
             }
             return hr;
+        }
+
+        HRESULT WINAPI HookedSetTextureStageState(IDirect3DDevice9* device, DWORD stage,
+                                                  D3DTEXTURESTAGESTATETYPE type, DWORD value)
+        {
+            if (!g_wowvrStateCalls && stage < static_cast<DWORD>(kProbeStages)
+                && static_cast<int>(type) >= 0 && static_cast<int>(type) < kProbeStageStates)
+            {
+                g_gameStageState[stage][type] = value;
+                g_haveGameStageState[stage][type] = true;
+            }
+            return g_originalSetTextureStageState(device, stage, type, value);
+        }
+
+        HRESULT WINAPI HookedSetSamplerState(IDirect3DDevice9* device, DWORD sampler,
+                                             D3DSAMPLERSTATETYPE type, DWORD value)
+        {
+            if (!g_wowvrStateCalls && sampler < static_cast<DWORD>(kProbeSamplers)
+                && static_cast<int>(type) >= 0 && static_cast<int>(type) < kProbeSamplerStates)
+            {
+                g_gameSamplerState[sampler][type] = value;
+                g_haveGameSamplerState[sampler][type] = true;
+            }
+            return g_originalSetSamplerState(device, sampler, type, value);
+        }
+
+        void NoteStateMismatch(const char* kind, int index, int type, DWORD device, DWORD game)
+        {
+            ++g_stateMismatches;
+            if (g_stateMismatchesLogged < 40)
+            {
+                ++g_stateMismatchesLogged;
+                WOWVR_WARN("State probe: %s %d/%d is 0x%08lX on the device but the game set "
+                           "0x%08lX - left behind by something outside the game.",
+                           kind, index, type, device, game);
+            }
+        }
+
+        // Every 30 frames, after WoWVR's end-of-frame work: does the device still hold
+        // what the game set? The separate-alpha states are excluded (deliberately WoWVR's
+        // during the interface pass and switched off at its end).
+        void ProbeGameState(IDirect3DDevice9* device)
+        {
+            if ((g_frameCount % 30) != 0)
+            {
+                return;
+            }
+            for (int st = 0; st < kProbeRenderStates; ++st)
+            {
+                if (!g_haveGameRenderState[st] || st == D3DRS_SEPARATEALPHABLENDENABLE
+                    || st == D3DRS_SRCBLENDALPHA || st == D3DRS_DESTBLENDALPHA
+                    || st == D3DRS_BLENDOPALPHA)
+                {
+                    continue;
+                }
+                DWORD value = 0;
+                if (SUCCEEDED(device->GetRenderState(static_cast<D3DRENDERSTATETYPE>(st), &value))
+                    && value != g_gameRenderState[st])
+                {
+                    NoteStateMismatch("render state", st, 0, value, g_gameRenderState[st]);
+                }
+            }
+            for (int stage = 0; stage < kProbeStages; ++stage)
+            {
+                for (int type = 1; type < kProbeStageStates; ++type)
+                {
+                    if (!g_haveGameStageState[stage][type]) { continue; }
+                    DWORD value = 0;
+                    if (SUCCEEDED(device->GetTextureStageState(
+                            static_cast<DWORD>(stage), static_cast<D3DTEXTURESTAGESTATETYPE>(type),
+                            &value))
+                        && value != g_gameStageState[stage][type])
+                    {
+                        NoteStateMismatch("texture stage", stage, type, value,
+                                          g_gameStageState[stage][type]);
+                    }
+                }
+            }
+            for (int sampler = 0; sampler < kProbeSamplers; ++sampler)
+            {
+                for (int type = 1; type < kProbeSamplerStates; ++type)
+                {
+                    if (!g_haveGameSamplerState[sampler][type]) { continue; }
+                    DWORD value = 0;
+                    if (SUCCEEDED(device->GetSamplerState(
+                            static_cast<DWORD>(sampler), static_cast<D3DSAMPLERSTATETYPE>(type),
+                            &value))
+                        && value != g_gameSamplerState[sampler][type])
+                    {
+                        NoteStateMismatch("sampler", sampler, type, value,
+                                          g_gameSamplerState[sampler][type]);
+                    }
+                }
+            }
         }
 
         // WoW never re-uploads its projection and never turns the depth test off, so
@@ -8198,6 +8359,10 @@ namespace wowvr
                      g_originalClear, "Clear");
             HookSlot(device, slot::device9::SetRenderState, &HookedSetRenderState,
                      g_originalSetRenderState, "SetRenderState");
+            HookSlot(device, slot::device9::SetTextureStageState, &HookedSetTextureStageState,
+                     g_originalSetTextureStageState, "SetTextureStageState");
+            HookSlot(device, slot::device9::SetSamplerState, &HookedSetSamplerState,
+                     g_originalSetSamplerState, "SetSamplerState");
             HookSlot(device, slot::device9::DrawPrimitive, &HookedDrawPrimitive,
                      g_originalDrawPrimitive, "DrawPrimitive");
             HookSlot(device, slot::device9::DrawIndexedPrimitive, &HookedDrawIndexedPrimitive,
@@ -8321,6 +8486,7 @@ namespace wowvr
                 // Shaders belong to the device: the old ones are gone and their addresses
                 // may be reused by the new device's.
                 ForgetShaderCombined();
+                ForgetCameraBlocks();
             }
 
             if (parameters != nullptr && parameters->BackBufferHeight > 0)

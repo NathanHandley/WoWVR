@@ -1040,6 +1040,24 @@ namespace wowvr
             residual.m[3][3] = 1.0f;
             return true;
         }
+
+        // Whether an eye's combined transform is one a real draw could use. The affine
+        // test can be passed by a near-singular camera, and what comes out then is
+        // entries in the tens of millions - which, written over a register that some
+        // other shader keeps its texture transform in, is what turned every model's
+        // textures to noise and its alpha-tested parts to solid blocks. Genuine ones,
+        // even the water's in world coordinates, stay within a few tens of thousands.
+        bool CombinedIsSane(const float* m)
+        {
+            for (int i = 0; i < 16; ++i)
+            {
+                if (!std::isfinite(m[i]) || std::fabs(m[i]) > 1.0e6f)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     bool ProjectionPatch::TryPatchCombined(const float* uploaded, float* outLeft, float* outRight)
@@ -1122,6 +1140,11 @@ namespace wowvr
             const Mat4 result = Mat4Multiply(worldView, eyeProjection);
             MatrixTo(wasTransposed ? Mat4Transpose(result) : result,
                      eye == EyeLeft ? outLeft : outRight);
+        }
+        if (!CombinedIsSane(outLeft) || !CombinedIsSane(outRight))
+        {
+            ++m_combinedNotAffine;
+            return false;
         }
 
         m_combinedMemo.valid = true;
