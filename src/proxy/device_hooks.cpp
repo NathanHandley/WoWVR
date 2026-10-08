@@ -17,6 +17,7 @@
 #include "game/ui_canvas.h"
 #include "game/comfort_vignette.h"
 #include "game/world_pointer.h"
+#include "game/float_text.h"
 #include "game/field_watch.h"
 #include "game/game_camera.h"
 #include "present/d3d12_present.h"
@@ -2477,6 +2478,157 @@ namespace wowvr
             g_platesDrawn += static_cast<unsigned long long>(vertices / 6);
         }
 
+        // Floating combat text (game/float_text.h) rising over the character: each message
+        // its own little card, facing the head the way the lifebars do, at a fixed size in
+        // metres - it is always about the same distance away. No depth test, like the
+        // client's text over units. Oldest first, so newer ones lie on top.
+        void DrawFloatingText(IDirect3DDevice9* device)
+        {
+            FloatText& texts = FloatTexts();
+            if (texts.Count() <= 0)
+            {
+                return;
+            }
+            Vec3 anchor;
+            if (!texts.AnchorBody(Cfg().floatingTextHeight, anchor))
+            {
+                return;
+            }
+            const Vec3 head = Projection().HeadOffsetMetres();
+            Vec3 toHead = { head.x - anchor.x, head.y - anchor.y, head.z - anchor.z };
+            const float range = sqrtf(toHead.x * toHead.x + toHead.y * toHead.y + toHead.z * toHead.z);
+            if (!(range > 0.05f))
+            {
+                return;   // the head is in the text (first person): nothing sensible to draw
+            }
+            toHead = { toHead.x / range, toHead.y / range, toHead.z / range };
+            const float along = toHead.y;
+            Vec3 up = { -toHead.x * along, 1.0f - toHead.y * along, -toHead.z * along };
+            const float upLength = sqrtf(up.x * up.x + up.y * up.y + up.z * up.z);
+            if (!(upLength > 1.0e-3f))
+            {
+                return;
+            }
+            up = { up.x / upLength, up.y / upLength, up.z / upLength };
+            const Vec3 right = { -(up.y * toHead.z - up.z * toHead.y),
+                                 -(up.z * toHead.x - up.x * toHead.z),
+                                 -(up.x * toHead.y - up.y * toHead.x) };
+
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZ | D3DFVF_TEX1);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            const Mat4 identity = Mat4Identity();
+            g_originalSetTransform(device, D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&identity));
+
+            // A fixed size in metres reads like part of the scene; zoomed far out it would
+            // shrink to nothing, so it never goes below about 1.3 degrees tall.
+            float size = Cfg().floatingTextSize;
+            if (size < range * 0.023f) { size = range * 0.023f; }
+            const float lifetime = FloatText::kLifetime;
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                D3DVIEWPORT9 viewport = {};
+                viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
+                viewport.Width = g_stereo.EyeWidth();
+                viewport.Height = g_stereo.EyeHeight();
+                viewport.MaxZ = 1.0f;
+                g_originalSetViewport(device, &viewport);
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+                const Mat4 projection = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                                0.05f, 2000.0f);
+                g_originalSetTransform(device, D3DTS_PROJECTION,
+                                       reinterpret_cast<const D3DMATRIX*>(&projection));
+                const Vec3 openVrOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
+                const Vec3 eyeOffset = { openVrOffset.x, openVrOffset.y, -openVrOffset.z };
+                const Mat4 world = UiPanel::BodyToEye(Projection().HeadRotation(),
+                                                      Projection().HeadOffsetMetres(), eyeOffset);
+                g_originalSetTransform(device, D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&world));
+
+                for (int i = 0; i < texts.Count(); ++i)
+                {
+                    const FloatMessage& m = texts.Message(i, device);
+                    if (m.texture == nullptr)
+                    {
+                        continue;
+                    }
+                    const float t = m.age / lifetime;
+                    // Ordinary text rises and fades over its last third; a critical
+                    // pops in large, settles, and fades where it is.
+                    float rise = 0.0f;
+                    float scale = 1.0f;
+                    if (m.crit)
+                    {
+                        const float pop = m.age < 0.15f ? m.age / 0.15f : 1.0f;
+                        scale = 1.5f + 0.6f * (1.0f - pop) * pop * 4.0f;
+                        rise = 0.15f * t;
+                    }
+                    else
+                    {
+                        rise = 1.0f - (1.0f - t) * (1.0f - t);   // eases out
+                        rise *= 5.0f;
+                    }
+                    float alpha = t < 0.66f ? 1.0f : (1.0f - t) / 0.34f;
+                    if (m.age < 0.08f) { alpha *= m.age / 0.08f; }
+                    if (!(alpha > 0.0f)) { continue; }
+                    if (alpha > 1.0f) { alpha = 1.0f; }
+
+                    const float height = size * scale;
+                    const float halfW = 0.5f * height * m.aspect;
+                    const float halfH = 0.5f * height;
+                    const float y = (rise - m.start * 1.1f) * size;
+                    const float x = m.side * 1.6f * size;
+                    const Vec3 c = { anchor.x + up.x * y + right.x * x,
+                                     anchor.y + up.y * y + right.y * x,
+                                     anchor.z + up.z * y + right.z * x };
+                    const PanelVertex tl = { c.x - right.x * halfW + up.x * halfH,
+                                             c.y - right.y * halfW + up.y * halfH,
+                                             c.z - right.z * halfW + up.z * halfH, 0.0f, 0.0f };
+                    const PanelVertex tr = { c.x + right.x * halfW + up.x * halfH,
+                                             c.y + right.y * halfW + up.y * halfH,
+                                             c.z + right.z * halfW + up.z * halfH, 1.0f, 0.0f };
+                    const PanelVertex bl = { c.x - right.x * halfW - up.x * halfH,
+                                             c.y - right.y * halfW - up.y * halfH,
+                                             c.z - right.z * halfW - up.z * halfH, 0.0f, 1.0f };
+                    const PanelVertex br = { c.x + right.x * halfW - up.x * halfH,
+                                             c.y + right.y * halfW - up.y * halfH,
+                                             c.z + right.z * halfW - up.z * halfH, 1.0f, 1.0f };
+                    const PanelVertex quad[6] = { tl, tr, bl, tr, br, bl };
+                    device->SetTexture(0, m.texture);
+                    g_originalSetRenderState(device, D3DRS_TEXTUREFACTOR,
+                                             static_cast<DWORD>(alpha * 255.0f + 0.5f) << 24);
+                    g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, 2, quad, sizeof(PanelVertex));
+                }
+            }
+            device->SetTexture(0, nullptr);
+        }
+
         // Upright slices the curved interface sheet is drawn with.
         const int kPanelSlices = 96;
 
@@ -3306,6 +3458,7 @@ namespace wowvr
             {
                 // Into the eyes (the overlay goes on top of them in the compositor).
                 DrawWorldPlates(device);
+                DrawFloatingText(device);
                 DrawVignette(device);
                 DrawHelpIntoInterface(device);
                 DrawCursorIntoInterface(device);
@@ -3316,6 +3469,7 @@ namespace wowvr
 
             // Lifebars first, then the vignette, so the interface sheet lies over both.
             DrawWorldPlates(device);
+            DrawFloatingText(device);
             DrawVignette(device);
             g_originalSetRenderTarget(device, 0, g_stereo.Color());
             g_originalSetDepthStencilSurface(device, nullptr);
@@ -4463,6 +4617,15 @@ namespace wowvr
                                      Projection().GameViewToBody(),
                                      Cfg().unitsPerMetre * Cfg().worldScale);
                     UpdatePlateStrip();
+                    {
+                        static LARGE_INTEGER last = {};
+                        const LARGE_INTEGER now = Now();
+                        const float seconds = last.QuadPart != 0
+                            ? static_cast<float>(ElapsedMs(last, now) / 1000.0) : 0.011f;
+                        last = now;
+                        FloatTexts().Update(Cfg().floatingText3d && g_uiPanel.IsReady(),
+                                            seconds > 0.25f ? 0.25f : seconds);
+                    }
 
                     // The persisted camera blocks are deliberately NOT refreshed here.
                     // At this point the client has not updated its camera for the
@@ -4482,6 +4645,7 @@ namespace wowvr
                 Pointer().Deactivate();
                 DrawRange().SetScale(1.0f);
                 Canvas().Update(1.0f);
+                FloatTexts().Update(false, 0.0f);
                 Billboards().Update(false, Mat4Identity());
             }
 
@@ -8483,6 +8647,7 @@ namespace wowvr
                 }
                 Help().ReleaseTexture();
                 LaunchHintCard().ReleaseTexture();
+                FloatTexts().ReleaseTextures();
                 // Shaders belong to the device: the old ones are gone and their addresses
                 // may be reused by the new device's.
                 ForgetShaderCombined();

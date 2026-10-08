@@ -77,6 +77,12 @@ namespace wowvr
         const WorldPlate& Plate(int index) const;
         // Once a frame, after the frame's plates have been drawn.
         void BeginPlateFrame();
+
+        // Whether the detours are live (VR, a panel, WorldPointing on).
+        bool IsActive() const;
+        // A world point (yards) in the body frame (metres), with the client's camera as
+        // it is now. False while inactive or without a camera.
+        bool WorldToBodyNow(const Vec3& world, Vec3& body) const;
     };
 
     WorldPointer& Pointer();

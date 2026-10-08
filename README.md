@@ -33,6 +33,10 @@ Lifebars (the V key) are drawn over each unit in the world at its own distance r
 interface (`[Panel] Nameplates3D`; while it's on, `CanvasScale` is at least 1.25). They can't be clicked to
 target.
 
+Floating combat text (heals, damage taken, buffs gained) rises over your character in the world
+instead of up the middle of the interface (`[Panel] FloatingText3D`, with `FloatingTextHeight` in yards
+above the feet and `FloatingTextSize` in metres).
+
 For a sharper interface the game can run at a resolution your monitor can't show
 (`[Panel] InterfaceResolution=3200x1800`, with `SET gxResolution "3200x1800"` in `WTF\Config.wtf`).
 The interface keeps its size in the headset and gets the extra pixels; the desktop window is shrunk

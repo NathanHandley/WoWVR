@@ -122,6 +122,12 @@ namespace wowvr
             L"; This needs room outside the interface, so it raises CanvasScale to at least\r\n"
             L"; 1.25. 0 puts lifebars back on the interface and allows CanvasScale=1.\r\n"
             L"Nameplates3D=1\r\n"
+            L"; 1 shows floating combat text (+heals, -damage, buffs gained) over your\r\n"
+            L"; character in 3D instead of up the middle of the interface. Height: where it\r\n"
+            L"; starts, in yards above the feet; Size: the letters' height in metres.\r\n"
+            L"FloatingText3D=1\r\n"
+            L"FloatingTextHeight=2.3\r\n"
+            L"FloatingTextSize=0.16\r\n"
             L"\r\n"
             L"[Mirror]\r\n"
             L"; Keep drawing the game to the desktop window as well as the headset.\r\n"
@@ -348,6 +354,18 @@ namespace wowvr
         if (config.nameplates3d && config.panelCanvasScale < 1.25f)
         {
             config.panelCanvasScale = 1.25f;
+        }
+        config.floatingText3d = ReadBool(path, L"Panel", L"FloatingText3D", config.floatingText3d);
+        config.floatingTextHeight =
+            ReadFloat(path, L"Panel", L"FloatingTextHeight", config.floatingTextHeight);
+        if (!(config.floatingTextHeight >= -2.0f && config.floatingTextHeight <= 10.0f))
+        {
+            config.floatingTextHeight = 2.3f;
+        }
+        config.floatingTextSize = ReadFloat(path, L"Panel", L"FloatingTextSize", config.floatingTextSize);
+        if (!(config.floatingTextSize >= 0.02f && config.floatingTextSize <= 1.0f))
+        {
+            config.floatingTextSize = 0.16f;
         }
         config.cursorScale = ReadFloat(path, L"Panel", L"CursorScale", config.cursorScale);
         config.confineCursor = ReadBool(path, L"Panel", L"ConfineCursor", config.confineCursor);

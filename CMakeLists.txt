@@ -77,6 +77,8 @@ set(WOWVR_SOURCES
     src/game/interface_resolution.cpp
     src/game/interior_view.cpp
     src/game/interior_view.h
+    src/game/float_text.cpp
+    src/game/float_text.h
     src/game/interface_resolution.h
     src/game/comfort_vignette.h
     src/ui/help_card.cpp

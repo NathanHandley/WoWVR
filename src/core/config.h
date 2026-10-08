@@ -431,6 +431,13 @@ namespace wowvr
         // raised to at least 1.25 (LoadConfig).
         bool nameplates3d = true;
 
+        // Floating combat text (Blizzard_CombatText: "+350", "-120", "<Regrowth>") over
+        // the character in 3D instead of up the middle of the interface. Height: where
+        // it starts, yards above the character's feet. Size: letter height, metres.
+        bool floatingText3d = true;
+        float floatingTextHeight = 2.3f;
+        float floatingTextSize = 0.16f;
+
         // The pointer is drawn at the size the game uses, which is small seen through a
         // headset. This multiplies it without touching where it actually points.
         float cursorScale = 1.5f;

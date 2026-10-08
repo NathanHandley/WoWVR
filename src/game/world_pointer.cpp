@@ -680,6 +680,26 @@ namespace wowvr
         g_plateCount = 0;
     }
 
+    bool WorldPointer::IsActive() const
+    {
+        return g_installed && g_state.active;
+    }
+
+    bool WorldPointer::WorldToBodyNow(const Vec3& world, Vec3& body) const
+    {
+        if (!IsActive())
+        {
+            return false;
+        }
+        CameraBasis camera;
+        if (!ReadCamera(CurrentWorldFrame(), camera))
+        {
+            return false;
+        }
+        pointing::WorldToBody(g_state.frame, camera, world, body);
+        return true;
+    }
+
     void WorldPointer::Deactivate()
     {
         g_state.active = false;
