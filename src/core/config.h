@@ -435,6 +435,11 @@ namespace wowvr
         // the character in 3D instead of up the middle of the interface. Height: where
         // it starts, yards above the character's feet. Size: letter height, metres.
         bool floatingText3d = true;
+
+        // The client's own numbers over units (damage you deal, heals you give) drawn
+        // over each unit in the world instead of on the interface: like Nameplates3D,
+        // through cells in the extra canvas (two columns at its left and right edges).
+        bool worldText3d = true;
         float floatingTextHeight = 2.3f;
         float floatingTextSize = 0.16f;
 

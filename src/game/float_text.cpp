@@ -485,8 +485,78 @@ namespace wowvr
         return Pointer().WorldToBodyNow(world, body);
     }
 
+    namespace
+    {
+        struct CachedText
+        {
+            char text[64] = {};
+            unsigned rgb = 0;
+            IDirect3DTexture9* texture = nullptr;
+            IDirect3DDevice9* device = nullptr;
+            float aspect = 1.0f;
+            unsigned long long used = 0;
+        };
+        CachedText g_textCache[96];
+        unsigned long long g_textCacheClock = 0;
+
+        void ReleaseTextCache()
+        {
+            for (CachedText& entry : g_textCache)
+            {
+                if (entry.texture != nullptr)
+                {
+                    entry.texture->Release();
+                }
+                entry = CachedText();
+            }
+        }
+    }
+
+    IDirect3DTexture9* CachedTextTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
+                                         float& aspect)
+    {
+        ++g_textCacheClock;
+        CachedText* oldest = &g_textCache[0];
+        for (CachedText& entry : g_textCache)
+        {
+            if (entry.texture != nullptr && entry.device == device && entry.rgb == rgb
+                && strcmp(entry.text, utf8) == 0)
+            {
+                entry.used = g_textCacheClock;
+                aspect = entry.aspect;
+                return entry.texture;
+            }
+            if (entry.used < oldest->used)
+            {
+                oldest = &entry;
+            }
+        }
+        wchar_t wide[64] = {};
+        if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, 64) <= 0)
+        {
+            return nullptr;
+        }
+        if (oldest->texture != nullptr)
+        {
+            oldest->texture->Release();
+        }
+        *oldest = CachedText();
+        oldest->texture = BuildTexture(device, wide, rgb, oldest->aspect);
+        if (oldest->texture == nullptr)
+        {
+            return nullptr;
+        }
+        strncpy_s(oldest->text, utf8, _TRUNCATE);
+        oldest->rgb = rgb;
+        oldest->device = device;
+        oldest->used = g_textCacheClock;
+        aspect = oldest->aspect;
+        return oldest->texture;
+    }
+
     void FloatText::ReleaseTextures()
     {
+        ReleaseTextCache();
         for (int i = 0; i < m_count; ++i)
         {
             if (m_messages[i].texture != nullptr)

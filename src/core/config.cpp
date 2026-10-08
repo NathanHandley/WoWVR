@@ -126,6 +126,9 @@ namespace wowvr
             L"; character in 3D instead of up the middle of the interface. Height: where it\r\n"
             L"; starts, in yards above the feet; Size: the letters' height in metres.\r\n"
             L"FloatingText3D=1\r\n"
+            L"; 1 shows the numbers over creatures (damage you deal, heals you give) in 3D\r\n"
+            L"; over each one instead of on the interface. Needs CanvasScale above 1.\r\n"
+            L"WorldText3D=1\r\n"
             L"FloatingTextHeight=2.3\r\n"
             L"FloatingTextSize=0.16\r\n"
             L"\r\n"
@@ -356,6 +359,7 @@ namespace wowvr
             config.panelCanvasScale = 1.25f;
         }
         config.floatingText3d = ReadBool(path, L"Panel", L"FloatingText3D", config.floatingText3d);
+        config.worldText3d = ReadBool(path, L"Panel", L"WorldText3D", config.worldText3d);
         config.floatingTextHeight =
             ReadFloat(path, L"Panel", L"FloatingTextHeight", config.floatingTextHeight);
         if (!(config.floatingTextHeight >= -2.0f && config.floatingTextHeight <= 10.0f))

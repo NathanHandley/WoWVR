@@ -1145,12 +1145,15 @@ namespace wowvr
         uint32_t g_plateTextureWidth = 0;
         uint32_t g_plateTextureHeight = 0;
         RECT g_plateStripRect = {};
+        // The second band, along the top of the canvas, the same size; empty if unused.
+        RECT g_plateStripRectTop = {};
         bool g_plateStripActive = false;
         float g_plateCellU = 0.0f;
         float g_plateCellV = 0.0f;
         float g_plateStripTopV = 0.0f;
         float g_plateStripHeightV = 0.0f;
         unsigned long long g_platesDrawn = 0;
+        unsigned long long g_textsDrawnReport = 0;   // world text cards (WorldText3D)
         // How far down its cell a lifebar's anchor is put. The client hangs the lifebar
         // below its anchor (measured: name and bar span about the next 45 px at 1.5x),
         // so near the top leaves room under it for a cast bar.
@@ -1572,6 +1575,10 @@ namespace wowvr
                        g_plateCellU * static_cast<float>(g_uiPanel.Width()),
                        g_plateCellV * static_cast<float>(g_uiPanel.Height()), g_platesDrawn);
             g_platesDrawn = 0;
+            WOWVR_INFO("World text in the world: %s, %llu cards drawn, %llu placements from the "
+                       "client's world text in all.", Cfg().worldText3d ? "on" : "off (WorldText3D=0)",
+                       g_textsDrawnReport, Pointer().TextCalls());
+            g_textsDrawnReport = 0;
 
             WOWVR_INFO("Frame rate mode: %s, %llu switches so far.",
                        Vr().HalfRate() ? "half rate" : "full rate", g_halfRate.switches);
@@ -2106,7 +2113,9 @@ namespace wowvr
             // factor. The cell sizes were measured at a 1395-pixel-tall screen; at any other
             // resolution they scale the same way, or a 1080p screen would find no room at all.
             const float pixelScale = static_cast<float>(height) / 1395.0f / canvas;
-            const float cellPixelsX = floorf(330.0f * pixelScale);
+            // Wide enough for a long name ("a domesticated direwolf" lost a letter at each
+            // end at 330, and the next cell showed the lost one).
+            const float cellPixelsX = floorf(520.0f * pixelScale);
             float cellPixelsY = floorf(150.0f * pixelScale);
             const float bandPixels = static_cast<float>(height) * (1.0f - 1.0f / canvas) * 0.5f;
             int rows = static_cast<int>((bandPixels - 4.0f) / cellPixelsY);
@@ -2135,8 +2144,14 @@ namespace wowvr
             g_plateCellV = cellPixelsY / static_cast<float>(height);
             g_plateStripTopV = static_cast<float>(g_plateStripRect.top) / static_cast<float>(height);
             g_plateStripHeightV = stripPixels / static_cast<float>(height);
+            // The band above the interface is just as empty: as many rows again there, so
+            // the wider cells do not cost lifebars.
+            g_plateStripRectTop.left = 0;
+            g_plateStripRectTop.right = static_cast<LONG>(width);
+            g_plateStripRectTop.top = 0;
+            g_plateStripRectTop.bottom = static_cast<LONG>(stripPixels);
             Pointer().SetPlateStrip(true, g_plateStripTopV, g_plateCellU, g_plateCellV, columns, rows,
-                                    kPlateAnchorV);
+                                    kPlateAnchorV, 0.0f);
             g_plateStripActive = Pointer().PlateStripOn();
             SetPlateStripReason(g_plateStripActive
                                     ? "in use (lifebars drawn over units in 3D)."
@@ -2151,8 +2166,10 @@ namespace wowvr
             {
                 return false;
             }
+            // Both bands, one above the other: the bottom band's rows, then the top's.
             const uint32_t width = static_cast<uint32_t>(g_plateStripRect.right - g_plateStripRect.left);
-            const uint32_t height = static_cast<uint32_t>(g_plateStripRect.bottom - g_plateStripRect.top);
+            const uint32_t band = static_cast<uint32_t>(g_plateStripRect.bottom - g_plateStripRect.top);
+            const uint32_t height = band * 2;
             if (g_plateTexture == nullptr || g_plateTextureWidth != width || g_plateTextureHeight != height)
             {
                 ReleasePlateTexture();
@@ -2172,10 +2189,16 @@ namespace wowvr
             {
                 DumpSurfaceBmp(device, panel, L"WoWVR_platedump_interface.bmp");
             }
+            const RECT lower = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(band) };
+            const RECT upper = { 0, static_cast<LONG>(band), static_cast<LONG>(width),
+                                 static_cast<LONG>(height) };
             const bool copied = Pointer().PlateCount() > 0
-                && SUCCEEDED(device->StretchRect(panel, &g_plateStripRect, g_plateSurface, nullptr,
+                && SUCCEEDED(device->StretchRect(panel, &g_plateStripRect, g_plateSurface, &lower,
+                                                 D3DTEXF_NONE))
+                && SUCCEEDED(device->StretchRect(panel, &g_plateStripRectTop, g_plateSurface, &upper,
                                                  D3DTEXF_NONE));
             device->ColorFill(panel, &g_plateStripRect, D3DCOLOR_ARGB(0, 0, 0, 0));
+            device->ColorFill(panel, &g_plateStripRectTop, D3DCOLOR_ARGB(0, 0, 0, 0));
             if (g_plateDumpNext)
             {
                 g_plateDumpNext = false;
@@ -2398,8 +2421,11 @@ namespace wowvr
                 const float cellTopV = plate.slotV - kPlateAnchorV * g_plateCellV;
                 const float u0 = plate.slotU - 0.5f * g_plateCellU;
                 const float u1 = plate.slotU + 0.5f * g_plateCellU;
-                const float v0 = (cellTopV - g_plateStripTopV) / g_plateStripHeightV;
-                const float v1 = (cellTopV + g_plateCellV - g_plateStripTopV) / g_plateStripHeightV;
+                // The texture holds every row, bottom band first.
+                (void)cellTopV;
+                const float rowsInTexture = 2.0f * g_plateStripHeightV / g_plateCellV;
+                const float v0 = static_cast<float>(plate.row) / rowsInTexture;
+                const float v1 = static_cast<float>(plate.row + 1) / rowsInTexture;
                 const Vec3 c = plate.body;
                 const Vec3 top = { c.x + up.x * above, c.y + up.y * above, c.z + up.z * above };
                 const Vec3 bottom = { c.x - up.x * below, c.y - up.y * below, c.z - up.z * below };
@@ -2476,6 +2502,147 @@ namespace wowvr
                                           quads, sizeof(PanelVertex));
             }
             g_platesDrawn += static_cast<unsigned long long>(vertices / 6);
+        }
+
+        // Each piece of the client's world text (game/world_pointer.h, WorldText3D) as a
+        // card at the client's own point for it, facing the head, in its own colour and
+        // fade, at the size it would have had on the interface (crit pop included). The
+        // client's copy is transparent. No depth test, as the client's has none.
+        void DrawWorldTexts(IDirect3DDevice9* device)
+        {
+            const int count = Pointer().TextCount();
+            if (count <= 0)
+            {
+                return;
+            }
+            int order[64];
+            int n = 0;
+            for (int i = 0; i < count && n < 64; ++i) { order[n++] = i; }
+            for (int i = 1; i < n; ++i)
+            {
+                const int key = order[i];
+                int j = i - 1;
+                while (j >= 0 && Pointer().Text(order[j]).distanceMetres
+                                     < Pointer().Text(key).distanceMetres)
+                {
+                    order[j + 1] = order[j];
+                    --j;
+                }
+                order[j + 1] = key;
+            }
+            const PanelShape& shape = g_uiPanel.Shape();
+            const Vec3 head = Projection().HeadOffsetMetres();
+            const float panelHeight = static_cast<float>(g_uiPanel.Height());
+
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZ | D3DFVF_TEX1);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            const Mat4 identity = Mat4Identity();
+            g_originalSetTransform(device, D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&identity));
+
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                D3DVIEWPORT9 viewport = {};
+                viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
+                viewport.Width = g_stereo.EyeWidth();
+                viewport.Height = g_stereo.EyeHeight();
+                viewport.MaxZ = 1.0f;
+                g_originalSetViewport(device, &viewport);
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+                const Mat4 projection = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                                0.05f, 2000.0f);
+                g_originalSetTransform(device, D3DTS_PROJECTION,
+                                       reinterpret_cast<const D3DMATRIX*>(&projection));
+                const Vec3 openVrOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
+                const Vec3 eyeOffset = { openVrOffset.x, openVrOffset.y, -openVrOffset.z };
+                const Mat4 world = UiPanel::BodyToEye(Projection().HeadRotation(),
+                                                      Projection().HeadOffsetMetres(), eyeOffset);
+                g_originalSetTransform(device, D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&world));
+
+                for (int k = 0; k < n; ++k)
+                {
+                    const WorldTextCard& text = Pointer().Text(order[k]);
+                    const uint32_t alpha = text.colour >> 24;
+                    if (alpha == 0)
+                    {
+                        continue;
+                    }
+                    float aspect = 1.0f;
+                    IDirect3DTexture9* texture =
+                        CachedTextTexture(device, text.text, text.colour & 0xFFFFFFu, aspect);
+                    if (texture == nullptr)
+                    {
+                        continue;
+                    }
+                    Vec3 toHead = { head.x - text.body.x, head.y - text.body.y, head.z - text.body.z };
+                    const float range = sqrtf(toHead.x * toHead.x + toHead.y * toHead.y
+                                              + toHead.z * toHead.z);
+                    if (!(range > 1.0e-3f)) { continue; }
+                    toHead = { toHead.x / range, toHead.y / range, toHead.z / range };
+                    const float along = toHead.y;
+                    Vec3 up = { -toHead.x * along, 1.0f - toHead.y * along, -toHead.z * along };
+                    const float upLength = sqrtf(up.x * up.x + up.y * up.y + up.z * up.z);
+                    if (!(upLength > 1.0e-3f)) { continue; }
+                    up = { up.x / upLength, up.y / upLength, up.z / upLength };
+                    const Vec3 right = { -(up.y * toHead.z - up.z * toHead.y),
+                                         -(up.z * toHead.x - up.x * toHead.z),
+                                         -(up.x * toHead.y - up.y * toHead.x) };
+                    // The size it had on the interface, as an angle; the texture's own
+                    // outline margin makes it a touch larger than the glyphs.
+                    const float perPixel = shape.metresPerPixel * text.distanceMetres
+                                         / (shape.radius > 0.1f ? shape.radius : 0.1f);
+                    const float pixels = text.heightOfScreen > 0.0f
+                        ? text.heightOfScreen * panelHeight * 1.25f : 34.0f;
+                    const float halfH = 0.5f * pixels * perPixel;
+                    const float halfW = halfH * aspect;
+                    const Vec3 c = text.body;
+                    const PanelVertex tl = { c.x - right.x * halfW + up.x * halfH,
+                                             c.y - right.y * halfW + up.y * halfH,
+                                             c.z - right.z * halfW + up.z * halfH, 0.0f, 0.0f };
+                    const PanelVertex tr = { c.x + right.x * halfW + up.x * halfH,
+                                             c.y + right.y * halfW + up.y * halfH,
+                                             c.z + right.z * halfW + up.z * halfH, 1.0f, 0.0f };
+                    const PanelVertex bl = { c.x - right.x * halfW - up.x * halfH,
+                                             c.y - right.y * halfW - up.y * halfH,
+                                             c.z - right.z * halfW - up.z * halfH, 0.0f, 1.0f };
+                    const PanelVertex br = { c.x + right.x * halfW - up.x * halfH,
+                                             c.y + right.y * halfW - up.y * halfH,
+                                             c.z + right.z * halfW - up.z * halfH, 1.0f, 1.0f };
+                    const PanelVertex quad[6] = { tl, tr, bl, tr, br, bl };
+                    device->SetTexture(0, texture);
+                    g_originalSetRenderState(device, D3DRS_TEXTUREFACTOR, alpha << 24);
+                    g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, 2, quad, sizeof(PanelVertex));
+                    if (eye == EyeLeft) { ++g_textsDrawnReport; }
+                }
+            }
+            device->SetTexture(0, nullptr);
         }
 
         // Floating combat text (game/float_text.h) rising over the character: each message
@@ -3458,6 +3625,7 @@ namespace wowvr
             {
                 // Into the eyes (the overlay goes on top of them in the compositor).
                 DrawWorldPlates(device);
+                DrawWorldTexts(device);
                 DrawFloatingText(device);
                 DrawVignette(device);
                 DrawHelpIntoInterface(device);
@@ -3469,6 +3637,7 @@ namespace wowvr
 
             // Lifebars first, then the vignette, so the interface sheet lies over both.
             DrawWorldPlates(device);
+            DrawWorldTexts(device);
             DrawFloatingText(device);
             DrawVignette(device);
             g_originalSetRenderTarget(device, 0, g_stereo.Color());
@@ -4617,6 +4786,7 @@ namespace wowvr
                                      Projection().GameViewToBody(),
                                      Cfg().unitsPerMetre * Cfg().worldScale);
                     UpdatePlateStrip();
+                    Pointer().SetWorldTextCapture(Cfg().worldText3d && g_uiPanel.IsReady());
                     {
                         static LARGE_INTEGER last = {};
                         const LARGE_INTEGER now = Now();

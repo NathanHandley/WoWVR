@@ -65,6 +65,9 @@ namespace wowvr
         // Where the chat bubble update (0x0056C340) returns to after its own call at
         // 0x0056C3BE. Bubbles hang off WorldFrame too, and are placed the same way.
         const uintptr_t kChatBubbleReturnRva = 0x0056C3C3u - kPublishedImageBase;
+        // Where the world text update (0x007E70D0, WorldText.cpp: the damage and heal
+        // numbers over units, DAMAGE_TEXT_FONT) returns to after its call at 0x007E71FE.
+        const uintptr_t kWorldTextReturnRva = 0x007E7203u - kPublishedImageBase;
 
         typedef void(__cdecl* ScreenToRayFn)(float nx, float ny, float* start, float* end);
 
@@ -98,6 +101,7 @@ namespace wowvr
             int columns = 0;
             int rows = 0;
             float anchorV = 0.5f;
+            float topBandV = -1.0f;   // the second band's top, or < 0 for none
         };
         PlateStrip g_strip;
         const int kMaxPlates = 64;
@@ -105,6 +109,102 @@ namespace wowvr
         Vec3 g_plateWorld[kMaxPlates];
         int g_plateCount = 0;
         unsigned long long g_platesDropped = 0;
+
+        uintptr_t ImageBase();
+
+        // World text in the world: this frame's pieces.
+        bool g_textCaptureOn = false;
+        const int kMaxTexts = 64;
+        WorldTextCard g_texts[kMaxTexts];
+        int g_textCount = 0;
+        unsigned long long g_textCalls = 0;
+
+        // The world text object (CWorldText string, WorldText.cpp) being placed: its
+        // update (0x007E70D0) holds it in esi across the call, and esi is preserved into
+        // the detour by WorldToScreenThunk. Its layout, from its constructor (0x007E6C60)
+        // and the add (0x007E6DC0): +0x08 type (0..10, a row of the timing table at
+        // 0x00AF474C), +0x10 half height in screen units, +0x20 colour (BGRA; the update
+        // writes the faded alpha into +0x23 before placing it), +0x28 its text object,
+        // +0x3C the text (64 bytes).
+        uintptr_t g_callerEsi = 0;
+        const uintptr_t kTextType = 0x08u;
+        const uintptr_t kTextHalfHeight = 0x10u;
+        const uintptr_t kTextColour = 0x20u;
+        const uintptr_t kTextObject = 0x28u;
+        const uintptr_t kTextString = 0x3Cu;
+        // The text object's colour and shadow setters, as the update calls them
+        // (0x007E6A0A and 0x007E6A1C): cdecl (object, colour*) and (object, colour*,
+        // offset*), the offset the client passes being the one at 0x00AF487C.
+        const uintptr_t kSetTextColourRva = 0x006BD070u - kPublishedImageBase;
+        const uintptr_t kSetTextShadowRva = 0x006BD0C0u - kPublishedImageBase;
+        const uintptr_t kShadowOffsetRva = 0x00AF487Cu - kPublishedImageBase;
+        const uint8_t kSetTextColourEntry[6] = { 0x55u, 0x8Bu, 0xECu, 0x8Bu, 0x4Du, 0x08u };
+        const uint8_t kSetTextShadowEntry[6] = { 0x55u, 0x8Bu, 0xECu, 0x8Bu, 0x4Du, 0x08u };
+        typedef int(__cdecl* SetTextColourFn)(void* object, const uint32_t* colour);
+        typedef int(__cdecl* SetTextShadowFn)(void* object, const uint32_t* colour, const void* offset);
+        int g_textSettersChecked = 0;   // 0 unknown, 1 good, -1 not the expected code
+
+        // Reads the piece; false if it does not look like one.
+        bool ReadWorldText(uintptr_t object, WorldTextCard& card, void*& textObject)
+        {
+            __try
+            {
+                const int type = *reinterpret_cast<const int*>(object + kTextType);
+                if (type < 0 || type > 10)
+                {
+                    return false;
+                }
+                const char* text = reinterpret_cast<const char*>(object + kTextString);
+                int n = 0;
+                while (n < 63 && text[n] != 0) { card.text[n] = text[n]; ++n; }
+                card.text[n] = 0;
+                if (n == 0)
+                {
+                    return false;
+                }
+                card.colour = *reinterpret_cast<const uint32_t*>(object + kTextColour);
+                const float half = *reinterpret_cast<const float*>(object + kTextHalfHeight);
+                card.heightOfScreen = half;   // screen units here; a fraction once placed
+                textObject = *reinterpret_cast<void* const*>(object + kTextObject);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+
+        // The client's own copy, transparent for this frame (the update sets its colour
+        // again every frame before placing it, so this never sticks).
+        void HideWorldText(void* textObject)
+        {
+            if (textObject == nullptr)
+            {
+                return;
+            }
+            if (g_textSettersChecked == 0)
+            {
+                g_textSettersChecked =
+                    (memcmp(reinterpret_cast<const void*>(ImageBase() + kSetTextColourRva),
+                            kSetTextColourEntry, 6) == 0
+                     && memcmp(reinterpret_cast<const void*>(ImageBase() + kSetTextShadowRva),
+                               kSetTextShadowEntry, 6) == 0) ? 1 : -1;
+            }
+            if (g_textSettersChecked < 0)
+            {
+                return;
+            }
+            static const uint32_t clear = 0;
+            __try
+            {
+                reinterpret_cast<SetTextColourFn>(ImageBase() + kSetTextColourRva)(textObject, &clear);
+                reinterpret_cast<SetTextShadowFn>(ImageBase() + kSetTextShadowRva)(
+                    textObject, &clear, reinterpret_cast<const void*>(ImageBase() + kShadowOffsetRva));
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
 
         // Diagnostics, all on the one thread.
         unsigned long long g_rayCalls = 0;
@@ -402,6 +502,44 @@ namespace wowvr
             ++g_projectCalls;
 
             const Vec3 target = { point[0], point[1], point[2] };
+
+            // World text in the world: read it, hide the client's copy, and answer "on
+            // screen" whatever the head is doing - a 'no' makes the client delete the piece
+            // (0x007E5205), and in a headset it is still there to be seen beside or behind.
+            if (g_textCaptureOn
+                && _ReturnAddress() == reinterpret_cast<void*>(ImageBase() + kWorldTextReturnRva))
+            {
+                ++g_textCalls;
+                if (g_textCount < kMaxTexts)
+                {
+                    WorldTextCard& card = g_texts[g_textCount];
+                    void* textObject = nullptr;
+                    if (ReadWorldText(g_callerEsi, card, textObject))
+                    {
+                        pointing::WorldToBody(g_state.frame, camera, target, card.body);
+                        const Vec3 d = { card.body.x - g_state.frame.headBody.x,
+                                         card.body.y - g_state.frame.headBody.y,
+                                         card.body.z - g_state.frame.headBody.z };
+                        card.distanceMetres = Length(d);
+                        const float fraction = ddc[1] > 0.0f ? 2.0f * card.heightOfScreen / ddc[1] : 0.0f;
+                        if ((g_textCalls % 1200u) == 1u)
+                        {
+                            WOWVR_INFO("World text sample: \"%s\" colour %08X, half height %.4f of "
+                                       "screen height %.4f -> %.3f of the screen, %.1f m away.",
+                                       card.text, card.colour, card.heightOfScreen, ddc[1], fraction,
+                                       card.distanceMetres);
+                        }
+                        card.heightOfScreen = (fraction > 0.0f && fraction < 0.5f) ? fraction : 0.0f;
+                        ++g_textCount;
+                        HideWorldText(textObject);
+                    }
+                }
+                out[0] = 0.5f * (frameRect[3] - frameRect[1]);
+                out[1] = 0.5f * (frameRect[2] - frameRect[0]);
+                out[2] = 1.0f;
+                if (flags != nullptr) { *flags = 0x0Fu; }
+                return 1u;
+            }
             float u = 0.0f;
             float v = 0.0f;
             float distanceYards = 0.0f;
@@ -440,7 +578,9 @@ namespace wowvr
                 }
                 if (slot < 0)
                 {
-                    if (g_plateCount >= kMaxPlates || g_plateCount >= g_strip.columns * g_strip.rows)
+                    const int bands = g_strip.topBandV >= 0.0f ? 2 : 1;
+                    if (g_plateCount >= kMaxPlates
+                        || g_plateCount >= g_strip.columns * g_strip.rows * bands)
                     {
                         ++g_platesDropped;
                         return 0u;
@@ -453,8 +593,11 @@ namespace wowvr
                     plate.body = body;
                     plate.distanceMetres = distanceYards / g_state.frame.unitsPerMetre;
                     plate.slotU = (static_cast<float>(slot % g_strip.columns) + 0.5f) * g_strip.cellU;
-                    plate.slotV = g_strip.topV
-                                + (static_cast<float>(slot / g_strip.columns) + g_strip.anchorV) * g_strip.cellV;
+                    plate.row = slot / g_strip.columns;
+                    const bool upper = plate.row >= g_strip.rows;
+                    plate.slotV = (upper ? g_strip.topBandV : g_strip.topV)
+                                + (static_cast<float>(upper ? plate.row - g_strip.rows : plate.row)
+                                   + g_strip.anchorV) * g_strip.cellV;
                 }
                 u = g_plates[slot].slotU;
                 v = g_plates[slot].slotV;
@@ -510,6 +653,18 @@ namespace wowvr
                 return 1u;
             }
             return 0u;
+        }
+
+        // GetScreenCoordinates is entered here first: the caller's esi (the world text
+        // object, for the world text update) is kept, then the detour runs as if called
+        // directly - same stack, same return address.
+        __declspec(naked) void WorldToScreenThunk()
+        {
+            __asm
+            {
+                mov g_callerEsi, esi
+                jmp WorldToScreenDetour
+            }
         }
 
         bool InstallDetour(uintptr_t rva, const uint8_t* expected, size_t length,
@@ -611,7 +766,7 @@ namespace wowvr
         // the pair together.
         const bool projectOk = InstallDetour(kWorldToScreenRva, kWorldToScreenEntry,
                                              sizeof(kWorldToScreenEntry),
-                                             reinterpret_cast<const void*>(&WorldToScreenDetour),
+                                             reinterpret_cast<const void*>(&WorldToScreenThunk),
                                              &projectTrampoline, "GetScreenCoordinates");
         if (projectOk)
         {
@@ -649,9 +804,10 @@ namespace wowvr
     }
 
     void WorldPointer::SetPlateStrip(bool on, float stripTopV, float cellU, float cellV,
-                                     int columns, int rows, float anchorV)
+                                     int columns, int rows, float anchorV, float topBandV)
     {
         g_strip.anchorV = anchorV;
+        g_strip.topBandV = topBandV;
         g_strip.on = on && columns > 0 && rows > 0 && cellU > 0.0f && cellV > 0.0f;
         g_strip.topV = stripTopV;
         g_strip.cellU = cellU;
@@ -678,6 +834,27 @@ namespace wowvr
     void WorldPointer::BeginPlateFrame()
     {
         g_plateCount = 0;
+        g_textCount = 0;
+    }
+
+    void WorldPointer::SetWorldTextCapture(bool on)
+    {
+        g_textCaptureOn = on;
+    }
+
+    int WorldPointer::TextCount() const
+    {
+        return g_textCount;
+    }
+
+    const WorldTextCard& WorldPointer::Text(int index) const
+    {
+        return g_texts[index];
+    }
+
+    unsigned long long WorldPointer::TextCalls() const
+    {
+        return g_textCalls;
     }
 
     bool WorldPointer::IsActive() const

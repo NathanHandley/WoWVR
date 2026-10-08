@@ -73,4 +73,10 @@ namespace wowvr
     };
 
     FloatText& FloatTexts();
+
+    // A text's texture (its colour, a dark outline, straight alpha), built once and kept
+    // for reuse - the same numbers come up again and again. 'rgb' 0xRRGGBB. Null if it
+    // could not be built. Released with FloatText::ReleaseTextures.
+    IDirect3DTexture9* CachedTextTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
+                                         float& aspect);
 }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/math3d.h"
+
+#include <cstdint>
 #include "ui/ui_panel.h"
 
 namespace wowvr
@@ -41,6 +43,19 @@ namespace wowvr
         float distanceMetres;   // from the head
         float slotU;            // where in the interface image its anchor was put: the
         float slotV;            //   cell's centre across, anchorV of the way down (0..1)
+        int row;                // its row of cells, counting the bottom band's first
+    };
+
+    // A piece of the client's world text (damage and heal numbers over units) this
+    // frame, read out of the client's own object, for drawing in the world.
+    struct WorldTextCard
+    {
+        Vec3 body;              // the point the client puts it at, metres, body frame
+        float distanceMetres;   // from the head
+        char text[64];          // as the client shows it
+        uint32_t colour;        // 0xAARRGGBB, alpha already faded by the client
+        float heightOfScreen;   // its height as a fraction of the screen's (the
+                                //   client's own, crit pop included), 0 if unknown
     };
 
     class WorldPointer
@@ -70,11 +85,23 @@ namespace wowvr
         // of the interface, clears it, and draws each cell over its unit in 3D.
         // anchorV: how far down its cell a lifebar's anchor goes (the client hangs the
         // lifebar below its anchor point).
+        // The rows are in two bands: 'rows' starting at stripTopV (along the bottom), then
+        // as many again starting at topBandV (along the top), when topBandV >= 0.
         void SetPlateStrip(bool on, float stripTopV, float cellU, float cellV, int columns,
-                           int rows, float anchorV);
+                           int rows, float anchorV, float topBandV = -1.0f);
         bool PlateStripOn() const;
         int PlateCount() const;
         const WorldPlate& Plate(int index) const;
+
+        // World text in the world. While on, each piece of the client's world text (the
+        // numbers over units as they are hit or healed) is read out of the client's
+        // object as it is placed - text, faded colour, size, point - and the client's own
+        // copy is made transparent, so it can be drawn over the unit instead.
+        void SetWorldTextCapture(bool on);
+        int TextCount() const;
+        const WorldTextCard& Text(int index) const;
+        // Calls from the world text placer since the last report.
+        unsigned long long TextCalls() const;
         // Once a frame, after the frame's plates have been drawn.
         void BeginPlateFrame();
 
