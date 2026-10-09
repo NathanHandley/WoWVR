@@ -512,6 +512,241 @@ namespace wowvr
         }
     }
 
+    namespace
+    {
+        // The client's colour and texture escapes out, UTF-8 to UTF-16.
+        bool PlainWide(const char* utf8, wchar_t* out, int capacity)
+        {
+            char plain[512] = {};
+            size_t n = 0;
+            const size_t length = strlen(utf8);
+            for (size_t i = 0; i < length && n + 1 < sizeof(plain); ++i)
+            {
+                const char c = utf8[i];
+                if (c == '|' && i + 1 < length)
+                {
+                    const char k = utf8[i + 1];
+                    if (k == 'c' && i + 9 < length) { i += 9; continue; }
+                    if (k == 'r') { i += 1; continue; }
+                    if (k == '|') { plain[n++] = '|'; i += 1; continue; }
+                }
+                plain[n++] = c;
+            }
+            plain[n] = 0;
+            return MultiByteToWideChar(CP_UTF8, 0, plain, -1, out, capacity) > 0;
+        }
+
+        IDirect3DTexture9* BuildBubble(IDirect3DDevice9* device, const wchar_t* text, unsigned rgb,
+                                       float& aspect, float& lineFraction)
+        {
+            const int kFont = 34;
+            const int kPad = 22;
+            const int kWrap = 640;
+            const int kTail = 22;
+            const int kRadius = 26;
+            const int kBorder = 3;
+            HDC dc = CreateCompatibleDC(nullptr);
+            if (dc == nullptr)
+            {
+                return nullptr;
+            }
+            HFONT font = CreateFontW(-kFont, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                     DEFAULT_PITCH | FF_SWISS, FontFace());
+            HGDIOBJ previousFont = SelectObject(dc, font);
+            RECT measure = { 0, 0, kWrap, 0 };
+            const int length = static_cast<int>(wcslen(text));
+            DrawTextW(dc, text, length, &measure, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+            TEXTMETRICW metrics = {};
+            GetTextMetricsW(dc, &metrics);
+            const int textW = measure.right - measure.left;
+            const int textH = measure.bottom - measure.top;
+            const int boxW = textW + kPad * 2 < kRadius * 3 ? kRadius * 3 : textW + kPad * 2;
+            const int boxH = textH + kPad * 2;
+            const int width = boxW + 2;
+            const int height = boxH + kTail + 2;
+
+            BITMAPINFO info = {};
+            info.bmiHeader.biSize = sizeof(info.bmiHeader);
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (bitmap == nullptr || bits == nullptr)
+            {
+                SelectObject(dc, previousFont);
+                DeleteObject(font);
+                DeleteDC(dc);
+                return nullptr;
+            }
+            HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
+            memset(bits, 0, static_cast<size_t>(width) * height * 4);
+            // Coverage per channel: blue the border (box and tail, filled), green the
+            // inside, red the text.
+            const int cx = width / 2;
+            const POINT tail[3] = { { cx - kTail, boxH - 2 }, { cx + kTail, boxH - 2 }, { cx, height - 1 } };
+            HBRUSH blue = CreateSolidBrush(RGB(0, 0, 255));
+            HPEN bluePen = CreatePen(PS_SOLID, 1, RGB(0, 0, 255));
+            HGDIOBJ oldBrush = SelectObject(dc, blue);
+            HGDIOBJ oldPen = SelectObject(dc, bluePen);
+            RoundRect(dc, 1, 1, boxW + 1, boxH + 1, kRadius * 2, kRadius * 2);
+            Polygon(dc, tail, 3);
+            HBRUSH green = CreateSolidBrush(RGB(0, 255, 255));
+            HPEN greenPen = CreatePen(PS_SOLID, 1, RGB(0, 255, 255));
+            SelectObject(dc, green);
+            SelectObject(dc, greenPen);
+            RoundRect(dc, 1 + kBorder, 1 + kBorder, boxW + 1 - kBorder, boxH + 1 - kBorder,
+                      (kRadius - kBorder) * 2, (kRadius - kBorder) * 2);
+            const POINT inner[3] = { { cx - kTail + kBorder * 2, boxH - 2 - kBorder },
+                                     { cx + kTail - kBorder * 2, boxH - 2 - kBorder },
+                                     { cx, height - 1 - kBorder * 2 } };
+            Polygon(dc, inner, 3);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(blue);
+            DeleteObject(bluePen);
+            DeleteObject(green);
+            DeleteObject(greenPen);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 0, 0));
+            RECT where = { cx - textW / 2, 1 + kPad, cx - textW / 2 + textW, 1 + kPad + textH };
+            // Text drawn over a cleared red channel only: GDI writes all three, so it
+            // goes into a second pass below.
+            GdiFlush();
+            std::vector<uint32_t> shape(static_cast<const uint32_t*>(bits),
+                                        static_cast<const uint32_t*>(bits) + static_cast<size_t>(width) * height);
+            memset(bits, 0, static_cast<size_t>(width) * height * 4);
+            DrawTextW(dc, text, length, &where, DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+            GdiFlush();
+
+            const uint32_t* textCover = static_cast<const uint32_t*>(bits);
+            std::vector<uint32_t> pixels(static_cast<size_t>(width) * height);
+            for (size_t i = 0; i < pixels.size(); ++i)
+            {
+                const uint32_t outer = shape[i] & 0xFFu;            // box and tail
+                const uint32_t inside = (shape[i] >> 8) & 0xFFu;    // inside the border
+                const uint32_t glyph = (textCover[i] >> 16) & 0xFFu;
+                // Border light grey, inside near-black at 80%, text in its colour.
+                uint32_t r = 0xC8, g = 0xC8, b = 0xC8;
+                uint32_t a = outer;
+                if (inside > 0)
+                {
+                    r = (r * (255 - inside) + 0x10 * inside) / 255;
+                    g = (g * (255 - inside) + 0x10 * inside) / 255;
+                    b = (b * (255 - inside) + 0x14 * inside) / 255;
+                    a = (a * (255 - inside) + 0xCC * inside) / 255;
+                }
+                if (glyph > 0)
+                {
+                    r = (r * (255 - glyph) + ((rgb >> 16) & 0xFFu) * glyph) / 255;
+                    g = (g * (255 - glyph) + ((rgb >> 8) & 0xFFu) * glyph) / 255;
+                    b = (b * (255 - glyph) + (rgb & 0xFFu) * glyph) / 255;
+                    a = a + ((255 - a) * glyph) / 255;
+                }
+                pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+            SelectObject(dc, previousBitmap);
+            SelectObject(dc, previousFont);
+            DeleteObject(bitmap);
+            DeleteObject(font);
+            DeleteDC(dc);
+
+            IDirect3DTexture9* texture = nullptr;
+            if (FAILED(device->CreateTexture(static_cast<UINT>(width), static_cast<UINT>(height), 1, 0,
+                                             D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr)))
+            {
+                return nullptr;
+            }
+            D3DLOCKED_RECT locked = {};
+            if (FAILED(texture->LockRect(0, &locked, nullptr, 0)))
+            {
+                texture->Release();
+                return nullptr;
+            }
+            for (int y = 0; y < height; ++y)
+            {
+                memcpy(static_cast<uint8_t*>(locked.pBits) + static_cast<size_t>(y) * locked.Pitch,
+                       pixels.data() + static_cast<size_t>(y) * width, static_cast<size_t>(width) * 4);
+            }
+            texture->UnlockRect(0);
+            aspect = static_cast<float>(width) / static_cast<float>(height);
+            lineFraction = static_cast<float>(metrics.tmHeight) / static_cast<float>(height);
+            return texture;
+        }
+
+        struct CachedBubble
+        {
+            char text[256] = {};
+            unsigned rgb = 0;
+            IDirect3DTexture9* texture = nullptr;
+            IDirect3DDevice9* device = nullptr;
+            float aspect = 1.0f;
+            float line = 0.1f;
+            unsigned long long used = 0;
+        };
+        CachedBubble g_bubbleCache[24];
+        unsigned long long g_bubbleClock = 0;
+
+        void ReleaseBubbleCache()
+        {
+            for (CachedBubble& entry : g_bubbleCache)
+            {
+                if (entry.texture != nullptr)
+                {
+                    entry.texture->Release();
+                }
+                entry = CachedBubble();
+            }
+        }
+    }
+
+    IDirect3DTexture9* CachedBubbleTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
+                                           float& aspect, float& lineFraction)
+    {
+        ++g_bubbleClock;
+        CachedBubble* oldest = &g_bubbleCache[0];
+        for (CachedBubble& entry : g_bubbleCache)
+        {
+            if (entry.texture != nullptr && entry.device == device && entry.rgb == rgb
+                && strcmp(entry.text, utf8) == 0)
+            {
+                entry.used = g_bubbleClock;
+                aspect = entry.aspect;
+                lineFraction = entry.line;
+                return entry.texture;
+            }
+            if (entry.used < oldest->used)
+            {
+                oldest = &entry;
+            }
+        }
+        static wchar_t wide[512];
+        if (!PlainWide(utf8, wide, 512))
+        {
+            return nullptr;
+        }
+        if (oldest->texture != nullptr)
+        {
+            oldest->texture->Release();
+        }
+        *oldest = CachedBubble();
+        oldest->texture = BuildBubble(device, wide, rgb, oldest->aspect, oldest->line);
+        if (oldest->texture == nullptr)
+        {
+            return nullptr;
+        }
+        strncpy_s(oldest->text, utf8, _TRUNCATE);
+        oldest->rgb = rgb;
+        oldest->device = device;
+        oldest->used = g_bubbleClock;
+        aspect = oldest->aspect;
+        lineFraction = oldest->line;
+        return oldest->texture;
+    }
+
     IDirect3DTexture9* CachedTextTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
                                          float& aspect)
     {
@@ -557,6 +792,7 @@ namespace wowvr
     void FloatText::ReleaseTextures()
     {
         ReleaseTextCache();
+        ReleaseBubbleCache();
         for (int i = 0; i < m_count; ++i)
         {
             if (m_messages[i].texture != nullptr)

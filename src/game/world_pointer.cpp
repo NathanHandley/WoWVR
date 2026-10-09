@@ -112,6 +112,54 @@ namespace wowvr
 
         uintptr_t ImageBase();
 
+        // Chat bubbles in the world: this frame's bubbles. The bubble update (0x0056C340,
+        // ChatBubbleFrame.cpp) holds its CGChatBubbleFrame in esi across the call; the
+        // frame's font string is at +0x2A4 (constructor, 0x0056CCE8), and a font string
+        // keeps its text at +0xF4 (FontString:GetText, 0x0048D730) and its colour at
+        // +0xA4 alpha, +0xAC/+0xAD/+0xAE blue/green/red when +0xA8 is 1 (0x00487AB0).
+        bool g_bubbleCaptureOn = false;
+        const int kMaxBubbles = 16;
+        WorldBubbleCard g_bubbles[kMaxBubbles];
+        int g_bubbleCount = 0;
+        unsigned long long g_bubbleCalls = 0;
+        unsigned long long g_bubbleReads = 0;
+        char g_lastBubbleLogged[64] = {};
+        const uintptr_t kBubbleFontString = 0x2A4u;
+        const uintptr_t kFontStringText = 0xF4u;
+        const uintptr_t kFontStringHasColour = 0xA8u;
+        const uintptr_t kFontStringColour = 0xACu;
+
+        bool ReadBubble(uintptr_t bubble, WorldBubbleCard& card)
+        {
+            __try
+            {
+                const uintptr_t fontString = *reinterpret_cast<const uintptr_t*>(bubble + kBubbleFontString);
+                if (fontString == 0)
+                {
+                    return false;
+                }
+                const char* text = *reinterpret_cast<const char* const*>(fontString + kFontStringText);
+                if (text == nullptr || text[0] == 0)
+                {
+                    return false;
+                }
+                int n = 0;
+                while (n < 255 && text[n] != 0) { card.text[n] = text[n]; ++n; }
+                card.text[n] = 0;
+                card.rgb = 0xFFFFFFu;
+                if (*reinterpret_cast<const int*>(fontString + kFontStringHasColour) == 1)
+                {
+                    const uint8_t* c = reinterpret_cast<const uint8_t*>(fontString + kFontStringColour);
+                    card.rgb = (static_cast<uint32_t>(c[2]) << 16) | (static_cast<uint32_t>(c[1]) << 8) | c[0];
+                }
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+
         // World text in the world: this frame's pieces.
         bool g_textCaptureOn = false;
         const int kMaxTexts = 64;
@@ -503,6 +551,41 @@ namespace wowvr
 
             const Vec3 target = { point[0], point[1], point[2] };
 
+            // Chat bubbles in the world: read the bubble, and send the client's frame
+            // far off the canvas (it is placed wherever this says, and a 'no' would only
+            // leave it where it was, on the interface).
+            if (g_bubbleCaptureOn
+                && _ReturnAddress() == reinterpret_cast<void*>(ImageBase() + kChatBubbleReturnRva))
+            {
+                ++g_bubbleCalls;
+                if (g_bubbleCount < kMaxBubbles)
+                {
+                    WorldBubbleCard& card = g_bubbles[g_bubbleCount];
+                    if (ReadBubble(g_callerEsi, card))
+                    {
+                        ++g_bubbleReads;
+                        pointing::WorldToBody(g_state.frame, camera, target, card.body);
+                        const Vec3 d = { card.body.x - g_state.frame.headBody.x,
+                                         card.body.y - g_state.frame.headBody.y,
+                                         card.body.z - g_state.frame.headBody.z };
+                        card.distanceMetres = Length(d);
+                        if (strncmp(g_lastBubbleLogged, card.text, sizeof(g_lastBubbleLogged) - 1) != 0)
+                        {
+                            strncpy_s(g_lastBubbleLogged, card.text, _TRUNCATE);
+                            WOWVR_INFO("Chat bubble: \"%.60s\" colour %06X, %.1f m away, at body "
+                                       "(%.2f, %.2f, %.2f).", card.text, card.rgb, card.distanceMetres,
+                                       card.body.x, card.body.y, card.body.z);
+                        }
+                        ++g_bubbleCount;
+                    }
+                }
+                out[0] = -20.0f * (frameRect[3] - frameRect[1]);
+                out[1] = -20.0f * (frameRect[2] - frameRect[0]);
+                out[2] = 1.0f;
+                if (flags != nullptr) { *flags = 0x0Fu; }
+                return 1u;
+            }
+
             // World text in the world: read it, hide the client's copy, and answer "on
             // screen" whatever the head is doing - a 'no' makes the client delete the piece
             // (0x007E5205), and in a headset it is still there to be seen beside or behind.
@@ -835,11 +918,65 @@ namespace wowvr
     {
         g_plateCount = 0;
         g_textCount = 0;
+        g_bubbleCount = 0;
     }
 
     void WorldPointer::SetWorldTextCapture(bool on)
     {
         g_textCaptureOn = on;
+    }
+
+    void WorldPointer::SetBubbleCapture(bool on)
+    {
+        g_bubbleCaptureOn = on;
+
+        // The client gives no chat bubble to a unit that has a lifebar (the bubble
+        // creation, 0x00720010, leaves when the unit's nameplate frame at +0xC38 is set):
+        // on a flat screen the lifebar sits where the bubble would. With bubbles in the
+        // world they no longer share a spot, so while this is on that test is skipped:
+        //   00720020  0F 85 01 01 00 00   jne 0x00720127
+        // becomes six nops.
+        static const uint8_t kExpected[6] = { 0x0Fu, 0x85u, 0x01u, 0x01u, 0x00u, 0x00u };
+        static const uint8_t kPatched[6] = { 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u };
+        static bool s_patched = false;
+        static bool s_refused = false;
+        if (on == s_patched || s_refused)
+        {
+            return;
+        }
+        uint8_t* site = reinterpret_cast<uint8_t*>(ImageBase() + (0x00720020u - kPublishedImageBase));
+        const uint8_t* from = on ? kExpected : kPatched;
+        const uint8_t* to = on ? kPatched : kExpected;
+        if (memcmp(site, from, sizeof(kExpected)) != 0)
+        {
+            WOWVR_WARN("Chat bubbles: 0x00720020 does not hold the expected bytes; units with "
+                       "lifebars keep getting no bubble.");
+            s_refused = true;
+            return;
+        }
+        DWORD previous = 0;
+        if (!VirtualProtect(site, sizeof(kExpected), PAGE_EXECUTE_READWRITE, &previous))
+        {
+            WOWVR_WARN("Chat bubbles: 0x00720020 could not be made writable.");
+            s_refused = true;
+            return;
+        }
+        memcpy(site, to, sizeof(kExpected));
+        VirtualProtect(site, sizeof(kExpected), previous, &previous);
+        FlushInstructionCache(GetCurrentProcess(), site, sizeof(kExpected));
+        s_patched = on;
+        WOWVR_INFO("Chat bubbles: units with lifebars %s.",
+                   on ? "now get bubbles too" : "get no bubble again (the client's own rule)");
+    }
+
+    int WorldPointer::BubbleCount() const
+    {
+        return g_bubbleCount;
+    }
+
+    const WorldBubbleCard& WorldPointer::Bubble(int index) const
+    {
+        return g_bubbles[index];
     }
 
     int WorldPointer::TextCount() const
@@ -855,6 +992,16 @@ namespace wowvr
     unsigned long long WorldPointer::TextCalls() const
     {
         return g_textCalls;
+    }
+
+    unsigned long long WorldPointer::BubbleCalls() const
+    {
+        return g_bubbleCalls;
+    }
+
+    unsigned long long WorldPointer::BubbleReads() const
+    {
+        return g_bubbleReads;
     }
 
     bool WorldPointer::IsActive() const

@@ -79,4 +79,11 @@ namespace wowvr
     // could not be built. Released with FloatText::ReleaseTextures.
     IDirect3DTexture9* CachedTextTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
                                          float& aspect);
+
+    // A chat bubble's texture: the text wrapped in a dark rounded box with a light
+    // border and a tail at the bottom middle, built once per text and colour.
+    // 'lineFraction' is one line of text as a fraction of the texture's height, for
+    // sizing it in the world. Released with FloatText::ReleaseTextures.
+    IDirect3DTexture9* CachedBubbleTexture(IDirect3DDevice9* device, const char* utf8, unsigned rgb,
+                                           float& aspect, float& lineFraction);
 }

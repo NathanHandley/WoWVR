@@ -58,6 +58,16 @@ namespace wowvr
                                 //   client's own, crit pop included), 0 if unknown
     };
 
+    // A chat bubble the client placed this frame (a creature or player speaking), read
+    // out of the client's bubble frame, for drawing in the world.
+    struct WorldBubbleCard
+    {
+        Vec3 body;              // the tip of its tail, metres, body frame
+        float distanceMetres;   // from the head
+        char text[256];         // as the bubble shows it
+        uint32_t rgb;           // 0xRRGGBB, the chat type's colour
+    };
+
     class WorldPointer
     {
     public:
@@ -98,10 +108,19 @@ namespace wowvr
         // object as it is placed - text, faded colour, size, point - and the client's own
         // copy is made transparent, so it can be drawn over the unit instead.
         void SetWorldTextCapture(bool on);
+
+        // Chat bubbles in the world, the same way: read out as each is placed, and the
+        // client's own frame put off the canvas where it cannot be seen.
+        void SetBubbleCapture(bool on);
+        int BubbleCount() const;
+        const WorldBubbleCard& Bubble(int index) const;
         int TextCount() const;
         const WorldTextCard& Text(int index) const;
         // Calls from the world text placer since the last report.
         unsigned long long TextCalls() const;
+        // Calls from the chat bubble placer, and bubbles read from them, in all.
+        unsigned long long BubbleCalls() const;
+        unsigned long long BubbleReads() const;
         // Once a frame, after the frame's plates have been drawn.
         void BeginPlateFrame();
 

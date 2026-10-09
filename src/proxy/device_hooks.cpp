@@ -1154,6 +1154,7 @@ namespace wowvr
         float g_plateStripHeightV = 0.0f;
         unsigned long long g_platesDrawn = 0;
         unsigned long long g_textsDrawnReport = 0;   // world text cards (WorldText3D)
+        unsigned long long g_bubblesDrawnReport = 0; // chat bubble cards (ChatBubbles3D)
         // How far down its cell a lifebar's anchor is put. The client hangs the lifebar
         // below its anchor (measured: name and bar span about the next 45 px at 1.5x),
         // so near the top leaves room under it for a cast bar.
@@ -1579,6 +1580,10 @@ namespace wowvr
                        "client's world text in all.", Cfg().worldText3d ? "on" : "off (WorldText3D=0)",
                        g_textsDrawnReport, Pointer().TextCalls());
             g_textsDrawnReport = 0;
+            WOWVR_INFO("Chat bubbles in the world: %s, %llu cards drawn; %llu placements, %llu read, "
+                       "from the client's bubbles in all.", Cfg().chatBubbles3d ? "on" : "off (ChatBubbles3D=0)",
+                       g_bubblesDrawnReport, Pointer().BubbleCalls(), Pointer().BubbleReads());
+            g_bubblesDrawnReport = 0;
 
             WOWVR_INFO("Frame rate mode: %s, %llu switches so far.",
                        Vr().HalfRate() ? "half rate" : "full rate", g_halfRate.switches);
@@ -2619,7 +2624,7 @@ namespace wowvr
                     const float perPixel = shape.metresPerPixel * text.distanceMetres
                                          / (shape.radius > 0.1f ? shape.radius : 0.1f);
                     const float pixels = text.heightOfScreen > 0.0f
-                        ? text.heightOfScreen * panelHeight * 1.25f : 34.0f;
+                        ? text.heightOfScreen * panelHeight * 0.625f : 17.0f;
                     const float halfH = 0.5f * pixels * perPixel;
                     const float halfW = halfH * aspect;
                     const Vec3 c = text.body;
@@ -2640,6 +2645,137 @@ namespace wowvr
                     g_originalSetRenderState(device, D3DRS_TEXTUREFACTOR, alpha << 24);
                     g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, 2, quad, sizeof(PanelVertex));
                     if (eye == EyeLeft) { ++g_textsDrawnReport; }
+                }
+            }
+            device->SetTexture(0, nullptr);
+        }
+
+        // Each chat bubble (game/world_pointer.h, ChatBubbles3D) as a card standing on its
+        // tail at the speaker's head, facing the head, its lines the size the client's
+        // bubble text has on the interface. Furthest first; no depth test.
+        void DrawWorldBubbles(IDirect3DDevice9* device)
+        {
+            const int count = Pointer().BubbleCount();
+            if (count <= 0)
+            {
+                return;
+            }
+            int order[16];
+            int n = 0;
+            for (int i = 0; i < count && n < 16; ++i) { order[n++] = i; }
+            for (int i = 1; i < n; ++i)
+            {
+                const int key = order[i];
+                int j = i - 1;
+                while (j >= 0 && Pointer().Bubble(order[j]).distanceMetres
+                                     < Pointer().Bubble(key).distanceMetres)
+                {
+                    order[j + 1] = order[j];
+                    --j;
+                }
+                order[j + 1] = key;
+            }
+            const PanelShape& shape = g_uiPanel.Shape();
+            const Vec3 head = Projection().HeadOffsetMetres();
+            // A line of bubble text (NAMEPLATE_FONT) is about this much of the screen's
+            // height on the interface.
+            const float linePixels = 0.022f * static_cast<float>(g_uiPanel.Height());
+
+            g_originalSetRenderTarget(device, 0, g_stereo.Color());
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetVertexShader(device, nullptr);
+            device->SetPixelShader(nullptr);
+            g_originalSetFVF(device, D3DFVF_XYZ | D3DFVF_TEX1);
+            g_originalSetRenderState(device, D3DRS_ZENABLE, D3DZB_FALSE);
+            g_originalSetRenderState(device, D3DRS_ZWRITEENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE);
+            g_originalSetRenderState(device, D3DRS_LIGHTING, FALSE);
+            g_originalSetRenderState(device, D3DRS_FOGENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHATESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_STENCILENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_originalSetRenderState(device, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            g_originalSetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_originalSetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_originalSetRenderState(device, D3DRS_COLORWRITEENABLE, 0x0F);
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+            const Mat4 identity = Mat4Identity();
+            g_originalSetTransform(device, D3DTS_VIEW, reinterpret_cast<const D3DMATRIX*>(&identity));
+
+            for (int eye = 0; eye < EyeCount; ++eye)
+            {
+                D3DVIEWPORT9 viewport = {};
+                viewport.X = (eye == EyeLeft) ? 0 : g_stereo.EyeWidth();
+                viewport.Width = g_stereo.EyeWidth();
+                viewport.Height = g_stereo.EyeHeight();
+                viewport.MaxZ = 1.0f;
+                g_originalSetViewport(device, &viewport);
+                float tanLeft = 0.0f, tanRight = 0.0f, tanTop = 0.0f, tanBottom = 0.0f;
+                Vr().EyeTangents(eye, tanLeft, tanRight, tanTop, tanBottom);
+                const Mat4 projection = Mat4PerspectiveTangents(tanLeft, tanRight, tanTop, tanBottom,
+                                                                0.05f, 2000.0f);
+                g_originalSetTransform(device, D3DTS_PROJECTION,
+                                       reinterpret_cast<const D3DMATRIX*>(&projection));
+                const Vec3 openVrOffset = Mat4TranslationOf(Vr().EyeToHead(eye));
+                const Vec3 eyeOffset = { openVrOffset.x, openVrOffset.y, -openVrOffset.z };
+                const Mat4 world = UiPanel::BodyToEye(Projection().HeadRotation(),
+                                                      Projection().HeadOffsetMetres(), eyeOffset);
+                g_originalSetTransform(device, D3DTS_WORLD, reinterpret_cast<const D3DMATRIX*>(&world));
+
+                for (int k = 0; k < n; ++k)
+                {
+                    const WorldBubbleCard& bubble = Pointer().Bubble(order[k]);
+                    float aspect = 1.0f;
+                    float line = 0.1f;
+                    IDirect3DTexture9* texture =
+                        CachedBubbleTexture(device, bubble.text, bubble.rgb, aspect, line);
+                    if (texture == nullptr)
+                    {
+                        continue;
+                    }
+                    Vec3 toHead = { head.x - bubble.body.x, head.y - bubble.body.y,
+                                    head.z - bubble.body.z };
+                    const float range = sqrtf(toHead.x * toHead.x + toHead.y * toHead.y
+                                              + toHead.z * toHead.z);
+                    if (!(range > 1.0e-3f)) { continue; }
+                    toHead = { toHead.x / range, toHead.y / range, toHead.z / range };
+                    const float along = toHead.y;
+                    Vec3 up = { -toHead.x * along, 1.0f - toHead.y * along, -toHead.z * along };
+                    const float upLength = sqrtf(up.x * up.x + up.y * up.y + up.z * up.z);
+                    if (!(upLength > 1.0e-3f)) { continue; }
+                    up = { up.x / upLength, up.y / upLength, up.z / upLength };
+                    const Vec3 right = { -(up.y * toHead.z - up.z * toHead.y),
+                                         -(up.z * toHead.x - up.x * toHead.z),
+                                         -(up.x * toHead.y - up.y * toHead.x) };
+                    const float perPixel = shape.metresPerPixel * bubble.distanceMetres
+                                         / (shape.radius > 0.1f ? shape.radius : 0.1f);
+                    const float height = linePixels * perPixel / (line > 0.01f ? line : 0.1f);
+                    const float halfW = 0.5f * height * aspect;
+                    // Standing on its tail: the bottom edge at the point.
+                    const Vec3 b = bubble.body;
+                    const Vec3 t = { b.x + up.x * height, b.y + up.y * height, b.z + up.z * height };
+                    const PanelVertex tl = { t.x - right.x * halfW, t.y - right.y * halfW,
+                                             t.z - right.z * halfW, 0.0f, 0.0f };
+                    const PanelVertex tr = { t.x + right.x * halfW, t.y + right.y * halfW,
+                                             t.z + right.z * halfW, 1.0f, 0.0f };
+                    const PanelVertex bl = { b.x - right.x * halfW, b.y - right.y * halfW,
+                                             b.z - right.z * halfW, 0.0f, 1.0f };
+                    const PanelVertex br = { b.x + right.x * halfW, b.y + right.y * halfW,
+                                             b.z + right.z * halfW, 1.0f, 1.0f };
+                    const PanelVertex quad[6] = { tl, tr, bl, tr, br, bl };
+                    device->SetTexture(0, texture);
+                    g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST, 2, quad, sizeof(PanelVertex));
+                    if (eye == EyeLeft) { ++g_bubblesDrawnReport; }
                 }
             }
             device->SetTexture(0, nullptr);
@@ -3625,6 +3761,7 @@ namespace wowvr
             {
                 // Into the eyes (the overlay goes on top of them in the compositor).
                 DrawWorldPlates(device);
+                DrawWorldBubbles(device);
                 DrawWorldTexts(device);
                 DrawFloatingText(device);
                 DrawVignette(device);
@@ -3637,6 +3774,7 @@ namespace wowvr
 
             // Lifebars first, then the vignette, so the interface sheet lies over both.
             DrawWorldPlates(device);
+            DrawWorldBubbles(device);
             DrawWorldTexts(device);
             DrawFloatingText(device);
             DrawVignette(device);
@@ -4787,6 +4925,7 @@ namespace wowvr
                                      Cfg().unitsPerMetre * Cfg().worldScale);
                     UpdatePlateStrip();
                     Pointer().SetWorldTextCapture(Cfg().worldText3d && g_uiPanel.IsReady());
+                    Pointer().SetBubbleCapture(Cfg().chatBubbles3d && g_uiPanel.IsReady());
                     {
                         static LARGE_INTEGER last = {};
                         const LARGE_INTEGER now = Now();

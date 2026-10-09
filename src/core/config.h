@@ -440,6 +440,10 @@ namespace wowvr
         // over each unit in the world instead of on the interface: like Nameplates3D,
         // through cells in the extra canvas (two columns at its left and right edges).
         bool worldText3d = true;
+
+        // Chat bubbles (creatures and players speaking) drawn over the speaker in the
+        // world instead of on the interface.
+        bool chatBubbles3d = true;
         float floatingTextHeight = 2.3f;
         float floatingTextSize = 0.16f;
 
